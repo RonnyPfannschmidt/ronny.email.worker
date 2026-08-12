@@ -1,6 +1,6 @@
 # Documentation
 
-- [x] [01 — The idea](01-idea.md) `#sketch`
+- [x] [01 — Intent](01-intent.md) `#sketch`
 - [x] [02 — Action suggestions](02-action-suggestions.md) `#sketch` `#open-questions`
 - [ ] 03 — The review step `#todo`
 - [ ] 04 — Mailbox access `#todo`
