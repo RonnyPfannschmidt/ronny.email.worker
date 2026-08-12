@@ -2,12 +2,12 @@
 
 - [x] [01 — Intent](01-intent.md) `#sketch`
 - [x] [02 — Action suggestions](02-action-suggestions.md) `#sketch` `#open-questions`
-- [ ] 03 — The review step `#todo`
-- [ ] 04 — Mailbox access `#todo`
-- [ ] 05 — The agent surface `#todo`
-- [ ] 06 — The core `#todo`
-- [ ] 07 — Tenancy `#todo`
-- [ ] 08 — Untrusted content `#todo`
+- [ ] [03 — The review step](03-review.md) `#draft` `#open-questions`
+- [ ] [04 — Mailbox access](04-mailbox-access.md) `#draft` `#open-questions`
+- [ ] [05 — The agent surface](05-agent-surface.md) `#draft` `#open-questions`
+- [ ] [06 — The core](06-core.md) `#draft` `#open-questions`
+- [ ] [07 — Tenancy](07-tenancy.md) `#draft` `#open-questions`
+- [ ] [08 — Untrusted content](08-untrusted-content.md) `#draft` `#open-questions`
 
 Plus [design history](design-history/) — starting-point documents, kept verbatim, not
 authoritative.
@@ -17,6 +17,7 @@ authoritative.
 | Tag | Meaning |
 |---|---|
 | `#todo` | Not written yet |
+| `#draft` | A first cut, written to be argued with — expect it to be rewritten |
 | `#sketch` | Surface described — what it is made of, who may do what to it |
 | `#open-questions` | Carries questions that want an experiment before they can be answered |
 | `#tried` | The shape has been built once and survived it |
