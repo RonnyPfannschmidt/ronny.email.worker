@@ -1,2 +1,6 @@
 # ronny.email.worker
-mcp server + webapp that allows agents to work with someonees mailboxes
+
+`mailmind` — an MCP server and webapp that lets agents work with someone's mailboxes,
+without letting them change anything a person has not agreed to.
+
+Nothing is built yet. See [docs/](docs/) — start with the [overview](docs/overview.md).

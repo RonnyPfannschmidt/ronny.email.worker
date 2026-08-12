@@ -6,13 +6,12 @@ They are exploratory design work — mostly transcripts and artifacts from sessi
 Claude — kept verbatim so the origin of an idea stays traceable once it has been folded
 into a real spec. They are recorded as history, not as direction.
 
-The authoritative specs live in [`openspec/specs/`](../../openspec/specs/). Where a
-document here disagrees with a spec, the spec wins. Where it disagrees with reality, both
-lose and the spec gets fixed.
+The current design lives in [`docs/`](../). Where a document here disagrees with it, the
+current design wins. Where it disagrees with reality, both lose and the design gets fixed.
 
-Documents are dated by when they were recorded and are never edited afterwards. Digging a
-document into the specs is done incrementally, one capability at a time, via
-`/opsx:propose`; the source document stays here unchanged.
+Documents are dated by when they were recorded and are never edited afterwards. Folding one
+into the current design is done incrementally, a component at a time; the source document
+stays here unchanged.
 
 ## Documents
 
