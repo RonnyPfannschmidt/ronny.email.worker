@@ -1,4 +1,4 @@
-# Action suggestions
+# 02 — Action suggestions
 
 An agent has to be able to say what it thinks should happen without being able to make it
 happen. An action suggestion is that: the unit the rest of the service is built around.
