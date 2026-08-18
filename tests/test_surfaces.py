@@ -11,7 +11,7 @@ import pytest
 import sqlalchemy as sa
 from fastapi.testclient import TestClient
 
-from mailmind.config import AccountConfig, Config, Limits
+from mailmind.config import AccountConfig, Config, Limits, Login
 from mailmind.db import models as m
 from mailmind.db.scope import unscoped_session
 from mailmind.imap import sync
@@ -43,7 +43,13 @@ def service(tmp_path, backend):
         Config(
             database_url=url,
             limits=Limits(max_messages_per_request=3),
-            accounts=(AccountConfig(name="test", host="h", username="u", secret_ref="env:X"),),
+            accounts=(
+                AccountConfig(
+                    name="test",
+                    host="h",
+                    login=Login(username="u", password="env://X"),
+                ),
+            ),
         ),
         backend_factory=lambda _config: backend,
     )
@@ -60,7 +66,9 @@ def service(tmp_path, backend):
         session.commit()
 
     with service.scope() as scope:
-        account = scope.add(m.Account(name="test", host="h", username="u", secret_ref="env:X"))
+        account = scope.add(
+            m.Account(name="test", host="h", username="u", password_url="env://X")
+        )
         scope.flush()
         for cap in ("CONDSTORE", "MOVE", "UIDPLUS", "SPECIAL-USE", "IDLE"):
             scope.add(m.AccountCapability(account_id=account.id, name=cap))
@@ -232,7 +240,9 @@ def test_without_a_token_there_is_no_view_at_all(client):
 
 def test_an_agent_sees_only_the_accounts_its_grant_covers(client, service):
     with service.scope() as scope:
-        scope.add(m.Account(name="other", host="h", username="u2", secret_ref="env:Y"))
+        scope.add(
+            m.Account(name="other", host="h", username="u2", password_url="env://Y")
+        )
         scope.commit()
     accounts = Agent(client).call("list_accounts")
     assert [a["name"] for a in accounts] == ["test"]

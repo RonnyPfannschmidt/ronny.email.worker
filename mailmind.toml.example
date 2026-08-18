@@ -16,9 +16,6 @@ max_bundle_size = 500
 host = "imap.example.org"
 port = 993
 use_ssl = true
-username = "me@example.org"
-# Where the password is found, never the password: env:NAME, file:/path, keyring:service/user
-secret_ref = "env:MAILMIND_PERSONAL_PASSWORD"
 # What this server is declared to be able to do.  `mailmindctl probe` checks the
 # declaration against the server and fails loudly on divergence; it never quietly
 # downgrades.  Drop CONDSTORE here and conditional applies become best-effort ones that
@@ -26,3 +23,17 @@ secret_ref = "env:MAILMIND_PERSONAL_PASSWORD"
 caps = ["CONDSTORE", "QRESYNC", "MOVE", "UIDPLUS", "SPECIAL-USE", "IDLE"]
 # false keeps message bodies out of the local database entirely.
 cache_bodies = true
+
+[accounts.personal.login]
+username = "me@example.org"
+# A URL saying where the password is found — never the password itself:
+#
+#   env://MAILMIND_PERSONAL_PASSWORD
+#   file:///run/secrets/mailmind-personal      (also file://~/.secrets/personal)
+#   secret-storage://imap.example.org/me@example.org
+#
+# secret-storage:// may omit the user, in which case the username above is used:
+#   secret-storage://imap.example.org
+#
+# An unknown scheme is refused when the config loads, not when a connection is attempted.
+password = "env://MAILMIND_PERSONAL_PASSWORD"

@@ -49,8 +49,8 @@ def bootstrap(ctx: click.Context) -> None:
                     host=account_config.host,
                     port=account_config.port,
                     use_ssl=account_config.use_ssl,
-                    username=account_config.username,
-                    secret_ref=account_config.secret_ref,
+                    username=account_config.login.username,
+                    password_url=account_config.login.password,
                     cache_bodies=account_config.cache_bodies,
                 )
                 scope.add(account)

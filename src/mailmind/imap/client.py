@@ -14,7 +14,7 @@ from imapclient.exceptions import IMAPClientError
 from imapclient.imapclient import join_message_ids, seq_to_parenstr
 from imapclient.response_parser import parse_fetch_response
 
-from mailmind.config import AccountConfig, resolve_secret
+from mailmind.config import AccountConfig
 from mailmind.imap.backend import (
     ContainerInfo,
     IdentityLost,
@@ -46,7 +46,7 @@ class ImapBackend:
         self._readonly = True
         try:
             self._client = IMAPClient(account.host, port=account.port, ssl=account.use_ssl)
-            self._client.login(account.username, resolve_secret(account.secret_ref))
+            self._client.login(account.login.username, account.login.resolve())
         except IMAPClientError as exc:
             raise MailboxUnhealthy(f"login failed: {exc}") from exc
         self._caps = frozenset(_text(c).upper() for c in self._client.capabilities())

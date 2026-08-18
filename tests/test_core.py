@@ -37,7 +37,10 @@ def world(scope, backend):
     """An account, its containers synced, and a seed map from logical name to message id."""
     account = scope.add(
         m.Account(
-            name="test", host="imap.invalid", username="me@example.org", secret_ref="env:X"
+            name="test",
+            host="imap.invalid",
+            username="me@example.org",
+            password_url="env://X",
         )
     )
     scope.flush()

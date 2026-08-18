@@ -16,7 +16,7 @@ import os
 
 import pytest
 
-from mailmind.config import AccountConfig
+from mailmind.config import AccountConfig, Login
 from mailmind.imap.backend import MailBackend
 from mailmind.imap.sync import flags_hash
 from tests.corpus import CORPUS
@@ -38,8 +38,10 @@ def target() -> AccountConfig:
         host=host,
         port=int(port or 143),
         use_ssl=False,
-        username=os.environ.get("MAILMIND_IMAP_USER", "me@example.org"),
-        secret_ref="env:MAILMIND_TEST_PASSWORD",
+        login=Login(
+            username=os.environ.get("MAILMIND_IMAP_USER", "me@example.org"),
+            password="env://MAILMIND_TEST_PASSWORD",
+        ),
     )
 
 
@@ -53,7 +55,7 @@ def out_of_band(target):
     from imapclient import IMAPClient
 
     client = IMAPClient(target.host, port=target.port, ssl=target.use_ssl)
-    client.login(target.username, os.environ["MAILMIND_TEST_PASSWORD"])
+    client.login(target.login.username, target.login.resolve())
     yield client
     client.logout()
 

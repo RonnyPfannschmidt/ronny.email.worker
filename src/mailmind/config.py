@@ -16,17 +16,52 @@ import attrs
 
 DEFAULT_CAPS = ("CONDSTORE", "MOVE", "UIDPLUS", "SPECIAL-USE", "IDLE")
 
+#: Where a password may come from.  Nothing here reads a password out of the config file
+#: itself, and there is deliberately no scheme that would let it.
+PASSWORD_SCHEMES = frozenset({"env", "file", "secret-storage"})
+
 
 class ConfigError(Exception):
     pass
 
 
 @attrs.frozen
+class Login:
+    """How to authenticate, and where the password is found.
+
+    ``password`` is a URL, never a password.  Its scheme says where to look:
+
+    - ``env://NAME`` — an environment variable
+    - ``file:///path/to/secret`` — a file, stripped of trailing whitespace
+    - ``secret-storage://service/user`` — the desktop secret store; ``user`` may be
+      omitted, in which case the login's own username is used
+
+    A scheme this does not know is refused when the configuration loads rather than when
+    a connection is attempted, because the second is somebody's mail not syncing at three
+    in the morning for a reason that reads like a network fault.
+    """
+
+    username: str
+    password: str
+
+    def __attrs_post_init__(self) -> None:
+        scheme = self.password.partition("://")[0]
+        if scheme not in PASSWORD_SCHEMES:
+            raise ConfigError(
+                f"password must be a URL with one of "
+                f"{', '.join(sorted(s + '://' for s in PASSWORD_SCHEMES))} — got "
+                f"{self.password.split('://')[0]!r}"
+            )
+
+    def resolve(self) -> str:
+        return resolve_password(self.password, username=self.username)
+
+
+@attrs.frozen
 class AccountConfig:
     name: str
     host: str
-    username: str
-    secret_ref: str
+    login: Login
     port: int = 993
     use_ssl: bool = True
     #: What this server is declared to be able to do.  The probe checks the declaration;
@@ -79,17 +114,7 @@ def load_config(path: Path | None = None) -> Config:
     raw = tomllib.loads(path.read_text())
 
     accounts = tuple(
-        AccountConfig(
-            name=name,
-            host=body["host"],
-            username=body["username"],
-            secret_ref=body["secret_ref"],
-            port=body.get("port", 993),
-            use_ssl=body.get("use_ssl", True),
-            caps=tuple(body.get("caps", DEFAULT_CAPS)),
-            cache_bodies=body.get("cache_bodies", True),
-        )
-        for name, body in raw.get("accounts", {}).items()
+        _account(name, body) for name, body in raw.get("accounts", {}).items()
     )
     limits_raw = raw.get("limits", {})
     return Config(
@@ -101,30 +126,72 @@ def load_config(path: Path | None = None) -> Config:
     )
 
 
-def resolve_secret(secret_ref: str) -> str:
-    """Turn a reference into a password.
+def _account(name: str, body: dict) -> AccountConfig:
+    if "login" not in body:
+        stray = sorted({"username", "password", "secret_ref"} & body.keys())
+        hint = (
+            f" — move {', '.join(stray)} into it" if stray else ""
+        )
+        raise ConfigError(f"account {name!r} has no [accounts.{name}.login] table{hint}")
+    login = body["login"]
+    for key in ("username", "password"):
+        if key not in login:
+            raise ConfigError(f"account {name!r}: [accounts.{name}.login] needs {key}")
+    return AccountConfig(
+        name=name,
+        host=body["host"],
+        login=Login(username=login["username"], password=login["password"]),
+        port=body.get("port", 993),
+        use_ssl=body.get("use_ssl", True),
+        caps=tuple(body.get("caps", DEFAULT_CAPS)),
+        cache_bodies=body.get("cache_bodies", True),
+    )
 
-    ``env:NAME``, ``file:/path``, or ``keyring:service/user``.  A missing secret is an
-    error rather than an empty string, because an empty password reaches the server as a
-    failed login and looks like something else.
+
+def resolve_password(url: str, *, username: str | None = None) -> str:
+    """Follow a password URL to an actual password.
+
+    A missing secret is an error rather than an empty string: an empty password reaches
+    the server as a failed login, which looks like a wrong password rather than like a
+    misconfiguration.
     """
-    scheme, _, rest = secret_ref.partition(":")
+    scheme, separator, rest = url.partition("://")
+    if not separator:
+        raise ConfigError(f"password must be a URL, e.g. env://NAME — got {url!r}")
+
     if scheme == "env":
+        if not rest:
+            raise ConfigError("env:// needs a variable name")
         value = os.environ.get(rest)
         if value is None:
             raise ConfigError(f"environment variable {rest!r} is not set")
         return value
+
     if scheme == "file":
+        # Everything after the scheme is the path, so file:///abs, file://~/rel and
+        # file://rel all mean what they look like.
         path = Path(rest).expanduser()
         if not path.exists():
-            raise ConfigError(f"secret file {path} does not exist")
+            raise ConfigError(f"password file {path} does not exist")
         return path.read_text().strip()
-    if scheme == "keyring":
+
+    if scheme == "secret-storage":
         service, _, user = rest.partition("/")
-        import keyring  # imported here so keyring stays an optional dependency
+        user = user or username
+        if not service or not user:
+            raise ConfigError(
+                "secret-storage:// needs service/user, or a service and a login username"
+            )
+        try:
+            import keyring  # kept an optional dependency
+        except ImportError as exc:
+            raise ConfigError(
+                "secret-storage:// needs the keyring package installed"
+            ) from exc
 
         value = keyring.get_password(service, user)
         if value is None:
-            raise ConfigError(f"no keyring entry for {service}/{user}")
+            raise ConfigError(f"no secret-storage entry for {service}/{user}")
         return value
-    raise ConfigError(f"unknown secret reference scheme {scheme!r}")
+
+    raise ConfigError(f"unknown password scheme {scheme!r} in {url!r}")

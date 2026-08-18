@@ -171,8 +171,9 @@ class Account(Base, TenantScoped):
     port: Mapped[int] = mapped_column(default=993)
     use_ssl: Mapped[bool] = mapped_column(default=True)
     username: Mapped[str] = mapped_column(sa.String(255))
-    #: Where the password is found, never the password.  ``env:NAME`` or ``keyring:SERVICE``.
-    secret_ref: Mapped[str] = mapped_column(sa.String(255))
+    #: Where the password is found, never the password: an ``env://``, ``file://`` or
+    #: ``secret-storage://`` URL.
+    password_url: Mapped[str] = mapped_column(sa.String(255))
     health: Mapped[AccountHealth] = mapped_column(
         _enum(AccountHealth, "account_health"), default=AccountHealth.unknown
     )

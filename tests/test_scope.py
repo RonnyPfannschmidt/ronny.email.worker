@@ -51,7 +51,7 @@ def two_tenants(sessions):
                     name=f"{name}-account",
                     host="imap.example",
                     username=f"{name}@example",
-                    secret_ref="env:NOPE",
+                    password_url="env://NOPE",
                 )
             )
             scope.flush()
