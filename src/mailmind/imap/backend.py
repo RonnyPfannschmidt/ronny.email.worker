@@ -1,0 +1,123 @@
+"""What the rest of the service is allowed to know about a mail server.
+
+04 says the service should not know which backend it is talking to; it should know what
+that backend can promise.  This protocol is that line.  Everything above it deals in
+containers, uids and modseqs; everything below it deals in IMAP, and later in whatever
+Gmail turns out to need.
+
+The promises are not uniform, so operations return what guarantee they actually obtained
+rather than claiming the one that was asked for.
+"""
+
+from __future__ import annotations
+
+import datetime as dt
+from typing import Protocol, runtime_checkable
+
+import attrs
+
+
+class MailboxUnhealthy(Exception):
+    """Reading works and writing does not, or nothing works and someone has to look."""
+
+
+class IdentityLost(Exception):
+    """UIDVALIDITY changed, or a cursor expired.
+
+    Everything remembered about the container is suspect and suggestions resting on it
+    are dead.
+    """
+
+
+@attrs.frozen
+class ContainerInfo:
+    name: str
+    delimiter: str | None = None
+    special_use: str | None = None
+    selectable: bool = True
+
+
+@attrs.frozen
+class SelectInfo:
+    uidvalidity: int
+    uidnext: int
+    message_count: int
+    highestmodseq: int | None = None
+
+
+@attrs.frozen
+class MessageInfo:
+    """What a FETCH gives back without asking for a body."""
+
+    uid: int
+    flags: tuple[str, ...]
+    internaldate: dt.datetime | None
+    size: int
+    modseq: int | None = None
+    #: Headers only.  A sync fetches these for every message; bodies cost too much to
+    #: pull for a whole untended mailbox and are fetched on demand instead.
+    headers: bytes | None = None
+    #: The whole message.  Present only when something asked for a body.
+    raw: bytes | None = None
+
+
+@attrs.frozen
+class StoreResult:
+    """What actually happened, including which promise was obtained.
+
+    ``conditional`` means the server refused to act had the message changed.
+    ``best_effort`` means it did not offer that, and the caller must say so rather than
+    imply a guarantee it did not get.
+    """
+
+    changed: bool
+    guarantee: str
+    detail: str | None = None
+    resulting_uid: int | None = None
+
+
+@runtime_checkable
+class MailBackend(Protocol):
+    """The whole of what mailmind asks a mail server to do.
+
+    Note what is absent: there is no send.  04 puts sending outside this surface, so it
+    is not a permission that is withheld — it is a method that does not exist.
+    """
+
+    def capabilities(self) -> frozenset[str]: ...
+
+    def list_containers(self) -> list[ContainerInfo]: ...
+
+    def select(self, container: str, *, readonly: bool = True) -> SelectInfo: ...
+
+    def fetch_envelopes(
+        self, container: str, uids: list[int] | None = None
+    ) -> list[MessageInfo]: ...
+
+    def fetch_changed_since(self, container: str, modseq: int) -> list[MessageInfo]: ...
+
+    def all_uids(self, container: str) -> list[int]: ...
+
+    def fetch_raw(self, container: str, uid: int) -> bytes: ...
+
+    def store_flags(
+        self,
+        container: str,
+        uid: int,
+        flags: tuple[str, ...],
+        *,
+        add: bool,
+        unchanged_since: int | None = None,
+    ) -> StoreResult: ...
+
+    def move(
+        self,
+        container: str,
+        uid: int,
+        destination: str,
+        *,
+        expected_modseq: int | None = None,
+        expected_flags: tuple[str, ...] | None = None,
+    ) -> StoreResult: ...
+
+    def close(self) -> None: ...

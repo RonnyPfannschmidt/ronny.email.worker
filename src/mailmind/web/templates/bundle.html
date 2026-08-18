@@ -1,0 +1,144 @@
+{% extends "base.html" %}
+{% block title %}review — mailmind{% endblock %}
+{% block content %}
+
+{% set stale_items = bundle["items"] | selectattr("status", "equalto", "stale") | list %}
+
+<h1 class="effect">
+  {{ bundle.operation }}{% if bundle.flag %} {{ bundle.flag }}{% endif %}
+  {% if bundle.target_container %}<span class="arrow">&rarr;</span> {{ bundle.target_container }}{% endif %}
+  <span class="muted small">({{ bundle["items"] | length }} messages)</span>
+</h1>
+
+{% if error %}<div class="banner error">{{ error }}</div>{% endif %}
+
+{% if bundle.self_assessed_by %}
+<div class="banner">
+  Assessed by <strong>{{ bundle.self_assessed_by | join(", ") }}</strong> — the same
+  producer that proposed this. An assessment is meant to come from somewhere else, because
+  whatever can be talked into a suggestion can be talked into vouching for it. Weigh it
+  accordingly.
+</div>
+{% endif %}
+
+{% if stale_items %}
+<div class="banner">
+  {{ stale_items | length }} of these moved since this was proposed. They will not be
+  applied. What changed is shown against each one below.
+</div>
+{% endif %}
+
+<p class="small muted">
+  Proposed by {{ bundle.producer }} · status {{ bundle.status }} · expires {{ bundle.expires_at[:16] }}
+</p>
+
+<h2>The effect</h2>
+<table>
+  <tr><th>From</th><th>Subject</th><th>Date</th><th>Now in</th><th></th><th>Would be in</th><th></th></tr>
+  {% for item in bundle["items"] %}
+  <tr id="m{{ item.message_id }}" class="{{ 'stale' if item.status == 'stale' }}">
+    <td class="small">
+      {{ item.from_address or "—" }}
+      {% if item.from_display_name %}<br><span class="muted">{{ item.from_display_name }}</span>{% endif %}
+    </td>
+    <td class="small">{{ item.subject or "(no subject)" }}</td>
+    <td class="small muted">{{ (item.date or "")[:10] }}</td>
+    <td class="small">{{ item.currently_in }}</td>
+    <td class="arrow">&rarr;</td>
+    <td class="small">
+      {% if bundle.operation == "move" %}{{ item.would_move_to }}
+      {% elif bundle.operation == "delete" %}Trash
+      {% else %}{{ item.currently_in }} <span class="muted">({{ bundle.operation }} {{ bundle.flag }})</span>{% endif %}
+    </td>
+    <td class="small">
+      {% if item.status == "proposed" and bundle.status == "proposed" %}
+        <form class="inline" method="post" action="/bundle/{{ bundle.bundle_id }}/exclude/{{ item.suggestion_id }}">
+          <button>exclude</button>
+        </form>
+      {% else %}{{ item.status }}{% endif %}
+    </td>
+  </tr>
+  {% if item.stale_detail %}
+  <tr><td colspan="7" class="small warn">{{ item.stale_detail }}</td></tr>
+  {% endif %}
+  <tr><td colspan="7">
+    {% for assessment in item.assessment %}
+      {% for f in assessment.findings %}
+        <span class="finding {{ f["class"] }}">{{ f.detail }}</span>
+      {% endfor %}
+    {% endfor %}
+    <details>
+      <summary class="small muted">the message itself</summary>
+      {% set body = bodies.get(item.message_id) %}
+      {% if body %}
+        <div class="body">{{ body.text }}</div>
+        {% if body.links %}
+        <table class="links">
+          <tr><th>link text</th><th>actually goes to</th></tr>
+          {% for link in body.links %}
+          <tr><td>{{ link.text }}</td><td>{{ link.target }}</td></tr>
+          {% endfor %}
+        </table>
+        {% endif %}
+        <p class="small muted">Nothing above was fetched from the network. Remote images
+        are not loaded: loading one tells the sender the mail was read.</p>
+      {% else %}
+        <form method="post" action="/bundle/{{ bundle.bundle_id }}/body/{{ item.message_id }}">
+          <button>fetch the body from the server</button>
+        </form>
+      {% endif %}
+    </details>
+  </td></tr>
+  {% endfor %}
+</table>
+
+<h2>What the producer says</h2>
+<p>{{ bundle.summary }}</p>
+<p class="muted">{{ bundle.reason }}</p>
+<p class="small muted">This is what it says it is doing. The table above is what it would
+actually do. Accepting from this paragraph rather than that table would make the review
+theatre.</p>
+
+{% if bundle.attempts %}
+<h2>What happened</h2>
+<table class="small">
+  <tr><th>item</th><th>outcome</th><th>guarantee</th><th>detail</th></tr>
+  {% for a in bundle.attempts %}
+  <tr>
+    <td>{{ a.suggestion_id }}</td>
+    <td class="{% if a.outcome == 'applied' %}ok{% else %}warn{% endif %}">{{ a.outcome }}</td>
+    <td>{{ a.guarantee_obtained }}{% if a.guarantee_obtained != a.precondition %}
+        <span class="muted">(asked for {{ a.precondition }})</span>{% endif %}</td>
+    <td class="muted">{{ a.detail or "" }}</td>
+  </tr>
+  {% endfor %}
+</table>
+<p class="small muted">A best-effort guarantee means the server could not promise the
+message was untouched between the check and the change — it does not mean it was.</p>
+{% endif %}
+
+{% if bundle.status == "proposed" %}
+<div class="actions">
+  <form method="post" action="/bundle/{{ bundle.bundle_id }}/accept">
+    {% if stale_items %}
+    <p class="small">
+      <label><input type="checkbox" name="acknowledge_stale" value="1" required>
+      I have read what changed on the {{ stale_items | length }} message(s) above. They
+      will not be applied.</label>
+    </p>
+    {% endif %}
+    <button>Accept — do this to the mailbox</button>
+  </form>
+  <form method="post" action="/bundle/{{ bundle.bundle_id }}/reject">
+    <input name="reason" placeholder="why not (optional)" size="30">
+    <button>Reject</button>
+  </form>
+</div>
+{% else %}
+<p class="small muted">
+  {{ bundle.status }}{% if bundle.decided_by %} by {{ bundle.decided_by }}{% endif %}
+  {%- if bundle.decided_at %} at {{ bundle.decided_at[:16] }}{% endif %}
+  {%- if bundle.decision_reason %} — {{ bundle.decision_reason }}{% endif %}
+</p>
+{% endif %}
+{% endblock %}

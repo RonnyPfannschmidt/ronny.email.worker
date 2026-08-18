@@ -1,0 +1,34 @@
+{% extends "base.html" %}
+{% block content %}
+<h1>Accounts</h1>
+{% for row in rows %}
+  <h2>{{ row.account.name }}
+    <span class="small {% if row.account.health.value == 'ok' %}ok{% else %}bad{% endif %}">
+      {{ row.account.health.value }}</span></h2>
+  {% if row.account.health_detail %}
+    <div class="banner error">{{ row.account.health_detail }}</div>
+  {% endif %}
+
+  <p class="small muted">
+    {% for name, declared, probed in row.capabilities %}
+      <span class="{% if declared and probed is false %}bad{% elif not declared %}muted{% endif %}">
+        {{ name }}{% if declared and probed is false %} (declared, not offered){% endif %}{% if not declared %} (offered, not declared){% endif %}
+      </span>{% if not loop.last %} · {% endif %}
+    {% endfor %}
+  </p>
+
+  <table class="small">
+    <tr><th>folder</th><th>cached</th><th>on server</th><th>last synced</th></tr>
+    {% for c in row.containers %}
+    <tr>
+      <td>{{ c.name }}</td><td>{{ c.cached_messages }}</td>
+      <td class="muted">{{ c.server_message_count }}</td>
+      <td class="muted">{{ (c.last_synced or "never")[:16] }}</td>
+    </tr>
+    {% endfor %}
+  </table>
+  <form method="post" action="/accounts/{{ row.account.id }}/sync">
+    <button>sync now</button>
+  </form>
+{% endfor %}
+{% endblock %}

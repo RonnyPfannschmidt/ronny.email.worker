@@ -216,3 +216,10 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# mailmind local state — the config names a host and a username, and the database holds
+# cached mail. Neither belongs in a repository.
+mailmind.toml
+mailmind.db
+mailmind.db-wal
+mailmind.db-shm

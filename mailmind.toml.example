@@ -1,0 +1,28 @@
+# Copy to mailmind.toml, or point MAILMIND_CONFIG at it.
+
+database_url = "sqlite:///mailmind.db"
+bind = "127.0.0.1"
+port = 8765
+
+[limits]
+# 05: a request matching more than this returns fewer and says so.
+max_messages_per_request = 200
+# 03: suggestions nobody gets to expire rather than accumulate.
+bundle_expiry_days = 7
+body_cache_bytes = 268435456
+max_bundle_size = 500
+
+[accounts.personal]
+host = "imap.example.org"
+port = 993
+use_ssl = true
+username = "me@example.org"
+# Where the password is found, never the password: env:NAME, file:/path, keyring:service/user
+secret_ref = "env:MAILMIND_PERSONAL_PASSWORD"
+# What this server is declared to be able to do.  `mailmindctl probe` checks the
+# declaration against the server and fails loudly on divergence; it never quietly
+# downgrades.  Drop CONDSTORE here and conditional applies become best-effort ones that
+# say so.
+caps = ["CONDSTORE", "QRESYNC", "MOVE", "UIDPLUS", "SPECIAL-USE", "IDLE"]
+# false keeps message bodies out of the local database entirely.
+cache_bodies = true

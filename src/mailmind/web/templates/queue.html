@@ -1,0 +1,40 @@
+{% extends "base.html" %}
+{% block content %}
+<h1>Awaiting review</h1>
+
+{% if not bundles %}
+  <p class="muted">Nothing to review.</p>
+{% else %}
+<table>
+  <tr><th>What would happen</th><th>Messages</th><th>From</th><th>Why</th><th></th></tr>
+  {% for b in bundles %}
+  <tr>
+    <td class="effect">
+      {{ b.operation }}{% if b.flag %} {{ b.flag }}{% endif %}
+      {% if b.target_container %}<span class="arrow">&rarr;</span>{{ b.target_container }}{% endif %}
+    </td>
+    <td>{{ b.item_count }}{% if b.stale_count %}
+        <span class="warn small">{{ b.stale_count }} moved</span>{% endif %}</td>
+    <td class="small">{{ b.producer }}</td>
+    <td class="small muted">{{ b.summary }}</td>
+    <td><a href="/bundle/{{ b.bundle_id }}">review</a></td>
+  </tr>
+  {% endfor %}
+</table>
+{% endif %}
+
+{% if recent %}
+<h2>Recently decided</h2>
+<table class="small">
+  {% for b in recent %}
+  <tr>
+    <td class="effect">{{ b.operation }}{% if b.target_container %}
+        <span class="arrow">&rarr;</span>{{ b.target_container }}{% endif %}</td>
+    <td>{{ b.item_count }}</td>
+    <td class="{% if b.status in ('applied',) %}ok{% elif b.status == 'partially_applied' %}warn{% endif %}">{{ b.status }}</td>
+    <td><a href="/bundle/{{ b.bundle_id }}">detail</a></td>
+  </tr>
+  {% endfor %}
+</table>
+{% endif %}
+{% endblock %}

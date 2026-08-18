@@ -1,0 +1,37 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{% block title %}mailmind{% endblock %}</title>
+<style>
+:root { color-scheme: light dark; --line:#0002; --warn:#b45309; --bad:#b91c1c; --ok:#15803d; }
+body { font: 15px/1.5 system-ui, sans-serif; margin: 0 auto; max-width: 62rem; padding: 1.5rem; }
+nav a { margin-right: 1rem; }
+h1 { font-size: 1.3rem; } h2 { font-size: 1.05rem; margin-top: 2rem; }
+table { border-collapse: collapse; width: 100%; }
+th, td { text-align: left; padding: .4rem .5rem; border-bottom: 1px solid var(--line); vertical-align: top; }
+th { font-weight: 600; font-size: .85rem; text-transform: uppercase; letter-spacing: .03em; opacity: .7; }
+.effect { font-variant-numeric: tabular-nums; white-space: nowrap; }
+.arrow { opacity: .6; padding: 0 .3rem; }
+.muted { opacity: .65; } .small { font-size: .85rem; }
+.warn { color: var(--warn); } .bad { color: var(--bad); } .ok { color: var(--ok); }
+.banner { padding: .7rem .9rem; border: 1px solid var(--line); border-left: 4px solid var(--warn); margin: 1rem 0; }
+.banner.error { border-left-color: var(--bad); }
+.finding { display:block; font-size:.85rem; }
+.finding.mechanical::before { content: "fact "; font-weight:600; opacity:.6; }
+.finding.interpretation::before { content: "read "; font-weight:600; opacity:.6; }
+.body { white-space: pre-wrap; border: 1px solid var(--line); padding: .6rem; margin: .4rem 0; font-size: .9rem; max-height: 22rem; overflow: auto; }
+.links td { font-size: .82rem; }
+form.inline { display: inline; }
+button { font: inherit; padding: .35rem .8rem; }
+.actions { display: flex; gap: 1rem; align-items: flex-start; margin-top: 1.5rem; flex-wrap: wrap; }
+.stale { text-decoration: line-through; opacity: .6; }
+details summary { cursor: pointer; }
+</style>
+</head>
+<body>
+<nav class="small"><a href="/">review queue</a><a href="/accounts">accounts</a></nav>
+{% block content %}{% endblock %}
+</body>
+</html>
