@@ -13,27 +13,19 @@ import pytest
 import sqlalchemy as sa
 
 from mailmind.db import models as m
-from mailmind.db.engine import create_engine
 from mailmind.db.scope import (
     CrossTenantWrite,
     Unscoped,
-    make_sessionmaker,
     tenant_scope,
     unscoped_session,
 )
 
 
 @pytest.fixture
-def sessions():
-    engine = create_engine("sqlite://")
-    m.Base.metadata.create_all(engine)
-    return make_sessionmaker(engine)
-
-
-@pytest.fixture
 def two_tenants(sessions):
     """Two tenants, each with an account, a container and a message in it."""
     with unscoped_session(sessions) as session:
+        # Tenant zero comes from the migration; these two are its neighbours.
         for name in ("zero", "one"):
             session.add(m.Tenant(name=name))
         session.commit()

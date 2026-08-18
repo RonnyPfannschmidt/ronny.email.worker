@@ -10,6 +10,7 @@ import sqlalchemy as sa
 
 from mailmind.config import load_config
 from mailmind.db import models as m
+from mailmind.db.migrate import upgrade_to_head
 from mailmind.service import TENANT_ZERO, Service, hash_token, mint_token
 
 
@@ -31,12 +32,7 @@ def main(ctx: click.Context, config_path: str | None) -> None:
 def bootstrap(ctx: click.Context) -> None:
     """Create tenant zero's accounts from configuration, and a token for an agent."""
     service = _service(ctx.obj["config_path"])
-    from alembic import command
-    from alembic.config import Config as AlembicConfig
-
-    alembic_cfg = AlembicConfig("alembic.ini")
-    alembic_cfg.cmd_opts = type("O", (), {"x": [f"db_url={service.config.database_url}"]})()
-    command.upgrade(alembic_cfg, "head")
+    upgrade_to_head(service.config.database_url)
 
     with service.scope(TENANT_ZERO) as scope:
         for account_config in service.config.accounts:

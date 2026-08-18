@@ -13,7 +13,7 @@ from fastapi.testclient import TestClient
 
 from mailmind.config import AccountConfig, Config, Limits, Login
 from mailmind.db import models as m
-from mailmind.db.scope import unscoped_session
+from mailmind.db.migrate import upgrade_to_head
 from mailmind.imap import sync
 from mailmind.imap.capabilities import probe_account
 from mailmind.mcp import server as mcp_server
@@ -39,6 +39,7 @@ def backend():
 @pytest.fixture
 def service(tmp_path, backend):
     url = f"sqlite:///{tmp_path / 'mm.db'}"
+    upgrade_to_head(url)
     service = Service(
         Config(
             database_url=url,
@@ -53,17 +54,6 @@ def service(tmp_path, backend):
         ),
         backend_factory=lambda _config: backend,
     )
-    m.Base.metadata.create_all(service.engine)
-    with service.engine.begin() as connection:
-        connection.execute(
-            sa.text(
-                "CREATE VIRTUAL TABLE message_fts USING fts5(subject, from_text, "
-                "preview, message_id UNINDEXED, tenant_id UNINDEXED, account_id UNINDEXED)"
-            )
-        )
-    with unscoped_session(service.sessions) as session:
-        session.add(m.Tenant(id=0, name="tenant-zero"))
-        session.commit()
 
     with service.scope() as scope:
         account = scope.add(

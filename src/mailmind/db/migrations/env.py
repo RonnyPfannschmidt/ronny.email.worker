@@ -1,7 +1,7 @@
 """Alembic environment.
 
-The database URL comes from mailmind's own config rather than alembic.ini, so there is
-one place a deployment says where its data lives.
+The database URL comes from mailmind's own configuration rather than from alembic.ini, so
+one deployment says where its data lives in one place.
 """
 
 from __future__ import annotations
@@ -16,9 +16,20 @@ target_metadata = Base.metadata
 
 
 def _url() -> str:
-    return (
-        context.get_x_argument(as_dictionary=True).get("db_url") or load_config().database_url
-    )
+    """Where the database is, in order of how explicitly it was said.
+
+    ``-x db_url=...`` beats a url set on the config object, which beats mailmind's own
+    configuration.  The last of those is a fallback and not a default to rely on: a
+    programmatic caller that means a particular database must say so, or it will quietly
+    migrate whichever one the working directory implies.
+    """
+    from_argument = context.get_x_argument(as_dictionary=True).get("db_url")
+    if from_argument:
+        return from_argument
+    configured = context.config.get_main_option("sqlalchemy.url", None)
+    if configured:
+        return configured
+    return load_config().database_url
 
 
 def run_migrations_offline() -> None:
@@ -33,17 +44,22 @@ def run_migrations_offline() -> None:
 
 
 def run_migrations_online() -> None:
-    connectable = config_engine = create_engine(_url())
-    with connectable.connect() as connection:
-        context.configure(
-            connection=connection,
-            target_metadata=target_metadata,
-            # SQLite cannot ALTER much; batch mode rewrites the table instead.
-            render_as_batch=True,
-        )
-        with context.begin_transaction():
-            context.run_migrations()
-    config_engine.dispose()
+    engine = create_engine(_url())
+    try:
+        with engine.connect() as connection:
+            context.configure(
+                connection=connection,
+                target_metadata=target_metadata,
+                # SQLite cannot ALTER much, so batch mode rewrites the table instead.
+                # Note that it drops and recreates, which fails against inbound foreign
+                # keys — see 0001initial for why a plain RENAME COLUMN is preferred where
+                # SQLite supports one.
+                render_as_batch=True,
+            )
+            with context.begin_transaction():
+                context.run_migrations()
+    finally:
+        engine.dispose()
 
 
 if context.is_offline_mode():
