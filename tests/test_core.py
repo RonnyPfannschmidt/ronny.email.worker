@@ -149,6 +149,50 @@ def test_a_link_whose_text_disagrees_with_its_target_is_found(scope, world, back
     assert "link_target_mismatch" in _codes(scope, message_id)
 
 
+def test_a_sender_never_seen_before_is_marked_and_a_familiar_one_is_not(
+    scope, world, backend
+):
+    """The finding says what was known when the message arrived.
+
+    It was unreachable: the row is written and flushed before the assessment runs, so
+    counting messages from the address counted the message being assessed and every
+    sender looked familiar.
+    """
+    assert "first_contact" in _codes(scope, world["seed"]["ordinary"])
+
+    second = backend.add_message(
+        "INBOX",
+        b"From: Alice <alice@example.com>\r\n"
+        b"To: me@example.org\r\n"
+        b"Subject: One more thing\r\n"
+        b"Date: Mon, 24 Aug 2026 09:00:00 +0000\r\n"
+        b"Message-ID: <second@example.com>\r\n"
+        b"\r\n"
+        b"About Thursday.\r\n",
+    )
+    sync.sync_container(scope, world["account"], world["containers"]["INBOX"], backend)
+    scope.flush()
+
+    placement = scope.scalar(
+        sa.select(m.Placement).where(
+            m.Placement.container_id == world["containers"]["INBOX"].id,
+            m.Placement.uid == second,
+        )
+    )
+    assert "first_contact" not in _codes(scope, placement.message_id)
+    assert "first_contact" in _codes(scope, world["seed"]["ordinary"]), (
+        "the first message stopped being first contact once a second one arrived"
+    )
+
+
+def test_a_cached_message_carries_the_size_the_server_reported(scope, world, backend):
+    """Not the size of the blob that was parsed, which during a sync is headers only."""
+    message = scope.get(m.Message, world["seed"]["ordinary"])
+    raw = CORPUS["ordinary"]
+    assert message.size_bytes == len(raw)
+    assert message.size_bytes > len(raw.partition(b"\r\n\r\n")[0])
+
+
 def test_a_message_with_no_message_id_is_still_cached_and_flagged(scope, world):
     codes = set(
         scope.scalars(
@@ -304,6 +348,30 @@ def test_gap_two_holds_even_when_the_cache_has_not_noticed(scope, world, backend
 
     attempts = applier.apply_bundle(scope, bundle, backend)
     assert [a.outcome for a in attempts] == [m.ApplyOutcome.refused_stale]
+
+
+def test_a_bundle_that_lost_every_item_is_not_reported_as_applied(scope, world, backend):
+    """Zero of zero used to count as all of them.
+
+    ``applied == len(attempts)`` holds trivially when nothing was attempted, so a bundle
+    whose every item died between acceptance and application announced itself as applied
+    and the queue showed a change the mailbox never saw.
+    """
+    from mailmind.suggest import staleness
+
+    bundle = _bundle(scope, world, ["newsletter"])
+    suggest.accept(scope, bundle, world["reviewer"])
+
+    # Somebody files it in their own client, and the next sync notices.
+    backend.out_of_band_move("INBOX", world["uids"]["newsletter"], "Archive")
+    sync.sync_container(scope, world["account"], world["containers"]["INBOX"], backend)
+    staleness.refresh_bundle(scope, bundle)
+    assert all(s.status is m.SuggestionStatus.stale for s in bundle.suggestions)
+
+    with pytest.raises(applier.NotApplicable) as refused:
+        applier.apply_bundle(scope, bundle, backend)
+    assert "nothing was done to the mailbox" in str(refused.value)
+    assert bundle.status is m.BundleStatus.accepted
 
 
 def test_a_recreated_folder_kills_everything_resting_on_it(scope, world, backend):

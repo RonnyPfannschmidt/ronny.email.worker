@@ -59,6 +59,16 @@ def apply_bundle(
             _apply_one(scope, bundle, suggestion, backend, trash_container=trash_container)
         )
 
+    if not attempts:
+        # Every item died between being accepted and getting here.  Nothing was done to
+        # the mailbox, so the bundle does not get to say it was: `applied == len(attempts)`
+        # holds trivially of zero attempts, and the queue then showed a change that never
+        # happened.  The bundle stays accepted with its items marked, which is the truth.
+        raise NotApplicable(
+            "no item of this bundle is still accepted; every one of them went stale "
+            "before it could be applied, and nothing was done to the mailbox"
+        )
+
     applied = sum(1 for a in attempts if a.outcome is m.ApplyOutcome.applied)
     bundle.status = (
         m.BundleStatus.applied if applied == len(attempts) else m.BundleStatus.partially_applied
@@ -185,8 +195,8 @@ def _perform(bundle, suggestion, backend, source, trash_container):  # noqa: ANN
             expected_modseq=suggestion.premise_modseq,
         )
     if bundle.operation is m.Operation.delete:
-        # Deleting is moving to Trash and flagging.  Nothing here expunges: 01 says mail
-        # has no undo, and this is the one place that could prove it.
+        # Deleting is moving to Trash, and nothing more: no \Deleted, no expunge.  01
+        # says mail has no undo, and this is the one place that could prove it.
         if trash_container is None:
             raise MailboxUnhealthy("no Trash container is known for this account")
         moved = backend.move(

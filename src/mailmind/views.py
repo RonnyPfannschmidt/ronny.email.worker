@@ -6,6 +6,8 @@ proposing against one picture while a person reviews another.
 
 from __future__ import annotations
 
+import datetime as dt
+
 import sqlalchemy as sa
 
 from mailmind.db import cache
@@ -25,6 +27,26 @@ def live_placements(container_id: int | None = None):
     if container_id is not None:
         stmt = stmt.where(m.Placement.container_id == container_id)
     return stmt
+
+
+def instant(value: str, field: str) -> dt.datetime:
+    """Read a caller's date or timestamp as a point in time.
+
+    It has to become a datetime before it reaches the comparison.  Bound as a string it
+    was compared to SQLite's own datetime text lexicographically, and ``2026-08-19T00:00``
+    sorts after ``2026-08-19 09:00`` — so ``before`` quietly included the whole of the
+    boundary day and ``since`` quietly dropped it.
+
+    Naive input is read as UTC, which is what a caller writing a bare date means.
+    """
+    try:
+        parsed = dt.datetime.fromisoformat(value)
+    except ValueError:
+        raise ValueError(
+            f"{field} must be an ISO 8601 date or timestamp — 2026-08-19, or "
+            f"2026-08-19T09:00:00Z — got {value!r}"
+        ) from None
+    return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=dt.UTC)
 
 
 def accounts(scope: TenantScope, allowed: set[int] | None = None) -> list[dict]:
@@ -99,9 +121,9 @@ def messages(
     if unread_only:
         stmt = stmt.where(sa.not_(m.Placement.flags.contains("\\Seen")))
     if before:
-        stmt = stmt.where(m.Message.date_header < before)
+        stmt = stmt.where(m.Message.date_header < instant(before, "before"))
     if since:
-        stmt = stmt.where(m.Message.date_header >= since)
+        stmt = stmt.where(m.Message.date_header >= instant(since, "since"))
 
     total = scope.scalar(sa.select(sa.func.count()).select_from(stmt.order_by(None).subquery()))
     rows = scope.scalars(
@@ -265,8 +287,8 @@ def summarize_lists(scope: TenantScope, container_id: int, limit: int = 100) -> 
     ]
 
 
-def search(scope: TenantScope, query: str, *, account_id: int | None, limit: int) -> dict:
-    ids = cache.search_messages(scope, query, account_id=account_id, limit=limit)
+def search(scope: TenantScope, query: str, *, account_ids: set[int] | None, limit: int) -> dict:
+    ids = cache.search_messages(scope, query, account_ids=account_ids, limit=limit)
     rows = []
     for message_id in ids:
         placement = scope.scalar(live_placements().where(m.Placement.message_id == message_id))
@@ -278,12 +300,16 @@ def search(scope: TenantScope, query: str, *, account_id: int | None, limit: int
 # ------------------------------------------------------------------------ bundles
 
 
-def bundle_summaries(scope: TenantScope, statuses: list[m.BundleStatus]) -> list[dict]:
-    bundles = scope.scalars(
-        sa.select(m.Bundle)
-        .where(m.Bundle.status.in_(statuses))
-        .order_by(m.Bundle.created_at.desc())
-    ).all()
+def bundle_summaries(
+    scope: TenantScope,
+    statuses: list[m.BundleStatus],
+    *,
+    account_ids: set[int] | None = None,
+) -> list[dict]:
+    stmt = sa.select(m.Bundle).where(m.Bundle.status.in_(statuses))
+    if account_ids is not None:
+        stmt = stmt.where(m.Bundle.account_id.in_(account_ids or {-1}))
+    bundles = scope.scalars(stmt.order_by(m.Bundle.created_at.desc())).all()
     return [
         {
             "bundle_id": b.id,

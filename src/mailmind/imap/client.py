@@ -7,6 +7,7 @@ modseqs and — importantly — which guarantee an operation actually obtained.
 from __future__ import annotations
 
 import datetime as dt
+from collections.abc import Iterable
 from typing import Any
 
 from imapclient import IMAPClient
@@ -16,6 +17,7 @@ from imapclient.response_parser import parse_fetch_response
 
 from mailmind.config import AccountConfig
 from mailmind.imap.backend import (
+    SPECIAL_USE,
     ContainerInfo,
     IdentityLost,
     MailboxUnhealthy,
@@ -31,6 +33,20 @@ _HEADER_KEY = b"BODY[HEADER]"
 
 def _text(value: Any) -> str:
     return value.decode("ascii", "replace") if isinstance(value, bytes) else str(value)
+
+
+def normalise_special_use(flags: Iterable[Any]) -> str | None:
+    """Which special use a LIST response claims, or None.
+
+    RFC 6154 attributes are case-insensitive on the wire and servers differ, so the case
+    a server happens to send is not something anything downstream should have to know:
+    what leaves here is one of :data:`~mailmind.imap.backend.SPECIAL_USE`.
+    """
+    for flag in flags:
+        name = _text(flag).lstrip("\\").lower()
+        if name in SPECIAL_USE:
+            return name
+    return None
 
 
 class ImapBackend:
@@ -67,19 +83,11 @@ class ImapBackend:
         out = []
         for flags, delimiter, name in self._client.list_folders():
             flag_names = {_text(f).lower() for f in flags}
-            special = next(
-                (
-                    f.lstrip("\\")
-                    for f in (_text(x) for x in flags)
-                    if f.lower() in ("\\sent", "\\drafts", "\\trash", "\\junk", "\\archive")
-                ),
-                None,
-            )
             out.append(
                 ContainerInfo(
                     name=name if isinstance(name, str) else _text(name),
                     delimiter=_text(delimiter) if delimiter else None,
-                    special_use=special,
+                    special_use=normalise_special_use(flags),
                     selectable="\\noselect" not in flag_names,
                 )
             )

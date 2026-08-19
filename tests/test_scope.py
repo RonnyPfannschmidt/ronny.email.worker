@@ -8,6 +8,7 @@ covering a case.
 from __future__ import annotations
 
 import datetime as dt
+import threading
 
 import pytest
 import sqlalchemy as sa
@@ -152,6 +153,67 @@ def test_audit_events_are_sequenced_per_tenant(sessions, two_tenants):
     with tenant_scope(sessions, two_tenants["one"]) as scope:
         events = scope.scalars(sa.select(m.AuditEvent).order_by(m.AuditEvent.seq)).all()
     assert [(e.seq, e.verb) for e in events] == [(1, "first"), (2, "second")]
+
+
+def test_a_stored_time_comes_back_comparable_to_now(sessions, two_tenants):
+    """SQLite has no offset to store, so an aware datetime came back naive.
+
+    Every column here is declared ``timezone=True`` and none of them were, which turns the
+    ordinary act of comparing a stored time to ``now()`` into a TypeError.
+    """
+    written = dt.datetime(2026, 8, 19, 11, 0, tzinfo=dt.timezone(dt.timedelta(hours=2)))
+    with tenant_scope(sessions, two_tenants["zero"]) as scope:
+        producer = scope.add(m.Producer(kind=m.ProducerKind.agent, name="opencode"))
+        scope.flush()
+        scope.add(
+            m.Grant(
+                producer_id=producer.id,
+                token_hash="not-a-real-token",
+                capabilities=["observe"],
+                expires_at=written,
+            )
+        )
+        scope.commit()
+
+    with tenant_scope(sessions, two_tenants["zero"]) as scope:
+        grant = scope.scalar(sa.select(m.Grant))
+        assert grant.expires_at.tzinfo is not None
+        assert grant.expires_at == written, "the offset was dropped instead of applied"
+        assert grant.expires_at <= dt.datetime.now(dt.UTC)
+        assert grant.created_at <= dt.datetime.now(dt.UTC)
+
+
+def test_concurrent_writers_do_not_collide_on_the_audit_sequence(sessions, two_tenants):
+    """Every route in the review UI is a ``def``, so starlette runs them in a threadpool,
+    and the MCP tools run in worker threads of their own.
+
+    Two transactions therefore read the same ``MAX(seq)``, both wrote ``seq + 1``, and the
+    second died on the unique constraint — taking down not just its audit line but the
+    sync or the acceptance that line was recording.
+    """
+    tenant_id = two_tenants["zero"]
+    rounds, workers = 20, 4
+    failures: list[str] = []
+
+    def write_audits() -> None:
+        for _ in range(rounds):
+            try:
+                with tenant_scope(sessions, tenant_id) as scope:
+                    scope.audit("touched", actor_kind="service", subject_kind="tenant")
+                    scope.commit()
+            except Exception as exc:  # noqa: BLE001 — the failure is the finding
+                failures.append(f"{type(exc).__name__}: {exc}")
+
+    threads = [threading.Thread(target=write_audits) for _ in range(workers)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=30)
+
+    assert failures == []
+    with tenant_scope(sessions, tenant_id) as scope:
+        seqs = list(scope.scalars(sa.select(m.AuditEvent.seq).order_by(m.AuditEvent.seq)))
+    assert seqs == list(range(1, rounds * workers + 1))
 
 
 def test_move_bundle_requires_a_target(sessions, two_tenants):

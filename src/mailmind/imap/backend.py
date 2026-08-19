@@ -29,10 +29,22 @@ class IdentityLost(Exception):
     """
 
 
+#: The RFC 6154 attributes mailmind acts on, in the one spelling the rest of the service
+#: uses: lowercase, no backslash.  A backend announcing ``\Trash`` normalises before the
+#: value leaves it, so nothing above this line has to know which case a server chose.
+SPECIAL_USE = ("sent", "drafts", "trash", "junk", "archive")
+
+#: Where a delete goes.  Named rather than spelled out at the call site, because the last
+#: time it was spelled out it was spelled differently at each end and delete could never
+#: find anywhere to delete into.
+TRASH = "trash"
+
+
 @attrs.frozen
 class ContainerInfo:
     name: str
     delimiter: str | None = None
+    #: One of :data:`SPECIAL_USE`, or None.  Normalised by the backend, never raw.
     special_use: str | None = None
     selectable: bool = True
 

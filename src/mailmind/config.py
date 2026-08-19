@@ -45,12 +45,15 @@ class Login:
     password: str
 
     def __attrs_post_init__(self) -> None:
-        scheme = self.password.partition("://")[0]
-        if scheme not in PASSWORD_SCHEMES:
+        scheme, separator, _ = self.password.partition("://")
+        if not separator or scheme not in PASSWORD_SCHEMES:
+            # The value is not quoted back.  The mistake this catches is a literal
+            # password in the config file, and printing it to the terminal — and into
+            # whatever collects the traceback — is the one thing this must not do.
             raise ConfigError(
-                f"password must be a URL with one of "
-                f"{', '.join(sorted(s + '://' for s in PASSWORD_SCHEMES))} — got "
-                f"{self.password.split('://')[0]!r}"
+                f"login {self.username!r}: password must be a URL with one of "
+                f"{', '.join(sorted(s + '://' for s in PASSWORD_SCHEMES))}"
+                + (f", got {scheme}://" if separator else "")
             )
 
     def resolve(self) -> str:
@@ -117,10 +120,14 @@ def load_config(path: Path | None = None) -> Config:
         _account(name, body) for name, body in raw.get("accounts", {}).items()
     )
     limits_raw = raw.get("limits", {})
+    try:
+        limits = Limits(**limits_raw)
+    except TypeError as exc:
+        raise ConfigError(f"[limits]: {exc}") from exc
     return Config(
         database_url=raw.get("database_url", "sqlite:///mailmind.db"),
         accounts=accounts,
-        limits=Limits(**limits_raw),
+        limits=limits,
         bind=raw.get("bind", "127.0.0.1"),
         port=raw.get("port", 8765),
     )
@@ -157,7 +164,8 @@ def resolve_password(url: str, *, username: str | None = None) -> str:
     """
     scheme, separator, rest = url.partition("://")
     if not separator:
-        raise ConfigError(f"password must be a URL, e.g. env://NAME — got {url!r}")
+        # Not echoed: what was passed may well be the password itself.
+        raise ConfigError("password must be a URL, e.g. env://NAME")
 
     if scheme == "env":
         if not rest:
@@ -194,4 +202,4 @@ def resolve_password(url: str, *, username: str | None = None) -> str:
             raise ConfigError(f"no secret-storage entry for {service}/{user}")
         return value
 
-    raise ConfigError(f"unknown password scheme {scheme!r} in {url!r}")
+    raise ConfigError(f"unknown password scheme {scheme}://")

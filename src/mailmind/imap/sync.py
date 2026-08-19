@@ -187,7 +187,8 @@ def _absorb(
     """Fold one FETCH result into the cache.  Returns whether it was new here."""
     raw = info.raw or info.headers or b""
     parsed = parse_message(raw)
-    message, _ = cache.upsert_message(scope, account.id, parsed)
+    # RFC822.SIZE, because `raw` here is usually the header block alone.
+    message, _ = cache.upsert_message(scope, account.id, parsed, size_bytes=info.size or None)
     cache.index_message(scope, message)
     cache.record_mechanical_assessment(scope, message, parsed)
 

@@ -54,6 +54,8 @@ class ParsedMessage:
     #: "ok", "partial" or "unparseable".
     parse_status: str
     parse_detail: str | None
+    #: The length of the blob that was parsed, which for a sync is the header block.
+    #: What the message actually weighs comes from the server, not from here.
     size_bytes: int
 
     @property

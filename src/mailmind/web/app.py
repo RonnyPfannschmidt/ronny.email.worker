@@ -22,6 +22,7 @@ from mailmind import views
 from mailmind.db import models as m
 from mailmind.imap import apply as applier
 from mailmind.imap import sync
+from mailmind.imap.backend import TRASH
 from mailmind.mcp import server as mcp_server
 from mailmind.service import Service
 from mailmind.suggest import model as suggest
@@ -167,13 +168,13 @@ def create_app(service: Service) -> FastAPI:
             if placement is not None:
                 container = scope.get(m.Container, placement.container_id)
                 account = scope.get(m.Account, container.account_id)
-                with contextlib.suppress(Exception):
+                with contextlib.suppress(Exception), service.backend(account) as backend:
                     sync.fetch_and_cache_body(
                         scope,
                         account,
                         container,
                         placement,
-                        service.backend(account),
+                        backend,
                         budget_bytes=service.config.limits.body_cache_bytes,
                     )
                 scope.commit()
@@ -213,13 +214,12 @@ def create_app(service: Service) -> FastAPI:
             trash = scope.scalar(
                 sa.select(m.Container).where(
                     m.Container.account_id == account.id,
-                    m.Container.special_use == "trash",
+                    m.Container.special_use == TRASH,
                 )
             )
             try:
-                applier.apply_bundle(
-                    scope, bundle, service.backend(account), trash_container=trash
-                )
+                with service.backend(account) as backend:
+                    applier.apply_bundle(scope, bundle, backend, trash_container=trash)
             except applier.NotApplicable as exc:
                 scope.commit()
                 return _back(bundle_id, str(exc))
@@ -268,10 +268,10 @@ def create_app(service: Service) -> FastAPI:
         with service.scope() as scope:
             account = scope.get(m.Account, account_id)
             if account is not None:
-                backend = service.backend(account)
-                for container in sync.discover_containers(scope, account, backend):
-                    if container.selectable:
-                        sync.sync_container(scope, account, container, backend)
+                with service.backend(account) as backend:
+                    for container in sync.discover_containers(scope, account, backend):
+                        if container.selectable:
+                            sync.sync_container(scope, account, container, backend)
                 scope.commit()
         return RedirectResponse("/accounts", status_code=303)
 

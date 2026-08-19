@@ -9,10 +9,9 @@ from __future__ import annotations
 
 import hashlib
 import secrets
+import threading
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
-
-import sqlalchemy as sa
 
 from mailmind.config import AccountConfig, Config, load_config
 from mailmind.db import models as m
@@ -45,46 +44,41 @@ class Service:
         self.sessions = make_sessionmaker(self.engine)
         self._backend_factory = backend_factory or _real_backend
         self._backends: dict[str, MailBackend] = {}
+        self._backend_locks: dict[str, threading.Lock] = {}
+        self._registry_lock = threading.Lock()
 
     @contextmanager
     def scope(self, tenant_id: int = TENANT_ZERO) -> Iterator[TenantScope]:
         with tenant_scope(self.sessions, tenant_id) as scope:
             yield scope
 
-    def backend(self, account: m.Account) -> MailBackend:
-        if account.name not in self._backends:
-            self._backends[account.name] = self._backend_factory(
-                self.config.account(account.name)
-            )
-        return self._backends[account.name]
+    @contextmanager
+    def backend(self, account: m.Account) -> Iterator[MailBackend]:
+        """One account's connection, held for as long as the caller needs it.
+
+        A backend is handed out under a lock rather than returned, because IMAP is a
+        stateful protocol with a selected folder and a connection therefore belongs to
+        one worker at a time — which the routes and the MCP tools, running in threadpools
+        of their own, would otherwise not respect.  Two threads interleaving SELECTs on
+        one connection do not fail; they read the wrong folder.
+        """
+        with self._registry_lock:
+            backend = self._backends.get(account.name)
+            if backend is None:
+                backend = self._backends[account.name] = self._backend_factory(
+                    self.config.account(account.name)
+                )
+            lock = self._backend_locks.setdefault(account.name, threading.Lock())
+        with lock:
+            yield backend
 
     def close(self) -> None:
-        for backend in self._backends.values():
+        with self._registry_lock:
+            backends = list(self._backends.values())
+            self._backends.clear()
+            self._backend_locks.clear()
+        for backend in backends:
             backend.close()
-        self._backends.clear()
-
-    # ------------------------------------------------------------------- grants
-
-    def resolve_grant(self, token: str) -> m.Grant | None:
-        """A token is the whole of what a caller may claim.
-
-        05: an agent cannot widen its own scope, cannot name a tenant, and cannot assert
-        who it is.  All of that is settled here, before it says anything.
-        """
-        with self.scope() as scope:
-            grant = scope.scalar(
-                sa.select(m.Grant).where(m.Grant.token_hash == hash_token(token))
-            )
-            if grant is None or grant.revoked_at is not None:
-                return None
-            if grant.expires_at is not None:
-                import datetime as dt
-
-                if grant.expires_at <= dt.datetime.now(dt.UTC):
-                    return None
-            # Detach the useful parts; the session closes with this block.
-            scope.session.expunge_all()
-            return grant
 
 
 def _real_backend(account: AccountConfig) -> MailBackend:

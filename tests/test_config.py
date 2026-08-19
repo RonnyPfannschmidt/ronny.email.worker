@@ -72,6 +72,35 @@ def test_an_unknown_scheme_is_refused_at_load_time(tmp_path):
         load_config(write(tmp_path, text))
 
 
+def test_a_refusal_never_quotes_back_what_might_be_the_password(tmp_path):
+    """The mistake this catches is a literal password in the config file.
+
+    Printing it to the terminal, and into whatever collects the traceback, is the one
+    thing the refusal must not do.
+    """
+    secret = "hunter2-actual-password"  # noqa: S105 — that is the point of the test
+    text = CONFIG.replace("env://PERSONAL_PASSWORD", secret)
+    with pytest.raises(ConfigError) as refused:
+        load_config(write(tmp_path, text))
+    assert secret not in str(refused.value)
+
+    with pytest.raises(ConfigError) as refused:
+        resolve_password(secret)
+    assert secret not in str(refused.value)
+
+    # A scheme that does not exist is named; what follows it is still not.
+    with pytest.raises(ConfigError) as refused:
+        resolve_password(f"vault://{secret}")
+    assert secret not in str(refused.value)
+    assert "vault" in str(refused.value)
+
+
+def test_an_unknown_key_under_limits_is_a_config_error(tmp_path):
+    text = CONFIG + "\n[limits]\nmax_messages = 10\n"
+    with pytest.raises(ConfigError, match="limits"):
+        load_config(write(tmp_path, text))
+
+
 def test_env_urls_resolve(monkeypatch):
     monkeypatch.setenv("MAILMIND_TEST_PW", "opensesame")
     assert resolve_password("env://MAILMIND_TEST_PW") == "opensesame"
@@ -130,3 +159,16 @@ def test_a_password_url_never_contains_the_password(tmp_path):
     login = Login(username="me", password=f"file://{secret}")
     assert "opensesame" not in login.password
     assert login.resolve() == "opensesame"
+
+
+def test_a_command_line_override_reaches_the_configuration(tmp_path):
+    """Not only the server it is handed to.
+
+    The MCP endpoint's DNS-rebinding allow-list is built from the configured bind
+    address, so ``serve --host`` that only reached uvicorn produced a service refusing
+    its own Host.
+    """
+    from mailmind.cli import _service
+
+    service = _service(str(write(tmp_path, CONFIG)), bind="192.0.2.10", port=9000)
+    assert (service.config.bind, service.config.port) == ("192.0.2.10", 9000)

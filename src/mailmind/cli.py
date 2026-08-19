@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import attrs
 import click
 import sqlalchemy as sa
 
@@ -14,8 +15,10 @@ from mailmind.db.migrate import upgrade_to_head
 from mailmind.service import TENANT_ZERO, Service, hash_token, mint_token
 
 
-def _service(config_path: str | None) -> Service:
+def _service(config_path: str | None, **overrides: object) -> Service:
     config = load_config(Path(config_path)) if config_path else load_config()
+    if overrides:
+        config = attrs.evolve(config, **overrides)
     return Service(config)
 
 
@@ -126,7 +129,8 @@ def probe(ctx: click.Context) -> None:
     diverged = False
     with service.scope(TENANT_ZERO) as scope:
         for account in scope.scalars(sa.select(m.Account)):
-            report = probe_account(scope, account, service.backend(account))
+            with service.backend(account) as backend:
+                report = probe_account(scope, account, backend)
             if report.missing:
                 diverged = True
                 click.secho(
@@ -156,22 +160,22 @@ def sync(ctx: click.Context, account_name: str | None) -> None:
         if account_name:
             stmt = stmt.where(m.Account.name == account_name)
         for account in scope.scalars(stmt):
-            backend = service.backend(account)
-            for container in sync_module.discover_containers(scope, account, backend):
-                if not container.selectable:
-                    continue
-                report = sync_module.sync_container(scope, account, container, backend)
-                if report.identity_broken:
-                    click.secho(
-                        f"{container.name}: RECREATED — {report.suggestions_killed} "
-                        "suggestion(s) died with it",
-                        fg="red",
-                    )
-                elif report.added or report.updated or report.vanished:
-                    click.echo(
-                        f"{container.name}: +{report.added} ~{report.updated} "
-                        f"-{report.vanished}"
-                    )
+            with service.backend(account) as backend:
+                for container in sync_module.discover_containers(scope, account, backend):
+                    if not container.selectable:
+                        continue
+                    report = sync_module.sync_container(scope, account, container, backend)
+                    if report.identity_broken:
+                        click.secho(
+                            f"{container.name}: RECREATED — {report.suggestions_killed} "
+                            "suggestion(s) died with it",
+                            fg="red",
+                        )
+                    elif report.added or report.updated or report.vanished:
+                        click.echo(
+                            f"{container.name}: +{report.added} ~{report.updated} "
+                            f"-{report.vanished}"
+                        )
             scope.commit()
     service.close()
 
@@ -198,13 +202,15 @@ def serve(ctx: click.Context, host: str | None, port: int | None) -> None:
 
     from mailmind.web.app import create_app
 
-    service = _service(ctx.obj["config_path"])
+    # An override has to reach the configuration rather than only uvicorn: the MCP
+    # endpoint builds its DNS-rebinding allow-list from the configured bind address, so
+    # a service told to listen elsewhere would refuse the very Host it was serving.
+    overrides = {key: value for key, value in (("bind", host), ("port", port)) if value}
+    service = _service(ctx.obj["config_path"], **overrides)
     app = create_app(service)
-    click.echo(
-        f"review UI  http://{host or service.config.bind}:{port or service.config.port}/\n"
-        f"MCP        http://{host or service.config.bind}:{port or service.config.port}/mcp"
-    )
-    uvicorn.run(app, host=host or service.config.bind, port=port or service.config.port)
+    where = f"http://{service.config.bind}:{service.config.port}"
+    click.echo(f"review UI  {where}/\nMCP        {where}/mcp")
+    uvicorn.run(app, host=service.config.bind, port=service.config.port)
 
 
 if __name__ == "__main__":

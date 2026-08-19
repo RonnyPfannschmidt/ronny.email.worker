@@ -16,6 +16,40 @@ import sqlalchemy as sa
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
 
+class UTCDateTime(sa.types.TypeDecorator):
+    """A datetime that is timezone-aware on both sides of the database.
+
+    SQLite has no datetime type and no offset: an aware value handed to it is written
+    without its offset and read back naive, so a column declared ``timezone=True`` is
+    still a lie by the time anything compares it to ``now()``.  That comparison is not
+    hypothetical — it is how a grant's expiry is checked on every request, and a naive
+    value there raises ``TypeError`` rather than expiring anything.
+
+    So: normalise to UTC going in, reattach UTC coming out.  A naive value is read as UTC
+    rather than refused, because a ``Date`` header carrying the ``-0000`` that RFC 5322
+    defines as "zone unknown" parses to a naive datetime, and that is ordinary mail.
+    """
+
+    impl = sa.DateTime(timezone=True)
+    cache_ok = True
+
+    def process_bind_param(
+        self, value: dt.datetime | None, dialect: object
+    ) -> dt.datetime | None:
+        if value is None or value.tzinfo is None:
+            return value
+        return value.astimezone(dt.UTC).replace(tzinfo=None)
+
+    def process_result_value(
+        self, value: dt.datetime | None, dialect: object
+    ) -> dt.datetime | None:
+        if value is None:
+            return None
+        if value.tzinfo is None:
+            return value.replace(tzinfo=dt.UTC)
+        return value.astimezone(dt.UTC)
+
+
 def _enum(py_enum: type[enum.Enum], name: str) -> sa.Enum:
     """Store enums as their string values with a CHECK constraint, not as ints."""
     return sa.Enum(
@@ -35,7 +69,7 @@ class Base(DeclarativeBase):
     type_annotation_map = {
         dict[str, Any]: sa.JSON,
         list[str]: sa.JSON,
-        dt.datetime: sa.DateTime(timezone=True),
+        dt.datetime: UTCDateTime(),
     }
 
 

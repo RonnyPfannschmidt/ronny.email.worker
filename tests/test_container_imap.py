@@ -128,6 +128,24 @@ def test_capabilities_are_reported_and_not_guessed(backend):
     assert "IMAP4REV1" in caps or "IMAP4REV1".lower() in {c.lower() for c in caps}
 
 
+def test_special_use_arrives_normalised_from_a_real_server(backend, out_of_band):
+    """Whatever case the server chose, one spelling leaves the client.
+
+    The applier looks up a trash folder by that spelling, so a server announcing
+    ``\\Trash`` and a lookup asking for ``trash`` is a delete that can never find
+    anywhere to go.
+    """
+    from mailmind.imap.backend import SPECIAL_USE
+
+    ensure_folder(out_of_band, "Trash")
+    reported = {c.name: c.special_use for c in backend.list_containers()}
+    assert reported, "the server listed no folders at all"
+    for name, special_use in reported.items():
+        assert special_use is None or special_use in SPECIAL_USE, (
+            f"{name} reported {special_use!r}, which nothing downstream looks for"
+        )
+
+
 def test_envelopes_come_back_with_headers_but_no_body(backend, seeded):
     envelopes = {e.uid: e for e in backend.fetch_envelopes("INBOX")}
     envelope = envelopes[seeded["ordinary"]]

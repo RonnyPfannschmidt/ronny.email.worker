@@ -18,21 +18,45 @@ from mailmind.db import models as m
 from mailmind.db.scope import TenantScope
 
 
-def known_sender(scope: TenantScope, account_id: int, address: str) -> bool:
+def known_sender(
+    scope: TenantScope, account_id: int, address: str, *, before_message_id: int
+) -> bool:
+    """Was an earlier message from this address already cached?
+
+    "Earlier" is by insertion rather than by date, and the message being assessed is
+    excluded from its own answer.  Both matter: the row is written and flushed before the
+    assessment runs, so counting every message from the address counted this one and made
+    ``first_contact`` a finding that could never fire — and since the mechanical half is
+    recomputed when a body arrives, an answer that drifted with what has been cached
+    since would quietly delete the finding from under a reviewer.
+    """
     return (
         scope.scalar(
             sa.select(sa.func.count())
             .select_from(m.Message)
-            .where(m.Message.account_id == account_id, m.Message.from_address == address)
+            .where(
+                m.Message.account_id == account_id,
+                m.Message.from_address == address,
+                m.Message.id < before_message_id,
+            )
         )
         or 0
     ) > 0
 
 
 def upsert_message(
-    scope: TenantScope, account_id: int, parsed: ParsedMessage
+    scope: TenantScope,
+    account_id: int,
+    parsed: ParsedMessage,
+    *,
+    size_bytes: int | None = None,
 ) -> tuple[m.Message, bool]:
-    """Find or create the message row.  Returns ``(message, created)``."""
+    """Find or create the message row.  Returns ``(message, created)``.
+
+    ``size_bytes`` is what the server said the whole message weighs, where it said
+    anything: a sync fetches headers only, so the length of the blob that was parsed is
+    the header block and not the message.
+    """
     content_key = parsed.content_key()
     message = scope.scalar(
         sa.select(m.Message).where(
@@ -49,7 +73,7 @@ def upsert_message(
     message.date_header = parsed.date
     message.from_address = parsed.from_address
     message.from_display = parsed.from_display
-    message.size_bytes = parsed.size_bytes
+    message.size_bytes = parsed.size_bytes if size_bytes is None else size_bytes
     message.has_attachments = bool(parsed.attachments)
     message.list_id = parsed.list_id
     message.has_list_unsubscribe = parsed.has_list_unsubscribe
@@ -100,13 +124,27 @@ def index_message(scope: TenantScope, message: m.Message) -> None:
 
 
 def search_messages(
-    scope: TenantScope, query: str, *, account_id: int | None = None, limit: int = 50
+    scope: TenantScope,
+    query: str,
+    *,
+    account_ids: set[int] | None = None,
+    limit: int = 50,
 ) -> list[int]:
+    """Search the index, optionally narrowed to a set of accounts.
+
+    ``account_ids`` is how a caller's own view reaches the one query the loader criteria
+    cannot police.  ``None`` means every account of the tenant, which is the reviewer's
+    view and never an agent's; an empty set means no mail rather than all of it.
+    """
     sql = "SELECT message_id FROM message_fts WHERE message_fts MATCH :q AND tenant_id = :tid"
     params: dict[str, object] = {"q": query, "tid": scope.tenant_id, "limit": limit}
-    if account_id is not None:
-        sql += " AND account_id = :aid"
-        params["aid"] = account_id
+    if account_ids is not None:
+        if not account_ids:
+            return []
+        names = [f"aid{index}" for index, _ in enumerate(sorted(account_ids))]
+        placeholders = ", ".join(f":{name}" for name in names)
+        sql += f" AND account_id IN ({placeholders})"
+        params.update(dict(zip(names, sorted(account_ids), strict=True)))
     sql += " ORDER BY rank LIMIT :limit"
     return [row[0] for row in scope.session.execute(sa.text(sql), params)]
 
@@ -141,7 +179,9 @@ def record_mechanical_assessment(
 
     findings = mechanical_findings(
         parsed,
-        is_known_sender=lambda address: known_sender(scope, message.account_id, address),
+        is_known_sender=lambda address: known_sender(
+            scope, message.account_id, address, before_message_id=message.id
+        ),
     )
     for finding in findings:
         scope.add(
