@@ -22,6 +22,7 @@ from mailmind.imap.backend import TRASH
 from mailmind.imap.capabilities import probe_account
 from mailmind.mcp import server as mcp_server
 from mailmind.service import Service, hash_token
+from mailmind.web import app as app_module
 from mailmind.web.app import create_app
 from tests.corpus import CORPUS
 from tests.targets.fake import FakeBackend
@@ -299,6 +300,9 @@ def other_account(service):
         scope.commit()
         return {
             "account_id": account.id,
+            "test_account_id": scope.scalar(
+                sa.select(m.Account.id).where(m.Account.name == "test")
+            ),
             "container_id": containers["INBOX"].id,
             "message_id": message.id,
             "bundle_id": bundle.id,
@@ -655,6 +659,67 @@ def test_the_mcp_endpoint_answers_on_the_address_it_was_told_to_serve(service, b
     )
     with TestClient(create_app(elsewhere), base_url="http://127.0.0.2:9000") as moved:
         assert [a["name"] for a in Agent(moved).call("list_accounts")] == ["test"]
+
+
+def test_the_queue_shows_the_account_being_worked_in_and_no_other(client, other_account):
+    """Local review has no login, so the account is what a person chooses instead.
+
+    A view rather than a boundary: the reviewer owns all of it, and a link to a bundle in
+    another account still opens. What the choice decides is what the queue is *about*.
+    """
+    agent = Agent(client)
+    mine = _propose(agent)["bundle_id"]
+    theirs = other_account["bundle_id"]
+
+    # Nothing chosen yet, so the first account by name — "other" sorts before "test".
+    queue = client.get("/").text
+    assert "working in" in queue
+    assert f"/bundle/{theirs}" in queue
+    assert f"/bundle/{mine}" not in queue
+
+    switched = client.post(
+        "/accounts/choose",
+        data={"account_id": other_account["test_account_id"]},
+        follow_redirects=True,
+    )
+    assert switched.status_code == 200
+    assert f"/bundle/{mine}" in switched.text
+    assert f"/bundle/{theirs}" not in switched.text
+
+    # The choice is the person's and outlives the request that made it.
+    assert f"/bundle/{mine}" in client.get("/").text
+
+    # Not a boundary: the other account's bundle is still readable by its link.
+    assert client.get(f"/bundle/{theirs}").status_code == 200
+
+
+def test_a_chosen_account_that_goes_away_takes_the_choice_and_not_the_producer(service):
+    """`ON DELETE SET NULL` on the choice.
+
+    Removing an account should drop a preference and never a producer, because the
+    producer is what "who accepted this" points at. Removing accounts is not a feature
+    yet — this asserts the clause is there so that it can be.
+    """
+    with service.scope() as scope:
+        spare = scope.add(
+            m.Account(name="spare", host="h", username="u3", password_url="env://Z")
+        )
+        person = scope.add(m.Producer(kind=m.ProducerKind.person, name="reviewer"))
+        scope.flush()
+        person.current_account_id = spare.id
+        scope.commit()
+        spare_id, person_id = spare.id, person.id
+
+    with service.scope() as scope:
+        scope.execute(sa.delete(m.Account).where(m.Account.id == spare_id))
+        scope.commit()
+
+    with service.scope() as scope:
+        person = scope.get(m.Producer, person_id)
+        assert person is not None, "the producer went with the account"
+        assert person.current_account_id is None
+        # And the fallback puts the reviewer back in a real account.
+        assert app_module.chosen_account(scope).name == "test"
 
 
 def test_an_unauthenticated_review_ui_refuses_to_listen_to_the_network(service, backend):

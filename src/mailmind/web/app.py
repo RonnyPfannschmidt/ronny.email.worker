@@ -62,6 +62,30 @@ class GrantMiddleware(BaseHTTPMiddleware):
             mcp_server.CURRENT_GRANT.reset(reset)
 
 
+def chosen_account(scope) -> m.Account | None:  # noqa: ANN001
+    """Which account the review UI is working in.
+
+    Local review has no login, so there is nobody to look up and nothing to derive this
+    from: the reviewer is implicit, and what a person picks instead is which account they
+    are looking at.  Authentication only enters on a deployment, and when it does it
+    replaces :func:`reviewer` rather than this.
+
+    This is a view and not a boundary.  Nothing is being kept from anybody — the person
+    at the keyboard owns all of it — so a link to a bundle in another account still
+    works.  The account scoping that *is* a boundary is the grant's, on the agent
+    surface, and it is enforced somewhere else entirely.
+
+    Nothing chosen falls back to the first account by name, so a fresh install has one
+    without anybody having to pick.
+    """
+    person = scope.scalar(sa.select(m.Producer).where(m.Producer.kind == m.ProducerKind.person))
+    if person is not None and person.current_account_id is not None:
+        chosen = scope.get(m.Account, person.current_account_id)
+        if chosen is not None:
+            return chosen
+    return scope.scalar(sa.select(m.Account).order_by(m.Account.name))
+
+
 def reviewer(scope) -> m.Producer:  # noqa: ANN001
     """The person at the keyboard.
 
@@ -119,6 +143,14 @@ def create_app(service: Service) -> FastAPI:
     def render(request: Request, template: str, **context) -> HTMLResponse:  # noqa: ANN003
         return TEMPLATES.TemplateResponse(request, template, context)
 
+    def chrome(scope) -> dict:  # noqa: ANN001
+        """What the header shows on every page: the accounts, and which one is chosen."""
+        current = chosen_account(scope)
+        return {
+            "accounts": views.accounts(scope),
+            "current_account": {"id": current.id, "name": current.name} if current else None,
+        }
+
     # -------------------------------------------------------------- the queue
 
     @app.get("/", response_class=HTMLResponse)
@@ -126,7 +158,11 @@ def create_app(service: Service) -> FastAPI:
         with service.scope() as scope:
             suggest.expire_due(scope)
             scope.commit()
-            bundles = views.bundle_summaries(scope, [m.BundleStatus.proposed])
+            header = chrome(scope)
+            current = header["current_account"]
+            # None means every account, which is only reachable when there are none at all.
+            here = {current["id"]} if current else None
+            bundles = views.bundle_summaries(scope, [m.BundleStatus.proposed], account_ids=here)
             recent = views.bundle_summaries(
                 scope,
                 [
@@ -136,8 +172,9 @@ def create_app(service: Service) -> FastAPI:
                     m.BundleStatus.expired,
                     m.BundleStatus.withdrawn,
                 ],
+                account_ids=here,
             )[:10]
-            return render(request, "queue.html", bundles=bundles, recent=recent)
+            return render(request, "queue.html", bundles=bundles, recent=recent, **header)
 
     @app.get("/bundle/{bundle_id}", response_class=HTMLResponse)
     def bundle_page(request: Request, bundle_id: int, error: str | None = None):  # noqa: ANN202
@@ -164,7 +201,14 @@ def create_app(service: Service) -> FastAPI:
                         "text": (body.text_plain or body.text_from_html or "")[:4000],
                         "links": body.links.get("links", [])[:40],
                     }
-            return render(request, "bundle.html", bundle=detail, bodies=bodies, error=error)
+            return render(
+                request,
+                "bundle.html",
+                bundle=detail,
+                bodies=bodies,
+                error=error,
+                **chrome(scope),
+            )
 
     @app.post("/bundle/{bundle_id}/body/{message_id}")
     def load_body(bundle_id: int, message_id: int):  # noqa: ANN202
@@ -268,7 +312,21 @@ def create_app(service: Service) -> FastAPI:
                         ),
                     }
                 )
-            return render(request, "accounts.html", rows=rows)
+            return render(request, "accounts.html", rows=rows, **chrome(scope))
+
+    @app.post("/accounts/choose")
+    def choose_account(account_id: int = Form()):  # noqa: ANN202
+        """Work in a different account.
+
+        The choice belongs to the person rather than to the tenant, which is the shape it
+        needs on a deployment where several authenticated people share one.
+        """
+        with service.scope() as scope:
+            account = scope.get(m.Account, account_id)
+            if account is not None:
+                reviewer(scope).current_account_id = account.id
+                scope.commit()
+        return RedirectResponse("/", status_code=303)
 
     @app.post("/accounts/{account_id}/sync")
     def sync_account(account_id: int):  # noqa: ANN202

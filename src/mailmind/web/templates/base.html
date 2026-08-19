@@ -7,7 +7,11 @@
 <style>
 :root { color-scheme: light dark; --line:#0002; --warn:#b45309; --bad:#b91c1c; --ok:#15803d; }
 body { font: 15px/1.5 system-ui, sans-serif; margin: 0 auto; max-width: 62rem; padding: 1.5rem; }
-nav a { margin-right: 1rem; }
+nav { display: flex; gap: 1rem; align-items: baseline; flex-wrap: wrap; }
+nav a { margin-right: 0; }
+nav form { margin-left: auto; }
+nav select, nav button { font: inherit; font-size: .85rem; padding: .15rem .4rem; }
+.here { font-weight: 600; }
 h1 { font-size: 1.3rem; } h2 { font-size: 1.05rem; margin-top: 2rem; }
 table { border-collapse: collapse; width: 100%; }
 th, td { text-align: left; padding: .4rem .5rem; border-bottom: 1px solid var(--line); vertical-align: top; }
@@ -31,7 +35,27 @@ details summary { cursor: pointer; }
 </style>
 </head>
 <body>
-<nav class="small"><a href="/">review queue</a><a href="/accounts">accounts</a></nav>
+<nav class="small">
+  <a href="/">review queue</a><a href="/accounts">accounts</a>
+  {% if current_account %}
+    {% if accounts|length > 1 %}
+      {# No script anywhere: the CSP forbids it, so switching is a submit rather than an
+         onchange. #}
+      <form method="post" action="/accounts/choose">
+        <label>working in
+          <select name="account_id">
+            {% for a in accounts %}
+            <option value="{{ a.id }}"{% if a.id == current_account.id %} selected{% endif %}>{{ a.name }}</option>
+            {% endfor %}
+          </select>
+        </label>
+        <button>switch</button>
+      </form>
+    {% else %}
+      <span class="muted" style="margin-left:auto">working in <span class="here">{{ current_account.name }}</span></span>
+    {% endif %}
+  {% endif %}
+</nav>
 {% block content %}{% endblock %}
 </body>
 </html>

@@ -120,6 +120,16 @@ class Producer(Base, TenantScoped):
     kind: Mapped[ProducerKind] = mapped_column(_enum(ProducerKind, "producer_kind"))
     name: Mapped[str] = mapped_column(sa.String(128))
     created_at: Mapped[dt.datetime] = mapped_column(default=utcnow)
+    #: Which account this person is currently working in.  Local review has no login, so
+    #: the reviewer is implicit and the account is the thing they choose instead; on a
+    #: deployment the same column is per authenticated person.  It says nothing about an
+    #: agent, whose accounts come from its grant and are not chosen at all.
+    #:
+    #: ``SET NULL`` rather than a cascade: removing an account should drop a preference,
+    #: never a producer, because the producer is what "who accepted this" points at.
+    current_account_id: Mapped[int | None] = mapped_column(
+        sa.ForeignKey("account.id", ondelete="SET NULL"), default=None
+    )
 
     __table_args__ = (sa.UniqueConstraint("tenant_id", "name"),)
 

@@ -3,7 +3,7 @@
 <h1>Awaiting review</h1>
 
 {% if not bundles %}
-  <p class="muted">Nothing to review.</p>
+  <p class="muted">Nothing to review{% if current_account %} in {{ current_account.name }}{% endif %}.</p>
 {% else %}
 <table>
   <tr><th>What would happen</th><th>Messages</th><th>From</th><th>Why</th><th></th></tr>

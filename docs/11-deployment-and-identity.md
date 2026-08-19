@@ -28,6 +28,13 @@ Loopback means provably loopback — `127.0.0.0/8`, `::1`, `localhost`. A hostna
 resolved to find out, because it could resolve to anything later and the check is meant to
 be sure rather than accommodating.
 
+Identity in this mode splits into two questions with different answers. *Who* is implicit:
+one `producer` row of kind `person`, which exists so that "who accepted this" is
+answerable, not because anybody authenticated. *Which mail* is **chosen** — a person picks
+the account they are working in, and the queue is about that account. Authentication
+answers neither question here, and when it arrives on a deployment it replaces the first
+one only.
+
 **Shared.** Anything else authenticates through somebody else. mailmind does not grow a
 user table, a password reset, or a session cookie of its own; there is nothing here that
 does identity better than the things that exist to do identity, and a review UI that
@@ -39,6 +46,22 @@ identity-aware proxy — authenticates every request before it arrives. `behind_
 true` is how an operator says so. It is an **assertion, not a feature**: nothing in this
 process can verify that anything is in front of it, which is exactly why it has to be
 written down rather than inferred from the bind address.
+
+## The chosen account
+
+The choice belongs to the person rather than to the tenant — `producer.current_account_id`
+— which is the shape it already needs for a deployment where several authenticated people
+share one tenant. Nothing chosen falls back to the first account by name, so a fresh
+install has one without anybody having to pick, and an account that goes away takes the
+preference with it and not the producer: `ON DELETE SET NULL`, because the producer is
+what "who accepted this" points at.
+
+It is worth being explicit that **this is a view and not a boundary**, because the codebase
+now contains something that looks identical and is not. A grant's account scoping on the
+agent surface is a boundary: an account outside it reads as absent, and every tool checks.
+The chosen account keeps nothing from anybody — the person at the keyboard owns all of it
+— so a link to a bundle in another account still opens. What the choice decides is what
+the queue is *about*.
 
 ## Where a mail credential lives
 
@@ -130,7 +153,12 @@ accounts sticks.
   `/mcp` simply not belong on a shared deployment?
 - If the proxy authenticates, how does the identity it asserts become a `producer` row and
   a tenant? A header the proxy sets is the usual answer and is only as good as the promise
-  that nothing else can reach the port.
+  that nothing else can reach the port. Note that only the *who* half needs answering —
+  which account a person is working in is already theirs to choose.
+- Should an agent's proposals be confined to the account the reviewer is looking at? They
+  are not: a grant covers what it covers, and a bundle proposed against an account nobody
+  is currently looking at still waits in that account's queue. That is probably right and
+  is definitely untested against somebody using two accounts in anger.
 - Is `behind_auth_proxy` the right shape, or should the escape hatch name what is in front
   of it, so the configuration says something checkable rather than something asserted?
 - A grant token is minted on the command line and printed once. On a shared deployment
