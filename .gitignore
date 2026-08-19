@@ -223,3 +223,8 @@ mailmind.toml
 mailmind.db
 mailmind.db-wal
 mailmind.db-shm
+
+# The dev database, built from the checked-in dev config.
+mailmind.dev.db
+mailmind.dev.db-wal
+mailmind.dev.db-shm

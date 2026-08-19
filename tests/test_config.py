@@ -152,6 +152,50 @@ def test_secret_storage_falls_back_to_the_login_username(monkeypatch):
     assert calls == [("imap.example.org", "me@example.org")]
 
 
+def test_secret_storage_reaches_the_real_keyring_package():
+    """The test above injects a fake module into ``sys.modules``.
+
+    That proves the scheme dispatches and proves nothing about the package it names — which
+    was in no dependency list at all, so ``secret-storage://`` was documented and
+    unreachable while the suite stayed green. This one imports the real thing and puts a
+    real backend behind it, so the call signature is checked against the library rather
+    than against our own idea of it.
+
+    The backend is in-memory: nothing here reads or writes the developer's own store.
+    """
+    keyring = pytest.importorskip("keyring", reason="install the [secrets] extra")
+    from keyring.backend import KeyringBackend
+
+    class InMemory(KeyringBackend):
+        priority = 1
+
+        def __init__(self) -> None:
+            self.store: dict[tuple[str, str], str] = {}
+
+        def set_password(self, service: str, username: str, password: str) -> None:
+            self.store[(service, username)] = password
+
+        def get_password(self, service: str, username: str) -> str | None:
+            return self.store.get((service, username))
+
+        def delete_password(self, service: str, username: str) -> None:
+            self.store.pop((service, username), None)
+
+    backend = InMemory()
+    previous = keyring.get_keyring()
+    keyring.set_keyring(backend)
+    try:
+        backend.set_password("imap.example.org", "me@example.org", "opensesame")
+        login = Login(username="me@example.org", password="secret-storage://imap.example.org")
+        assert login.resolve() == "opensesame"
+
+        missing = Login(username="nobody@example.org", password="secret-storage://nowhere")
+        with pytest.raises(ConfigError, match="no secret-storage entry"):
+            missing.resolve()
+    finally:
+        keyring.set_keyring(previous)
+
+
 def test_a_password_url_never_contains_the_password(tmp_path):
     """What is stored and logged is a location, not a secret."""
     secret = tmp_path / "secret"

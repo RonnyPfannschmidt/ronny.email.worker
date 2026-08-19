@@ -1,0 +1,31 @@
+# A mailmind pointed at a throwaway IMAP container rather than at anybody's mail.
+#
+#   podman run -d --rm --name mailmind-dev -p 3144:143 -e MAILNAME=example.org \
+#     -e MAIL_ADDRESS=me@example.org -e MAIL_PASS=secret \
+#     docker.io/antespi/docker-imap-devel:latest
+#   python dev/seed_mailbox.py
+#   export MAILMIND_CONFIG=mailmind.dev.toml MAILMIND_DEV_PASSWORD=secret
+#   mailmindctl bootstrap && mailmindctl probe && mailmindctl sync
+#
+# Checked in, unlike mailmind.toml, because there is nothing here worth keeping private.
+# See docs/10-running-it.md.
+
+database_url = "sqlite:///mailmind.dev.db"
+bind = "127.0.0.1"
+port = 8765
+
+[accounts.dev]
+host = "127.0.0.1"
+port = 3144
+use_ssl = false
+# Exactly what the service attempts, which is what a declaration is for.  QRESYNC is not
+# in this list: Dovecot offers it, mailmind does not use it, and declaring it would make
+# `probe` demand a capability nothing here would notice the absence of.
+caps = ["CONDSTORE", "MOVE", "UIDPLUS", "SPECIAL-USE", "IDLE"]
+
+[accounts.dev.login]
+username = "me@example.org"
+# env:// here and nowhere else: this is a container's throwaway password, not a secret.
+# For a mailbox that matters, see docs/10-running-it.md — secret-storage:// at a desk,
+# file:// on a headless box, and env:// on neither.
+password = "env://MAILMIND_DEV_PASSWORD"

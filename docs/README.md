@@ -9,6 +9,7 @@
 - [ ] [07 — Tenancy](07-tenancy.md) `#draft` `#open-questions`
 - [ ] [08 — Untrusted content](08-untrusted-content.md) `#draft` `#open-questions`
 - [x] [09 — Iteration one](09-iteration-one.md) `#tried` `#open-questions`
+- [ ] [10 — Running it](10-running-it.md) `#sketch` `#open-questions`
 
 Plus [design history](design-history/) — starting-point documents, kept verbatim, not
 authoritative.

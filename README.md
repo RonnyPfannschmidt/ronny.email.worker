@@ -11,13 +11,25 @@ would go — and accepts or rejects. Only then does the service touch the mailbo
 if nothing has moved in the meantime.
 
 The first iteration is built: IMAP, one tenant, and enough to sort a long untended mailbox.
-See [09 — Iteration one](docs/09-iteration-one.md) for what it does and how to run it.
+See [09 — Iteration one](docs/09-iteration-one.md) for what it does.
 
 Start with [the intent](docs/01-intent.md); the whole design is in [docs/](docs/).
 
+## A first look, costing you nothing
+
+A disposable IMAP server seeded with the test corpus, so nothing here touches your own
+mail. [10 — Running it](docs/10-running-it.md) covers this and pointing it at a real
+mailbox, including where the password should live.
+
 ```
-uv venv && uv pip install -e '.[test]'
-cp mailmind.toml.example mailmind.toml     # then edit it
+uv venv && uv pip install -e '.[dev]'
+
+podman run -d --rm --name mailmind-dev -p 3144:143 -e MAILNAME=example.org \
+  -e MAIL_ADDRESS=me@example.org -e MAIL_PASS=secret \
+  docker.io/antespi/docker-imap-devel:latest
+python dev/seed_mailbox.py
+
+export MAILMIND_CONFIG=mailmind.dev.toml MAILMIND_DEV_PASSWORD=secret
 mailmindctl bootstrap && mailmindctl probe && mailmindctl sync
 mailmindctl grant --producer opencode      # prints a bearer token, once
 mailmindctl serve                          # review UI on /, MCP on /mcp

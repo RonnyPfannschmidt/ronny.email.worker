@@ -19,8 +19,9 @@ use_ssl = true
 # What this server is declared to be able to do.  `mailmindctl probe` checks the
 # declaration against the server and fails loudly on divergence; it never quietly
 # downgrades.  Drop CONDSTORE here and conditional applies become best-effort ones that
-# say so.
-caps = ["CONDSTORE", "QRESYNC", "MOVE", "UIDPLUS", "SPECIAL-USE", "IDLE"]
+# say so.  QRESYNC is deliberately absent: a declaration says what the service attempts,
+# and nothing here uses it, so demanding it would fail the probe for no gain.
+caps = ["CONDSTORE", "MOVE", "UIDPLUS", "SPECIAL-USE", "IDLE"]
 # false keeps message bodies out of the local database entirely.
 cache_bodies = true
 
@@ -28,12 +29,19 @@ cache_bodies = true
 username = "me@example.org"
 # A URL saying where the password is found — never the password itself:
 #
-#   env://MAILMIND_PERSONAL_PASSWORD
-#   file:///run/secrets/mailmind-personal      (also file://~/.secrets/personal)
-#   secret-storage://imap.example.org/me@example.org
+#   secret-storage://imap.example.org           the desktop secret store; the username
+#                                               above is the entry, so this is usually
+#                                               the whole of it.  Needs `.[secrets]`
+#                                               installed and a desktop session to talk
+#                                               to.  `keyring set imap.example.org
+#                                               me@example.org` puts it there.
+#   file://~/.secrets/mailmind-personal         a file with a mode on it.  The headless
+#                                               answer: no session bus, no secret store.
+#   env://MAILMIND_PERSONAL_PASSWORD            the password is then in your shell
+#                                               history and in the environment of every
+#                                               process launched from that shell.  Fine
+#                                               for a throwaway container, wrong here.
 #
-# secret-storage:// may omit the user, in which case the username above is used:
-#   secret-storage://imap.example.org
-#
-# An unknown scheme is refused when the config loads, not when a connection is attempted.
-password = "env://MAILMIND_PERSONAL_PASSWORD"
+# docs/10-running-it.md has the reasoning.  An unknown scheme is refused when the config
+# loads, not when a connection is attempted.
+password = "secret-storage://imap.example.org"

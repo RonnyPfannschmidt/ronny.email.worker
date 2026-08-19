@@ -95,13 +95,8 @@ nothing has needed replay either.
 
 ## Running it
 
-```
-uv venv && uv pip install -e '.[test]'
-cp mailmind.toml.example mailmind.toml     # then edit it
-mailmindctl bootstrap && mailmindctl probe && mailmindctl sync
-mailmindctl grant --producer opencode      # prints a bearer token once
-mailmindctl serve                          # UI on /, MCP on /mcp
-```
+[10 — Running it](10-running-it.md) has the whole of it, including a throwaway mailbox to
+point at so a first look costs nobody their own mail.
 
 Tests run against an in-process fake by default. The container tier needs a real server:
 
