@@ -10,6 +10,7 @@
 - [ ] [08 — Untrusted content](08-untrusted-content.md) `#draft` `#open-questions`
 - [x] [09 — Iteration one](09-iteration-one.md) `#tried` `#open-questions`
 - [ ] [10 — Running it](10-running-it.md) `#sketch` `#open-questions`
+- [ ] [11 — Deployment and identity](11-deployment-and-identity.md) `#sketch` `#open-questions`
 
 Plus [design history](design-history/) — starting-point documents, kept verbatim, not
 authoritative.

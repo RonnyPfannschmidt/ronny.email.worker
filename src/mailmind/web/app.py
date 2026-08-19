@@ -19,6 +19,7 @@ from mcp.server.transport_security import TransportSecuritySettings
 from starlette.middleware.base import BaseHTTPMiddleware
 
 from mailmind import views
+from mailmind.config import check_exposure, is_wildcard
 from mailmind.db import models as m
 from mailmind.imap import apply as applier
 from mailmind.imap import sync
@@ -77,21 +78,27 @@ def reviewer(scope) -> m.Producer:  # noqa: ANN001
 
 
 def create_app(service: Service) -> FastAPI:
+    # Every deployment comes through here, so this is where the bargain is checked: the
+    # review UI has no login, so it does not get to listen anywhere but this machine.
+    check_exposure(service.config)
+
     mcp = mcp_server.build_server(service)
     # DNS rebinding protection: a browser page on some other site must not be able to
     # drive this endpoint just because it is listening on localhost.
     bind = service.config.bind
+    hosts = ["127.0.0.1:*", "localhost:*", "[::1]:*"]
+    origins = [f"http://{host}" for host in hosts]
+    if not is_wildcard(bind):
+        # A wildcard is not an address anybody sends as a Host, so listing it would look
+        # like protection while matching nothing.
+        hosts.append(f"{bind}:*")
+        origins.append(f"http://{bind}:*")
     mcp_app = mcp.streamable_http_app(
         streamable_http_path="/",
         transport_security=TransportSecuritySettings(
             enable_dns_rebinding_protection=True,
-            allowed_hosts=[f"{bind}:*", "127.0.0.1:*", "localhost:*", "[::1]:*"],
-            allowed_origins=[
-                f"http://{bind}:*",
-                "http://127.0.0.1:*",
-                "http://localhost:*",
-                "http://[::1]:*",
-            ],
+            allowed_hosts=hosts,
+            allowed_origins=origins,
         ),
     )
 

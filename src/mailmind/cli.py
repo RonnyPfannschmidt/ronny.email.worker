@@ -9,7 +9,7 @@ import attrs
 import click
 import sqlalchemy as sa
 
-from mailmind.config import load_config
+from mailmind.config import ConfigError, load_config
 from mailmind.db import models as m
 from mailmind.db.migrate import upgrade_to_head
 from mailmind.service import TENANT_ZERO, Service, hash_token, mint_token
@@ -207,7 +207,10 @@ def serve(ctx: click.Context, host: str | None, port: int | None) -> None:
     # a service told to listen elsewhere would refuse the very Host it was serving.
     overrides = {key: value for key, value in (("bind", host), ("port", port)) if value}
     service = _service(ctx.obj["config_path"], **overrides)
-    app = create_app(service)
+    try:
+        app = create_app(service)
+    except ConfigError as exc:
+        raise click.ClickException(str(exc)) from exc
     where = f"http://{service.config.bind}:{service.config.port}"
     click.echo(f"review UI  {where}/\nMCP        {where}/mcp")
     uvicorn.run(app, host=service.config.bind, port=service.config.port)

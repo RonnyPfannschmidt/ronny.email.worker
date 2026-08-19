@@ -13,7 +13,7 @@ import threading
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 
-from mailmind.config import AccountConfig, Config, load_config
+from mailmind.config import AccountConfig, Config, Login, load_config
 from mailmind.db import models as m
 from mailmind.db.engine import create_engine
 from mailmind.db.scope import TenantScope, make_sessionmaker, tenant_scope
@@ -22,6 +22,27 @@ from mailmind.imap.backend import MailBackend
 #: This iteration has one tenant.  Everything is written as though there were more,
 #: because retrofitting the boundary later is the way to get it wrong.
 TENANT_ZERO = 0
+
+
+def account_config(account: m.Account) -> AccountConfig:
+    """What a connection needs, taken from the row rather than from the file.
+
+    The row is the source of truth.  Configured accounts are seeded into it by the
+    bootstrap, and an account added through the review UI will only ever exist as one —
+    looking the name back up in the configuration would have made such an account exist
+    and be unusable at the same time.
+
+    ``caps`` is absent because nothing building a connection reads it: what a server is
+    declared to do lives in ``account_capability`` rows, and the probe compares those.
+    """
+    return AccountConfig(
+        name=account.name,
+        host=account.host,
+        port=account.port,
+        use_ssl=account.use_ssl,
+        login=Login(username=account.username, password=account.password_url),
+        cache_bodies=account.cache_bodies,
+    )
 
 
 def hash_token(token: str) -> str:
@@ -66,7 +87,7 @@ class Service:
             backend = self._backends.get(account.name)
             if backend is None:
                 backend = self._backends[account.name] = self._backend_factory(
-                    self.config.account(account.name)
+                    account_config(account)
                 )
             lock = self._backend_locks.setdefault(account.name, threading.Lock())
         with lock:

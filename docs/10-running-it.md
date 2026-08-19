@@ -8,6 +8,9 @@ may do what to it. This one is written from outside, because the first thing any
 with mailmind is try to run it, and until now the answer was five lines of shell
 duplicated in two files.
 
+Serving it to anything but this machine is refused, because the review UI has no login —
+[11](11-deployment-and-identity.md) has that bargain and the way out of it.
+
 ## Who this is for
 
 Two people, who turn out to want the same thing:
@@ -143,9 +146,9 @@ undo, and this is the one place that could prove it.
 
 ## Open questions
 
-- Should `mailmindctl account add` exist, or is hand-edited TOML the right amount of
-  friction for a file that names a mailbox and a credential? Adding an account is rare and
-  getting it wrong is not.
+- ~~Should `mailmindctl account add` exist?~~ Answered: adding an account is a thing you
+  do in the review UI, so the `account` row is the source of truth and this file is seed
+  data for it. See [11](11-deployment-and-identity.md). The form itself is not built.
 - Is a checked-in `mailmind.dev.toml` a convenience or a footgun? It is one edit away from
   somebody committing their own host, and the thing protecting them is that a different
   filename is gitignored.

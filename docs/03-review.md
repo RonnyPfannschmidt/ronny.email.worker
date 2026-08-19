@@ -26,6 +26,18 @@ expire rather than accumulate forever.
 A suggestion whose premise has moved on cannot be accepted at all — the reviewer is told what
 changed instead.
 
+## A bundle is large when the action is one action
+
+Homogeneity is what makes a bundle reviewable, not its length. One operation and one
+target over an enumerated list stays readable at a size the same list would not be if each
+item could do something different: a hundred messages moving to Archive is one decision
+shown a hundred times, and a hundred messages each doing their own thing is a hundred
+decisions dressed as one.
+
+So a size limit guards against a bundle nobody can render rather than one nobody can
+understand, which makes it a deployment setting rather than a design one — see
+[11](11-deployment-and-identity.md).
+
 ## Where the lifecycle lives
 
 Proposed → accepted → applied, with rejected, withdrawn, superseded and stale as the ways out.
@@ -46,10 +58,12 @@ accepts, not what acceptance is.
 
 ## Open questions
 
+- If homogeneity is what carries a large bundle, what enforces it beyond one operation and
+  one target? Two hundred messages to Archive is one decision; two hundred messages to
+  Archive *for two hundred different reasons* may not be.
 - **The real one:** what stops this becoming rubber-stamping? A queue that is fifty deep gets
   approved without reading, and then the boundary is decorative. This may be the constraint
   the rest of the design has to serve.
-- What does "see the effect" mean for a suggestion touching two hundred messages?
 - Does review happen on a phone? If so, most of the above needs rethinking.
 - Should suggestions be grouped — by sender, by kind, by thread — and does grouping reintroduce
   bulk acceptance through the back door?

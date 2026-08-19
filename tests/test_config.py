@@ -9,7 +9,14 @@ from __future__ import annotations
 
 import pytest
 
-from mailmind.config import ConfigError, Login, load_config, resolve_password
+from mailmind.config import (
+    Config,
+    ConfigError,
+    Login,
+    check_exposure,
+    load_config,
+    resolve_password,
+)
 
 CONFIG = """
 database_url = "sqlite:///x.db"
@@ -216,3 +223,43 @@ def test_a_command_line_override_reaches_the_configuration(tmp_path):
 
     service = _service(str(write(tmp_path, CONFIG)), bind="192.0.2.10", port=9000)
     assert (service.config.bind, service.config.port) == ("192.0.2.10", 9000)
+
+
+def test_binding_to_the_network_is_refused_unless_something_else_authenticates(tmp_path):
+    """The setting is an assertion by the operator, not a feature.
+
+    Nothing here can check that a proxy in front is really authenticating, which is why it
+    has to be written down rather than inferred from the bind address.
+    """
+    # Top-level keys have to come before the first table, or TOML reads them into it.
+    text = 'bind = "0.0.0.0"\n' + CONFIG
+    with pytest.raises(ConfigError, match="no login"):
+        check_exposure(load_config(write(tmp_path, text)))
+
+    allowed = load_config(write(tmp_path, "behind_auth_proxy = true\n" + text))
+    assert allowed.behind_auth_proxy is True
+    check_exposure(allowed)  # says nothing, which is the point
+
+
+@pytest.mark.parametrize(
+    ("bind", "allowed"),
+    [
+        ("127.0.0.1", True),
+        ("127.0.0.2", True),
+        ("localhost", True),
+        ("::1", True),
+        ("0.0.0.0", False),  # noqa: S104 — the case being refused
+        ("::", False),
+        ("192.0.2.10", False),
+        # A name is not resolved: it could resolve to anything, and the check is meant to
+        # be sure rather than accommodating.
+        ("mail.example.org", False),
+    ],
+)
+def test_only_addresses_that_are_provably_this_machine_serve_without_auth(bind, allowed):
+    config = Config(bind=bind)
+    if allowed:
+        check_exposure(config)
+    else:
+        with pytest.raises(ConfigError):
+            check_exposure(config)

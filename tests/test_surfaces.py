@@ -14,7 +14,7 @@ import pytest
 import sqlalchemy as sa
 from fastapi.testclient import TestClient
 
-from mailmind.config import AccountConfig, Config, Limits, Login
+from mailmind.config import AccountConfig, Config, ConfigError, Limits, Login
 from mailmind.db import models as m
 from mailmind.db.migrate import upgrade_to_head
 from mailmind.imap import sync
@@ -648,12 +648,70 @@ def test_the_mcp_endpoint_answers_on_the_address_it_was_told_to_serve(service, b
     so a service listening somewhere its own configuration does not name refuses the very
     Host it is there to serve.
     """
+    # Still loopback — anywhere else is refused outright, which the exposure tests cover.
     elsewhere = Service(
-        attrs.evolve(service.config, bind="192.0.2.10", port=9000),
+        attrs.evolve(service.config, bind="127.0.0.2", port=9000),
         backend_factory=lambda _config: backend,
     )
-    with TestClient(create_app(elsewhere), base_url="http://192.0.2.10:9000") as moved:
+    with TestClient(create_app(elsewhere), base_url="http://127.0.0.2:9000") as moved:
         assert [a["name"] for a in Agent(moved).call("list_accounts")] == ["test"]
+
+
+def test_an_unauthenticated_review_ui_refuses_to_listen_to_the_network(service, backend):
+    """The review UI has no login, so it does not get to be reachable from anywhere else.
+
+    That was half a bargain: the bind address defaulted to loopback and nothing stopped it
+    being changed, so `--host 0.0.0.0` served an accept-and-apply button to the network.
+    """
+    exposed = Service(
+        attrs.evolve(service.config, bind="0.0.0.0"),  # noqa: S104 — the point of the test
+        backend_factory=lambda _config: backend,
+    )
+    with pytest.raises(ConfigError) as refused:
+        create_app(exposed)
+    assert "no login" in str(refused.value)
+
+    # Somebody else authenticating is the other way to hold up the same bargain, and it
+    # has to be said out loud because nothing here can check it.
+    proxied = Service(
+        attrs.evolve(service.config, bind="0.0.0.0", behind_auth_proxy=True),  # noqa: S104
+        backend_factory=lambda _config: backend,
+    )
+    app = create_app(proxied)
+    with TestClient(app, base_url="http://127.0.0.1:8765") as client:
+        assert client.get("/").status_code == 200
+
+
+def test_an_account_that_exists_only_in_the_database_can_still_connect(service, backend):
+    """Which is every account the review UI will ever add.
+
+    Connections used to be built by looking the account's name back up in the
+    configuration file, so a row the file did not mention existed and was unusable at the
+    same time — and the file cannot be the source of truth for something a web form
+    writes.
+    """
+    with service.scope() as scope:
+        row = scope.add(
+            m.Account(
+                name="never-configured",
+                host="imap.invalid",
+                port=1143,
+                use_ssl=False,
+                username="someone@example.org",
+                password_url="env://NEVER_CONFIGURED",
+            )
+        )
+        scope.commit()
+        assert row.name not in {a.name for a in service.config.accounts}
+        with service.backend(row) as opened:
+            assert opened is backend
+
+    from mailmind.service import account_config
+
+    derived = account_config(row)
+    assert (derived.host, derived.port, derived.use_ssl) == ("imap.invalid", 1143, False)
+    assert derived.login.username == "someone@example.org"
+    assert derived.login.password == "env://NEVER_CONFIGURED"
 
 
 def test_the_review_pages_forbid_remote_content(client):

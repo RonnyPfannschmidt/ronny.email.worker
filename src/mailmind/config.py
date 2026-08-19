@@ -8,6 +8,7 @@ is found.
 
 from __future__ import annotations
 
+import ipaddress
 import os
 import tomllib
 from pathlib import Path
@@ -88,16 +89,74 @@ class Limits:
 @attrs.frozen
 class Config:
     database_url: str = "sqlite:///mailmind.db"
+    #: Accounts to seed the database with.  Not what a connection is built from — that is
+    #: the ``account`` row, which this is bootstrapped into and which the review UI will
+    #: also write.
     accounts: tuple[AccountConfig, ...] = ()
     limits: Limits = Limits()
     bind: str = "127.0.0.1"
     port: int = 8765
+    #: An assertion that something in front of this process authenticates every request
+    #: reaching it — a reverse proxy doing forward auth, an identity-aware proxy.  Nothing
+    #: here can check that; setting it is taking responsibility for it.  Without it the
+    #: service refuses to listen anywhere but loopback, because the review UI has no login.
+    behind_auth_proxy: bool = False
 
     def account(self, name: str) -> AccountConfig:
         for account in self.accounts:
             if account.name == name:
                 return account
         raise ConfigError(f"no account named {name!r} in configuration")
+
+
+#: Names that are loopback without having to be resolved.  A name that is not in here is
+#: not resolved either: it could resolve to anything, and the point of the check below is
+#: to be sure rather than to be accommodating.
+LOOPBACK_NAMES = frozenset({"localhost"})
+
+
+def _address(host: str) -> ipaddress.IPv4Address | ipaddress.IPv6Address | None:
+    try:
+        return ipaddress.ip_address(host.strip("[]"))
+    except ValueError:
+        return None
+
+
+def is_loopback(host: str) -> bool:
+    """Is this address reachable only from this machine?"""
+    if host in LOOPBACK_NAMES:
+        return True
+    address = _address(host)
+    return address is not None and address.is_loopback
+
+
+def is_wildcard(host: str) -> bool:
+    """``0.0.0.0`` or ``::`` — a bind address that is not an address anybody reaches."""
+    address = _address(host)
+    return address is not None and address.is_unspecified
+
+
+def check_exposure(config: Config) -> None:
+    """Refuse to serve an unauthenticated review UI to anything but this machine.
+
+    The review UI has no login, and that is deliberate: on one person's own machine a
+    login is ceremony protecting nothing, and the person at the keyboard is the only
+    person there.  The bargain has two halves, though, and only one of them was ever
+    written down — the bind address defaulted to loopback and nothing stopped it being
+    changed, so ``--host 0.0.0.0`` served an accept-and-apply button to the network.
+
+    ``behind_auth_proxy`` is the other way to hold up the same bargain: somebody else
+    authenticates.  It is an assertion rather than a feature, which is why it has to be
+    written down rather than inferred.
+    """
+    if is_loopback(config.bind) or config.behind_auth_proxy:
+        return
+    raise ConfigError(
+        f"refusing to listen on {config.bind}: the review UI has no login, so anyone who "
+        "can reach it can accept a suggestion and change somebody's mail. Bind to "
+        "127.0.0.1, or put authentication in front of it and say so with "
+        "behind_auth_proxy = true. See docs/11-deployment-and-identity.md."
+    )
 
 
 def config_path() -> Path:
@@ -130,6 +189,7 @@ def load_config(path: Path | None = None) -> Config:
         limits=limits,
         bind=raw.get("bind", "127.0.0.1"),
         port=raw.get("port", 8765),
+        behind_auth_proxy=raw.get("behind_auth_proxy", False),
     )
 
 

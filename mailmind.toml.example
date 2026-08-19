@@ -1,8 +1,18 @@
 # Copy to mailmind.toml, or point MAILMIND_CONFIG at it.
 
 database_url = "sqlite:///mailmind.db"
+
+# The review UI has no login, so it refuses to listen anywhere but this machine.  Anything
+# else needs something in front of it doing authentication, and `behind_auth_proxy = true`
+# is how you say so — an assertion nothing here can check, which is why it is not inferred
+# from the bind address.  docs/11-deployment-and-identity.md has the reasoning.
 bind = "127.0.0.1"
 port = 8765
+# behind_auth_proxy = false
+
+# Accounts below are seed data.  `mailmindctl bootstrap` writes them into `account` rows,
+# and the rows are what a connection is built from — so an account added another way works
+# without ever being named here.
 
 [limits]
 # 05: a request matching more than this returns fewer and says so.
