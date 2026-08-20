@@ -101,40 +101,32 @@ def reviewer(scope) -> m.Producer:  # noqa: ANN001
     return person
 
 
-def create_app(service: Service, *, with_mcp: bool = True) -> FastAPI:
-    """The review UI, and by default the MCP endpoint beside it.
-
-    ``with_mcp=False`` is for the stdio mode, where the agent is on a pipe rather than on
-    a port and mounting a second way in would be surface nobody asked for.
-    """
+def create_app(service: Service) -> FastAPI:
     # Every deployment comes through here, so this is where the bargain is checked: the
     # review UI has no login, so it does not get to listen anywhere but this machine.
     check_exposure(service.config)
 
-    if not with_mcp:
-        app = FastAPI(title="mailmind")
-    else:
-        mcp = mcp_server.build_server(service)
-        # DNS rebinding protection: a browser page on some other site must not be able to
-        # drive this endpoint just because it is listening on localhost.
-        bind = service.config.bind
-        hosts = ["127.0.0.1:*", "localhost:*", "[::1]:*"]
-        origins = [f"http://{host}" for host in hosts]
-        if not is_wildcard(bind):
-            # A wildcard is not an address anybody sends as a Host, so listing it would
-            # look like protection while matching nothing.
-            hosts.append(f"{bind}:*")
-            origins.append(f"http://{bind}:*")
-        mcp_app = mcp.streamable_http_app(
-            streamable_http_path="/",
-            transport_security=TransportSecuritySettings(
-                enable_dns_rebinding_protection=True,
-                allowed_hosts=hosts,
-                allowed_origins=origins,
-            ),
-        )
-        app = FastAPI(title="mailmind", lifespan=lambda _app: mcp.session_manager.run())
-        app.mount("/mcp", GrantMiddleware(mcp_app, service))
+    mcp = mcp_server.build_server(service)
+    # DNS rebinding protection: a browser page on some other site must not be able to
+    # drive this endpoint just because it is listening on localhost.
+    bind = service.config.bind
+    hosts = ["127.0.0.1:*", "localhost:*", "[::1]:*"]
+    origins = [f"http://{host}" for host in hosts]
+    if not is_wildcard(bind):
+        # A wildcard is not an address anybody sends as a Host, so listing it would look
+        # like protection while matching nothing.
+        hosts.append(f"{bind}:*")
+        origins.append(f"http://{bind}:*")
+    mcp_app = mcp.streamable_http_app(
+        streamable_http_path="/",
+        transport_security=TransportSecuritySettings(
+            enable_dns_rebinding_protection=True,
+            allowed_hosts=hosts,
+            allowed_origins=origins,
+        ),
+    )
+    app = FastAPI(title="mailmind", lifespan=lambda _app: mcp.session_manager.run())
+    app.mount("/mcp", GrantMiddleware(mcp_app, service))
 
     @app.middleware("http")
     async def security_headers(request: Request, call_next):  # noqa: ANN001, ANN202

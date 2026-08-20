@@ -1,19 +1,18 @@
 """The stdio transport, driven the way an MCP client drives it.
 
-A subprocess rather than an in-process call, because what is being asserted is a property
-of the pipe: that it carries protocol and nothing else, while a whole web server runs in
-the same process. The SDK defends that itself — it claims fd 1 and moves the real stdout
-somewhere private — so this is a guard on the property rather than on any one way of
-breaking it, and it would still fail if some future transport stopped defending it.
+A subprocess rather than an in-process call, because two of the properties asserted here
+are properties of the process: that the pipe carries protocol and nothing else, and that
+the process opens no port at all. The second is the whole point of the mode — the review
+UI belongs to `mailmindctl serve` and outlives whichever client spawned an agent.
 """
 
 from __future__ import annotations
 
 import datetime as dt
 import json
+import socket
 import subprocess
 import sys
-import urllib.request
 
 import pytest
 import sqlalchemy as sa
@@ -26,6 +25,7 @@ from mailmind.db.scope import make_sessionmaker, tenant_scope
 CONFIG = """
 database_url = "sqlite:///{db}"
 bind = "127.0.0.1"
+port = {port}
 """
 
 
@@ -67,9 +67,15 @@ def workspace(tmp_path):
             "message": message.id,
         }
 
+    # A port nothing is on, so "the UI is advertised here" and "this process is not
+    # listening here" can both be asserted against the same number.
+    with socket.socket() as probe:
+        probe.bind(("127.0.0.1", 0))
+        port = probe.getsockname()[1]
+
     config = tmp_path / "mailmind.toml"
-    config.write_text(CONFIG.format(db=db))
-    return {"config": config, "url": url, "sessions": sessions, **ids}
+    config.write_text(CONFIG.format(db=db, port=port))
+    return {"config": config, "url": url, "sessions": sessions, "port": port, **ids}
 
 
 class StdioClient:
@@ -117,8 +123,14 @@ class StdioClient:
         return self.proc.stderr.read()
 
 
-def test_stdio_serves_mcp_and_tells_the_model_where_the_reviewer_is(workspace):
-    client = StdioClient(workspace["config"], "--producer", "mail-agent", "--port", "0")
+def test_stdio_speaks_mcp_and_serves_nothing(workspace):
+    """It says where the review UI is; it does not become one.
+
+    The UI belongs to `mailmindctl serve`, running for as long as the person wants it,
+    rather than appearing and disappearing with whichever client happened to spawn an
+    agent.
+    """
+    client = StdioClient(workspace["config"], "--producer", "mail-agent")
     try:
         init = client.rpc(
             "initialize",
@@ -130,10 +142,8 @@ def test_stdio_serves_mcp_and_tells_the_model_where_the_reviewer_is(workspace):
         )
         client.rpc("notifications/initialized", notify=True)
         instructions = init["result"]["instructions"]
-        assert "http://127.0.0.1:" in instructions, (
-            "the model was never told where to send anybody"
-        )
-        url = instructions.split("The person reviewing is at ")[1].split(" ")[0]
+        expected = f"http://127.0.0.1:{workspace['port']}/"
+        assert expected in instructions, "the model was never told where to send anybody"
 
         assert len(client.rpc("tools/list")["result"]["tools"]) == 12
 
@@ -148,24 +158,39 @@ def test_stdio_serves_mcp_and_tells_the_model_where_the_reviewer_is(workspace):
         )
         # The link travels with the proposal too: instructions are read once, and a
         # bundle is the moment somebody actually needs to go and look.
-        assert proposed["note"].endswith(f"{url}bundle/{proposed['bundle_id']}")
+        assert proposed["note"].endswith(f"{expected}bundle/{proposed['bundle_id']}")
 
-        with urllib.request.urlopen(url, timeout=20) as response:
-            page = response.read().decode()
-        assert response.status == 200
-        assert f"/bundle/{proposed['bundle_id']}" in page, "the queue did not show it"
-
-        # Ask for one more response *after* the web server has handled a request, so the
-        # read happens at the point where anything that server wrote would be sitting in
-        # the pipe ahead of the answer.
-        assert len(client.rpc("tools/list")["result"]["tools"]) == 12
+        # And nothing is listening there, because this process does not serve.
+        with socket.socket() as probe:
+            probe.settimeout(2)
+            assert probe.connect_ex(("127.0.0.1", workspace["port"])) != 0, (
+                "the stdio server opened a port"
+            )
     finally:
         stderr = client.close()
 
     # Every line read was parsed as JSON on the way past; nothing may be left over either.
     leftover = [line for line in client.proc.stdout.read().splitlines() if line.strip()]
     assert leftover == [], f"something else wrote to the transport: {leftover[:2]}"
-    assert "review UI" in stderr, "the human-facing lines belong on stderr"
+    assert "review UI expected at" in stderr, "the human-facing lines belong on stderr"
+
+
+def test_the_advertised_review_url_can_be_overridden(workspace):
+    """For a UI that is not where this configuration says — behind a proxy, or elsewhere."""
+    client = StdioClient(workspace["config"], "--review-url", "https://mail.example.org/review")
+    try:
+        init = client.rpc(
+            "initialize",
+            {
+                "protocolVersion": "2025-06-18",
+                "capabilities": {},
+                "clientInfo": {"name": "t", "version": "0"},
+            },
+        )
+        # A trailing slash is added, because the bundle links are built by appending.
+        assert "https://mail.example.org/review/" in init["result"]["instructions"]
+    finally:
+        client.close()
 
 
 def test_stdio_reuses_the_named_producer_s_grant_rather_than_widening_it(workspace):
@@ -180,7 +205,7 @@ def test_stdio_reuses_the_named_producer_s_grant_rather_than_widening_it(workspa
         scope.add(m.GrantAccount(grant_id=grant.id, account_id=workspace["account"]))
         scope.commit()
 
-    client = StdioClient(workspace["config"], "--producer", "narrow", "--no-review-ui")
+    client = StdioClient(workspace["config"], "--producer", "narrow")
     try:
         client.rpc(
             "initialize",
@@ -224,7 +249,7 @@ def test_stdio_mints_a_grant_that_cannot_be_used_over_http(workspace):
     accounts without ever having been issued — which is what a grant for a process on the
     end of a pipe should be.
     """
-    client = StdioClient(workspace["config"], "--producer", "fresh", "--no-review-ui")
+    client = StdioClient(workspace["config"], "--producer", "fresh")
     try:
         client.rpc(
             "initialize",

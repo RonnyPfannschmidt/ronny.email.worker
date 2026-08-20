@@ -13,30 +13,33 @@ if the agent can only reach mailmind through MCP, then whatever it can do is exa
 ## Connecting: pick one
 
 **Over stdio, which is the easy one.** Your MCP client spawns `mailmindctl mcp` and talks
-down a pipe. There is no port to configure, no token to paste and nothing to start first.
-The review UI comes up alongside on a local port, and its address is handed to the model at
-connect time and repeated on every bundle, so the agent can tell whoever is reading where
-to go and accept.
+down a pipe. No port to configure, no token to paste.
 
 ```json
 {
   "mcpServers": {
     "mailmind": {
       "command": "mailmindctl",
-      "args": ["mcp", "--producer", "mail-agent", "--port", "0"],
+      "args": ["mcp", "--producer", "mail-agent"],
       "env": { "MAILMIND_CONFIG": "/home/you/.config/mailmind/mailmind.toml" }
     }
   }
 }
 ```
 
+It serves nothing. `mailmindctl serve` runs the review UI, separately, for as long as you
+want it — a review queue that appeared and disappeared with whichever client last spawned
+an agent would be a queue nobody could go back to. What the stdio process does is read the
+same configuration, work out where `serve` is, and tell the model: in the instructions at
+connect time, and again in the note on every bundle it proposes. So the agent can say where
+to go, and it stays true after the agent has gone.
+
 Set `MAILMIND_CONFIG` explicitly. A spawned process inherits a working directory you did
 not choose, so the `./mailmind.toml` fallback is not something to rely on;
-`~/.config/mailmind/mailmind.toml` is found without it, anything else is not.
-
-`--port 0` takes a free port, so two clients can each spawn one without colliding. Use
-`--no-review-ui` if a review UI is already running elsewhere — but then nothing tells the
-model where the reviewer is, and it will not be able to say.
+`~/.config/mailmind/mailmind.toml` is found without it, anything else is not. Both
+processes reading the same file is also what keeps the advertised address honest — change
+`port` and both follow. `--review-url` overrides it for a UI reached some other way, behind
+a proxy or on another host.
 
 **Over HTTP, when the agent is long-lived or somewhere else.** Run `mailmindctl serve`,
 mint a token, and connect to `http://127.0.0.1:8765/mcp/` with
@@ -114,14 +117,14 @@ messages moving for a hundred different reasons is a hundred decisions dressed a
 the log.
 
 **Say where the review is.** Over stdio the URL is in your instructions and in the note on
-every proposal. An agent that proposes twelve bundles and never mentions where to go has
-done half a job.
+every proposal, and it points at a UI that is still there tomorrow. An agent that proposes
+twelve bundles and never mentions where to go has done half a job.
 
 ## Testing your agent
 
 Against the throwaway mailbox from [10](10-running-it.md), not against real mail. Six
 messages, deliberately adversarial, and `podman stop` puts it all back. Your agent's test
-suite can spawn `mailmindctl mcp --no-review-ui` against a seeded database and drive it the
+suite can spawn `mailmindctl mcp` against a seeded database and drive it the
 way `tests/test_stdio.py` here does — newline-delimited JSON-RPC on a pipe, no mocking of
 anything.
 
