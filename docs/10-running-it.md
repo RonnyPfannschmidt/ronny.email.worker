@@ -61,10 +61,13 @@ its own connection over a pipe:
 mailmindctl mcp --producer mail-agent
 ```
 
-That speaks MCP on stdin and stdout — no port, no token — and serves nothing. It reads the
-same configuration, so it knows where `serve` is and tells the model, at connect time and
-on every bundle, so the agent can pass the link on.
-[12](12-an-agent-of-your-own.md) has the client configuration.
+That speaks MCP on stdin and stdout — no port, no token. It reads the same configuration,
+so it knows where `serve` is and tells the model, at connect time and on every bundle, so
+the agent can pass the link on.
+
+Add `--serve` and it brings the review UI up itself for the life of the session instead,
+which is the whole of the setup when the agent is the only thing that ever proposes
+anything. [12](12-an-agent-of-your-own.md) has the client configuration for both.
 
 ## Where the password lives
 

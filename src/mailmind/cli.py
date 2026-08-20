@@ -211,35 +211,86 @@ def status(ctx: click.Context) -> None:
     help="use an existing grant token instead, exactly as the HTTP endpoint would",
 )
 @click.option(
+    "--serve",
+    "serve_ui",
+    is_flag=True,
+    help="bring the review UI up too, for as long as this session lasts",
+)
+@click.option(
+    "--port",
+    default=None,
+    type=int,
+    help="with --serve: which port to take. 0 picks a free one.",
+)
+@click.option(
     "--review-url",
     default=None,
     envvar="MAILMIND_REVIEW_URL",
-    help="where the review UI is, if it is not where this configuration says",
+    help="where the review UI already is, if not where this configuration says",
 )
 @click.pass_context
 def mcp_stdio(
     ctx: click.Context,
     producer: str,
     token: str | None,
+    serve_ui: bool,
+    port: int | None,
     review_url: str | None,
 ) -> None:
-    """Speak MCP on stdin and stdout, and say where the review UI is.
+    """Speak MCP on stdin and stdout, and say where the review is.
 
     This is the shape an MCP client expects: it spawns the process and talks down a pipe,
     so there is no port to configure and no token to paste.
 
-    It serves nothing. The review UI is `mailmindctl serve`, running separately and for as
-    long as the person wants it — not something that appears and disappears with whichever
-    client happened to spawn an agent. What this does is tell the model where to find it,
-    at connect time and again on every bundle, so the agent can pass the link on.
+    Either way the model is told where the review UI is — in the instructions at connect
+    time and in the note on every bundle — so the agent can tell whoever it is working for
+    where to go.  What ``--serve`` decides is whether that UI is this process or another
+    one.
+
+    Without it, the address comes from the configuration and is expected to be a
+    ``mailmindctl serve`` that outlives any one session.  With it, this process brings the
+    UI up itself and takes it down again at the end, which is the whole of the setup for
+    somebody whose agent is the only thing that ever proposes anything: start the agent,
+    get told where to review, review it while the agent is still there.
     """
     import asyncio
+    import socket
+
+    import uvicorn
 
     from mailmind.mcp import server as mcp_server
+    from mailmind.web.app import create_app
 
-    service = _service(ctx.obj["config_path"])
+    if review_url and serve_ui:
+        raise click.ClickException(
+            "--review-url says where the UI already is and --serve brings one up; "
+            "one or the other"
+        )
+    if port is not None and not serve_ui:
+        raise click.ClickException("--port only means anything with --serve")
 
-    if review_url is None:
+    overrides = {"port": port} if port is not None else {}
+    service = _service(ctx.obj["config_path"], **overrides)
+
+    listener: socket.socket | None = None
+    if serve_ui:
+        bind = service.config.bind
+        family = socket.AF_INET6 if ":" in bind else socket.AF_INET
+        try:
+            listener = socket.create_server(
+                (bind, service.config.port), family=family, backlog=128
+            )
+        except OSError as exc:
+            raise click.ClickException(
+                f"cannot serve the review UI on {bind}:{service.config.port}: {exc}. "
+                "If something is already serving there, drop --serve and it will be "
+                "advertised instead; otherwise --port 0 takes a free one."
+            ) from exc
+        # Bound before the server is built, because instructions are fixed at construction
+        # and the address has to be in them — which is also what makes --port 0 workable.
+        shown = f"[{bind}]" if ":" in bind else bind
+        review_url = f"http://{shown}:{listener.getsockname()[1]}/"
+    elif review_url is None:
         bind = service.config.bind
         shown = f"[{bind}]" if ":" in bind else bind
         review_url = f"http://{shown}:{service.config.port}/"
@@ -261,11 +312,32 @@ def mcp_stdio(
 
     async def run() -> None:
         mcp_server.CURRENT_GRANT.set(context)
-        await server.run_stdio_async()
+        if listener is None:
+            await server.run_stdio_async()
+            return
+        # No MCP endpoint on it: the agent is already on the pipe, and mounting a second
+        # way in would be surface nobody asked for.
+        web = uvicorn.Server(
+            uvicorn.Config(
+                create_app(service, with_mcp=False),
+                log_level="warning",
+                access_log=False,
+            )
+        )
+        serving = asyncio.create_task(web.serve(sockets=[listener]))
+        try:
+            await server.run_stdio_async()
+        finally:
+            web.should_exit = True
+            await asyncio.gather(serving, return_exceptions=True)
 
     # stdout is the transport, so everything a person reads goes to stderr.
     click.echo(f"mailmind MCP on stdio as {producer!r}", err=True)
-    click.echo(f"review UI expected at {review_url} — `mailmindctl serve` runs it", err=True)
+    click.echo(
+        f"review UI  {review_url}"
+        + ("  (this session only)" if serve_ui else "  — `mailmindctl serve` runs it"),
+        err=True,
+    )
     try:
         asyncio.run(run())
     except KeyboardInterrupt:  # pragma: no cover - the client closing the pipe

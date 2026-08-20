@@ -36,6 +36,6 @@ mailmindctl serve                          # review UI on /, MCP on /mcp/
 ```
 
 An MCP client can also spawn its own connection over a pipe: `mailmindctl mcp` speaks MCP
-on stdin and stdout, serves nothing, and tells the model where the review UI is.
-[12 — An agent of your own](docs/12-an-agent-of-your-own.md) covers pointing your own agent
-repository at either transport.
+on stdin and stdout and tells the model where the review UI is — `--serve` brings one up
+for the life of the session. [12 — An agent of your own](docs/12-an-agent-of-your-own.md)
+covers pointing your own agent repository at either transport.

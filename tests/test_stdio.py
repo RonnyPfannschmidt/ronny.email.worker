@@ -2,8 +2,10 @@
 
 A subprocess rather than an in-process call, because two of the properties asserted here
 are properties of the process: that the pipe carries protocol and nothing else, and that
-the process opens no port at all. The second is the whole point of the mode — the review
-UI belongs to `mailmindctl serve` and outlives whichever client spawned an agent.
+it opens a port only when asked to. Whether the review UI is this process or another one
+is what `--serve` decides, and both halves matter — the default points at a UI that
+outlives any session, and the flag is the whole setup for somebody whose agent is the only
+thing that proposes anything.
 """
 
 from __future__ import annotations
@@ -13,6 +15,8 @@ import json
 import socket
 import subprocess
 import sys
+import urllib.error
+import urllib.request
 
 import pytest
 import sqlalchemy as sa
@@ -123,13 +127,8 @@ class StdioClient:
         return self.proc.stderr.read()
 
 
-def test_stdio_speaks_mcp_and_serves_nothing(workspace):
-    """It says where the review UI is; it does not become one.
-
-    The UI belongs to `mailmindctl serve`, running for as long as the person wants it,
-    rather than appearing and disappearing with whichever client happened to spawn an
-    agent.
-    """
+def test_stdio_says_where_the_review_is_without_becoming_it(workspace):
+    """The default: point at a `mailmindctl serve` that outlives any one session."""
     client = StdioClient(workspace["config"], "--producer", "mail-agent")
     try:
         init = client.rpc(
@@ -172,7 +171,81 @@ def test_stdio_speaks_mcp_and_serves_nothing(workspace):
     # Every line read was parsed as JSON on the way past; nothing may be left over either.
     leftover = [line for line in client.proc.stdout.read().splitlines() if line.strip()]
     assert leftover == [], f"something else wrote to the transport: {leftover[:2]}"
-    assert "review UI expected at" in stderr, "the human-facing lines belong on stderr"
+    assert "`mailmindctl serve` runs it" in stderr, "the human-facing lines go to stderr"
+
+
+def test_serve_brings_the_review_ui_up_for_the_life_of_the_session(workspace):
+    """The opt-in: the agent starts, and there is somewhere to review while it is running.
+
+    For somebody whose agent is the only thing that ever proposes anything, this is the
+    whole of the setup — start the agent, get told where to review, review it while the
+    agent is still there.
+    """
+    client = StdioClient(workspace["config"], "--serve", "--port", "0")
+    try:
+        init = client.rpc(
+            "initialize",
+            {
+                "protocolVersion": "2025-06-18",
+                "capabilities": {},
+                "clientInfo": {"name": "t", "version": "0"},
+            },
+        )
+        client.rpc("notifications/initialized", notify=True)
+        url = (
+            init["result"]["instructions"].split("The person reviewing is at ")[1].split(" ")[0]
+        )
+        # A free port, not the configured one, which is what --port 0 is for.
+        assert not url.endswith(f":{workspace['port']}/")
+
+        proposed = client.call(
+            "propose_bundle",
+            account_id=workspace["account"],
+            operation="move",
+            message_ids=[workspace["message"]],
+            target_container_id=workspace["archive"],
+            summary="tidy",
+            reason="because",
+        )
+        with urllib.request.urlopen(url, timeout=20) as response:
+            page = response.read().decode()
+        assert response.status == 200
+        assert f"/bundle/{proposed['bundle_id']}" in page, "the queue did not show it"
+
+        # The agent is on the pipe, so the served app offers no second way in.
+        with pytest.raises(urllib.error.HTTPError) as refused:
+            urllib.request.urlopen(f"{url}mcp/", timeout=20)
+        assert refused.value.code == 404
+
+        # Ask for one more response after the web server has handled requests, so the read
+        # happens where anything it wrote would be sitting in the pipe ahead of the answer.
+        assert len(client.rpc("tools/list")["result"]["tools"]) == 12
+    finally:
+        stderr = client.close()
+
+    leftover = [line for line in client.proc.stdout.read().splitlines() if line.strip()]
+    assert leftover == [], f"something else wrote to the transport: {leftover[:2]}"
+    assert "(this session only)" in stderr
+
+    # And it went away with the session.
+    host, _, port = url.removeprefix("http://").rstrip("/").rpartition(":")
+    with socket.socket() as probe:
+        probe.settimeout(2)
+        assert probe.connect_ex((host, int(port))) != 0, "the review UI outlived the session"
+
+
+@pytest.mark.parametrize(
+    ("args", "complaint"),
+    [
+        (["--serve", "--review-url", "https://elsewhere.example/"], "one or the other"),
+        (["--port", "0"], "only means anything with --serve"),
+    ],
+)
+def test_arguments_that_contradict_each_other_are_refused(workspace, args, complaint):
+    client = StdioClient(workspace["config"], *args)
+    stderr = client.close()
+    assert complaint in stderr
+    assert client.proc.returncode != 0
 
 
 def test_the_advertised_review_url_can_be_overridden(workspace):

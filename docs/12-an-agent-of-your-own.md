@@ -27,19 +27,34 @@ down a pipe. No port to configure, no token to paste.
 }
 ```
 
-It serves nothing. `mailmindctl serve` runs the review UI, separately, for as long as you
-want it — a review queue that appeared and disappeared with whichever client last spawned
-an agent would be a queue nobody could go back to. What the stdio process does is read the
-same configuration, work out where `serve` is, and tell the model: in the instructions at
-connect time, and again in the note on every bundle it proposes. So the agent can say where
-to go, and it stays true after the agent has gone.
+Either way the model is told where the review UI is — in the instructions at connect time
+and in the note on every bundle — so the agent can tell whoever it is working for where to
+go. What `--serve` decides is whether that UI is this process or another one.
+
+**Without it** the address comes from the configuration, and is expected to be a
+`mailmindctl serve` that outlives any one session. That is the shape to want when the queue
+is something you come back to: an agent proposes twenty bundles at nine in the morning and
+you work through them at four, long after the client that spawned it has gone.
+
+**With it** this process brings the UI up itself and takes it down again at the end:
+
+```json
+"args": ["mcp", "--producer", "mail-agent", "--serve", "--port", "0"]
+```
+
+That is the whole of the setup for somebody whose agent is the only thing that ever
+proposes anything. Start the agent, get told where to review, review it while the agent is
+still there. `--port 0` takes a free one, so several clients can each have their own
+without colliding; without it the configured port is used, and if a `serve` already has it
+you get told to drop the flag rather than a stack trace. Nothing else is mounted on it —
+the agent is already on the pipe, so `/mcp/` is not there.
 
 Set `MAILMIND_CONFIG` explicitly. A spawned process inherits a working directory you did
 not choose, so the `./mailmind.toml` fallback is not something to rely on;
 `~/.config/mailmind/mailmind.toml` is found without it, anything else is not. Both
 processes reading the same file is also what keeps the advertised address honest — change
-`port` and both follow. `--review-url` overrides it for a UI reached some other way, behind
-a proxy or on another host.
+`port` and both follow. `--review-url` says where a UI already is, for one reached some
+other way, behind a proxy or on another host.
 
 **Over HTTP, when the agent is long-lived or somewhere else.** Run `mailmindctl serve`,
 mint a token, and connect to `http://127.0.0.1:8765/mcp/` with
