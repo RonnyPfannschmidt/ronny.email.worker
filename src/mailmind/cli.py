@@ -212,7 +212,9 @@ def serve(ctx: click.Context, host: str | None, port: int | None) -> None:
     except ConfigError as exc:
         raise click.ClickException(str(exc)) from exc
     where = f"http://{service.config.bind}:{service.config.port}"
-    click.echo(f"review UI  {where}/\nMCP        {where}/mcp")
+    # The trailing slash is not decoration: the endpoint is mounted at /mcp/ and a POST to
+    # /mcp gets a 307, which an MCP client is entitled to follow and may not.
+    click.echo(f"review UI  {where}/\nMCP        {where}/mcp/")
     uvicorn.run(app, host=service.config.bind, port=service.config.port)
 
 

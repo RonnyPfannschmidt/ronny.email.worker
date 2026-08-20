@@ -41,7 +41,7 @@ python dev/seed_mailbox.py
 export MAILMIND_CONFIG=mailmind.dev.toml MAILMIND_DEV_PASSWORD=secret
 mailmindctl bootstrap && mailmindctl probe && mailmindctl sync
 mailmindctl grant --producer opencode      # prints a bearer token, once
-mailmindctl serve                          # UI on /, MCP on /mcp
+mailmindctl serve                          # UI on /, MCP on /mcp/
 ```
 
 `podman stop mailmind-dev` takes it all away; `rm mailmind.dev.db*` takes the cache with

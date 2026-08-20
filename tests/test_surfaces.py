@@ -779,6 +779,36 @@ def test_an_account_that_exists_only_in_the_database_can_still_connect(service, 
     assert derived.login.password == "env://NEVER_CONFIGURED"
 
 
+def test_the_mcp_endpoint_is_advertised_at_the_path_that_answers(client):
+    """The trailing slash is not decoration.
+
+    The endpoint is mounted at `/mcp/`, so a POST to `/mcp` gets a 307 — which a client is
+    entitled to follow and may not, and which is a miserable thing to debug from the other
+    side. What `mailmindctl serve` prints has to be the one that answers.
+    """
+    body = {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": {
+            "protocolVersion": "2025-06-18",
+            "capabilities": {},
+            "clientInfo": {"name": "t", "version": "0"},
+        },
+    }
+    headers = {
+        "Accept": "application/json, text/event-stream",
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {TOKEN}",
+    }
+    assert client.post("/mcp/", headers=headers, json=body).status_code == 200
+    # follow_redirects=False, because the test client follows them by default and would
+    # hide exactly the hop a real client might not make.
+    redirected = client.post("/mcp", headers=headers, json=body, follow_redirects=False)
+    assert redirected.status_code == 307
+    assert redirected.headers["location"].endswith("/mcp/")
+
+
 def test_the_review_pages_forbid_remote_content(client):
     response = client.get("/")
     csp = response.headers["content-security-policy"]

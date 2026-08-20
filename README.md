@@ -32,5 +32,5 @@ python dev/seed_mailbox.py
 export MAILMIND_CONFIG=mailmind.dev.toml MAILMIND_DEV_PASSWORD=secret
 mailmindctl bootstrap && mailmindctl probe && mailmindctl sync
 mailmindctl grant --producer opencode      # prints a bearer token, once
-mailmindctl serve                          # review UI on /, MCP on /mcp
+mailmindctl serve                          # review UI on /, MCP on /mcp/
 ```
