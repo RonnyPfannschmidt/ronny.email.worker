@@ -37,7 +37,7 @@ LOCAL_WARNING = (
     "  to the agent — not that the agent cannot reach it. Anything running as you can\n"
     "  read that key, and read the mailbox password out of your configuration without\n"
     "  going near mailmind at all. If that matters, sandbox the agent.\n"
-    "  See docs/12-an-agent-of-your-own.md."
+    "  See docs/security-model.md."
 )
 
 

@@ -1,0 +1,71 @@
+site_name: mailmind
+site_description: >-
+  An MCP server and webapp that lets agents work with mailboxes without letting them change
+  anything a person has not agreed to.
+repo_url: https://github.com/RonnyPfannschmidt/ronny.email.worker
+edit_uri: edit/main/docs/
+
+theme:
+  name: material
+  features:
+    - navigation.sections
+    - navigation.top
+    - content.code.copy
+    - toc.follow
+  palette:
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      toggle:
+        icon: material/brightness-7
+        name: Switch to dark mode
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      toggle:
+        icon: material/brightness-4
+        name: Switch to light mode
+
+markdown_extensions:
+  - admonition
+  - attr_list
+  - tables
+  - toc:
+      permalink: true
+  - pymdownx.superfences
+
+nav:
+  - Home: index.md
+  - Guide:
+      - Getting started: getting-started.md
+      - Configuration: configuration.md
+      - Reviewing: reviewing.md
+      - Connecting an agent: agents.md
+      - Security model: security-model.md
+      - Troubleshooting: troubleshooting.md
+  - Reference:
+      - mailmindctl: reference/cli.md
+      - MCP surface: reference/mcp.md
+  - Design notes:
+      - design/index.md
+      - 01 — Intent: design/01-intent.md
+      - 02 — Action suggestions: design/02-action-suggestions.md
+      - 03 — The review step: design/03-review.md
+      - 04 — Mailbox access: design/04-mailbox-access.md
+      - 05 — The agent surface: design/05-agent-surface.md
+      - 06 — The core: design/06-core.md
+      - 07 — Tenancy: design/07-tenancy.md
+      - 08 — Untrusted content: design/08-untrusted-content.md
+      - 09 — Iteration one: design/09-iteration-one.md
+      - 10 — Running it: design/10-running-it.md
+      - 11 — Deployment and identity: design/11-deployment-and-identity.md
+      - 12 — An agent of your own: design/12-an-agent-of-your-own.md
+      - History:
+          - design/history/index.md
+          - Testability & CI plan: design/history/2026-08-12-mailmind-testability-and-ci-plan.md
+
+strict: true
+
+validation:
+  omitted_files: warn
+  absolute_links: warn
+  unrecognized_links: warn
+  anchors: warn

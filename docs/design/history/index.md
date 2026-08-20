@@ -6,7 +6,7 @@ They are exploratory design work — mostly transcripts and artifacts from sessi
 Claude — kept verbatim so the origin of an idea stays traceable once it has been folded
 into a real spec. They are recorded as history, not as direction.
 
-The current design lives in [`docs/`](../). Where a document here disagrees with it, the
+The current design lives in [`docs/design/`](../index.md). Where a document here disagrees with it, the
 current design wins. Where it disagrees with reality, both lose and the design gets fixed.
 
 Documents are dated by when they were recorded and are never edited afterwards. Folding one

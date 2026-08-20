@@ -11,15 +11,28 @@ would go — and accepts or rejects. Only then does the service touch the mailbo
 if nothing has moved in the meantime.
 
 The first iteration is built: IMAP, one tenant, and enough to sort a long untended mailbox.
-See [09 — Iteration one](docs/09-iteration-one.md) for what it does.
+See [09 — Iteration one](docs/design/09-iteration-one.md) for what it does.
 
-Start with [the intent](docs/01-intent.md); the whole design is in [docs/](docs/).
+## Documentation
+
+[Getting started](docs/getting-started.md) runs it against a mailbox that is not yours.
+[Configuration](docs/configuration.md) points it at one that is, and decides where the
+password lives. [Security model](docs/security-model.md) is what it promises and where that
+stops. [Connecting an agent](docs/agents.md) is the other half, and
+[`mailmindctl`](docs/reference/cli.md) and [the MCP surface](docs/reference/mcp.md) are the
+lists to look things up in.
+
+Why any of it is shaped that way is in [design notes](docs/design/index.md) — sketches and
+arguments, starting with [the intent](docs/design/01-intent.md).
+
+The whole of it builds as a site: `uv run --group docs mkdocs serve`.
 
 ## A first look, costing you nothing
 
 A disposable IMAP server seeded with the test corpus, so nothing here touches your own
-mail. [10 — Running it](docs/10-running-it.md) covers this and pointing it at a real
-mailbox, including where the password should live.
+mail. [Getting started](docs/getting-started.md) covers this, and
+[Configuration](docs/configuration.md) covers pointing it at a real mailbox, including
+where the password should live.
 
 ```
 podman run -d --rm --name mailmind-dev -p 3144:143 -e MAILNAME=example.org \
@@ -35,6 +48,6 @@ uv run mailmindctl serve                       # prints a link with the login ke
 
 An MCP client can also spawn its own connection over a pipe: `mailmindctl mcp` speaks MCP
 on stdin and stdout and tells the model where the review UI is — `--serve` brings one up
-for the life of the session. [12 — An agent of your own](docs/12-an-agent-of-your-own.md)
+for the life of the session. [Connecting an agent](docs/agents.md)
 covers pointing your own agent repository at either transport, and
 [`integrations/`](integrations/) has ready-made client configurations.

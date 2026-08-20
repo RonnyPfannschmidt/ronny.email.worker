@@ -113,7 +113,7 @@ def not_a_browser_gesture(request: Request) -> str | None:
     say all of this. What it does is move the review UI out of reach of an agent doing the
     obvious thing with an address it was given, so that reaching it at all means asserting,
     in four headers, that a browser is showing a page to somebody. See
-    docs/12-an-agent-of-your-own.md for how far that goes and what it does not cover.
+    docs/design/12-an-agent-of-your-own.md for how far that goes and what it does not cover.
     """
     for header, expected in BROWSER_GESTURE.items():
         actual = request.headers.get(header)

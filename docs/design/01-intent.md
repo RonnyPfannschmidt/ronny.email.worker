@@ -63,5 +63,5 @@ through its API.
 
 ---
 
-Partly derived from [`design-history/2026-08-12-mailmind-testability-and-ci-plan.md`](design-history/2026-08-12-mailmind-testability-and-ci-plan.md),
+Partly derived from [`history/2026-08-12-mailmind-testability-and-ci-plan.md`](history/2026-08-12-mailmind-testability-and-ci-plan.md),
 which is a starting point, not a decision. That document calls action suggestions "ideas".

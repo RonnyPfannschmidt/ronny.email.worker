@@ -1055,7 +1055,7 @@ def test_the_review_ui_refuses_a_change_that_is_not_a_person_at_a_browser(
     It is still not a security boundary — anything that can set a header can say all of
     this. What it buys is that an agent doing the obvious thing with an address it was
     given no longer reaches it, and one that does reach it has asserted in four headers
-    that a browser is showing a page to somebody. See docs/12.
+    that a browser is showing a page to somebody. See docs/design/12.
     """
     proposed = _propose(Agent(client))
     spoiled = NOT_A_GESTURE[why]

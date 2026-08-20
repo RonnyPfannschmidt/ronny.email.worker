@@ -27,7 +27,7 @@ mailmindctl = "mailmind.cli:main"
 [project.optional-dependencies]
 # The desktop secret store, for `secret-storage://` password URLs. Optional because it
 # needs a session bus to talk to and there is nothing to talk to on a headless box —
-# see docs/10-running-it.md for what to use there instead.
+# see docs/configuration.md for what to use there instead.
 secrets = [
     "keyring>=25",
 ]
@@ -45,6 +45,12 @@ dev = [
     {include-group = "test"},
     "mailmind[secrets]",
     "ruff>=0.6",
+]
+# Not in dev: building the site is a thing you do on purpose, and mkdocs-material pulls a
+# tree of its own. `uv run --group docs mkdocs serve`.
+docs = [
+    "mkdocs>=1.6",
+    "mkdocs-material>=9.5",
 ]
 
 [tool.hatch.version]

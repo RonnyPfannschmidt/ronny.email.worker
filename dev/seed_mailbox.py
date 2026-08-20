@@ -13,7 +13,7 @@ subcommand of ``mailmindctl``.
       docker.io/antespi/docker-imap-devel:latest
     python dev/seed_mailbox.py
 
-See docs/10-running-it.md.
+See docs/getting-started.md.
 """
 
 from __future__ import annotations

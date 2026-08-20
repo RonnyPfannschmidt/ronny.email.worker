@@ -1,4 +1,11 @@
-# Documentation
+# Design notes
+
+Why mailmind is shaped the way it is. These are working documents — sketches, arguments and
+open questions, written to be argued with — and they are not how to use the thing. That is
+[the guide](../index.md), which these pages sit underneath.
+
+Numbering is order of introduction, not dependency.
+
 
 - [x] [01 — Intent](01-intent.md) `#sketch`
 - [x] [02 — Action suggestions](02-action-suggestions.md) `#sketch` `#open-questions`
@@ -13,7 +20,7 @@
 - [ ] [11 — Deployment and identity](11-deployment-and-identity.md) `#sketch` `#open-questions`
 - [ ] [12 — An agent of your own](12-an-agent-of-your-own.md) `#sketch` `#open-questions`
 
-Plus [design history](design-history/) — starting-point documents, kept verbatim, not
+Plus [design history](history/index.md) — starting-point documents, kept verbatim, not
 authoritative.
 
 ## Status tags

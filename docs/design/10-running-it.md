@@ -5,8 +5,10 @@
 
 Every other document here is written from the inside — what a component is made of, who
 may do what to it. This one is written from outside, because the first thing anybody does
-with mailmind is try to run it, and until now the answer was five lines of shell
-duplicated in two files.
+with mailmind is try to run it.
+
+The instructions themselves now live in the guide — [Getting started](../getting-started.md)
+and [Configuration](../configuration.md). What is left here is why they say what they say.
 
 Serving it to anything but this machine is refused, because its session cookie travels
 over plain HTTP —
@@ -33,17 +35,8 @@ That is the story this document is about:
 corpus the tests use. `mailmind.dev.toml` is checked in and points at it, so there is
 nothing to copy and nothing to edit. This is the one to start with.
 
-```
-podman run -d --rm --name mailmind-dev -p 3144:143 -e MAILNAME=example.org \
-  -e MAIL_ADDRESS=me@example.org -e MAIL_PASS=secret \
-  docker.io/antespi/docker-imap-devel:latest
-uv run dev/seed_mailbox.py
-
-export MAILMIND_CONFIG=mailmind.dev.toml MAILMIND_DEV_PASSWORD=secret
-uv run mailmindctl bootstrap && uv run mailmindctl probe && uv run mailmindctl sync
-uv run mailmindctl grant --producer opencode   # prints a bearer token, once
-uv run mailmindctl serve                       # prints a link with the login key in it
-```
+The commands are in [Getting started](../getting-started.md); six of them, and none of
+them edits a file.
 
 The review UI has a login: `serve` prints a URL carrying a key, and following it once
 trades that key for a session cookie. It is not a password and does not say who you are —
@@ -81,44 +74,23 @@ anything. [12](12-an-agent-of-your-own.md) has the client configuration for both
 
 The configuration never holds a password. It holds a URL saying where to find one, and the
 scheme decides. Which scheme is right depends on something the service cannot know, so it
-is written down here rather than defaulted to silently.
+is a decision written down rather than defaulted to silently. The recipes are in
+[Configuration](../configuration.md#where-the-password-lives); the reasoning is this:
 
-**`secret-storage://` — at a desk.** The desktop secret store, via
-[keyring](https://pypi.org/project/keyring/): SecretService (gnome-keyring, KWallet) on
-Linux, Keychain on macOS, Credential Locker on Windows. The password is stored once, by
-you, outside the repository, and mailmind reads it at connect time.
+**`secret-storage://` is for a desk.** The password is stored once, by you, outside the
+repository, by something the operating system already audits. It needs a session bus to
+talk to, and on a headless box there is nothing to talk to.
 
-```
-keyring set imap.example.org me@example.org
-# password = "secret-storage://imap.example.org"
-```
+**`file://` is for headless, and is not a fallback.** Without a session, keyring resolves
+to a backend that raises rather than one that stores anything. This is not a mailmind
+limitation and there is no fixing it from here — a secret store you can read without a
+session is a file with a mode on it. `systemd-creds` and a mounted secret land in the same
+place.
 
-The service key alone is enough — `secret-storage://imap.example.org` uses the login's own
-username as the entry, so the common case reads as the host and no more.
-
-This is optional and now installable: `pip install -e '.[secrets]'`, or a plain `uv sync`,
-whose `dev` group pulls the extra in. It had been documented and unreachable — `keyring`
-was in no dependency list at all, and the test for the scheme injects a fake module into
-`sys.modules`, so nothing noticed the package it names was never installable.
-
-**`file://` — headless.** A container, a bare SSH session, CI: no session bus, so keyring
-resolves to a backend that raises rather than one that stores anything. This is not a
-mailmind limitation and there is no fixing it from here — a secret store you can read
-without a session is a file with a mode on it.
-
-```
-install -m 600 /dev/stdin ~/.secrets/mailmind-personal <<< "$PASSWORD"
-# password = "file://~/.secrets/mailmind-personal"
-```
-
-`systemd-creds` and a mounted secret both land in the same place: something at a path,
-readable by this process and not by others.
-
-**`env://` — neither.** It exists, it is what `mailmind.dev.toml` uses, and that file is
-pointing at a container whose password is the word `secret`. Anywhere else it means the
-password is in your shell history and in the environment of every process you launch from
-that shell, including the agent. It is the wrong default and it is no longer the one in
-the example.
+**`env://` is for a container whose password is the word `secret`.** Anywhere else it means
+the password is in your shell history and in the environment of every process you launch
+from that shell, including the agent. It is the wrong default and it is no longer the one
+in the example.
 
 Two alternatives were looked at and not taken, recorded so the next person does not have
 to look them up: `keyrings.alt` adds encrypted file-backed keyring backends, and
@@ -126,6 +98,10 @@ to look them up: `keyrings.alt` adds encrypted file-backed keyring backends, and
 the cost of a dependency that stores secrets itself rather than delegating to something
 the operating system already audits. `file://` already covers the headless case without
 that, so neither is worth the surface yet.
+
+`keyring` itself had been documented and unreachable — it was in no dependency list at all,
+and the test for the scheme injects a fake module into `sys.modules`, so nothing noticed
+the package it names was never installable. It is now an extra, and in the `dev` group.
 
 ## Seeding is outside the package on purpose
 
@@ -142,18 +118,10 @@ connection, from outside, exactly as the container tier's `out_of_band` fixture 
 
 ## What you should see
 
-Against the container above, `mailmindctl sync` reports `INBOX: +6 ~0 -0` and the cache
-holds the corpus with its special-use folders recognised:
-
-```
-containers: Archive(None) Drafts(drafts) INBOX(None) Sent(sent) Trash(trash)
-findings:   display_name_spoofs_address 1, first_contact 6, malformed_mime 1, no_message_id 1
-```
-
-`mailmindctl probe` reports the account `ok` and then lists twenty-seven capabilities
-Dovecot offers that the account does not declare. That is informational and does not fail
-the probe; only the other direction — declared and not offered — is loud, and only that
-one sets a non-zero exit.
+Recorded in [Getting started](../getting-started.md#what-you-should-see), because it is the
+thing somebody checks their own run against: six messages, the special-use folders
+recognised, four findings, and a probe that is loud in one direction and quiet in the
+other.
 
 Proposing a delete over MCP and accepting it in the UI moves the message into the server's
 own Trash and leaves five in INBOX. Nothing expunges: [01](01-intent.md) says mail has no

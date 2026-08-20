@@ -157,7 +157,7 @@ def check_exposure(config: Config) -> None:
         "token and this is plain HTTP, so anyone who can watch the wire can take it and "
         "accept somebody's mail. Bind to 127.0.0.1, or put TLS and authentication in "
         "front of it and say so with behind_auth_proxy = true. "
-        "See docs/11-deployment-and-identity.md."
+        "See docs/security-model.md."
     )
 
 

@@ -8,7 +8,7 @@
 #   mailmindctl bootstrap && mailmindctl probe && mailmindctl sync
 #
 # Checked in, unlike mailmind.toml, because there is nothing here worth keeping private.
-# See docs/10-running-it.md.
+# See docs/getting-started.md.
 
 database_url = "sqlite:///mailmind.dev.db"
 bind = "127.0.0.1"
@@ -26,6 +26,6 @@ caps = ["CONDSTORE", "MOVE", "UIDPLUS", "SPECIAL-USE", "IDLE"]
 [accounts.dev.login]
 username = "me@example.org"
 # env:// here and nowhere else: this is a container's throwaway password, not a secret.
-# For a mailbox that matters, see docs/10-running-it.md — secret-storage:// at a desk,
+# For a mailbox that matters, see docs/configuration.md — secret-storage:// at a desk,
 # file:// on a headless box, and env:// on neither.
 password = "env://MAILMIND_DEV_PASSWORD"
