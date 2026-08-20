@@ -34,3 +34,7 @@ mailmindctl bootstrap && mailmindctl probe && mailmindctl sync
 mailmindctl grant --producer opencode      # prints a bearer token, once
 mailmindctl serve                          # review UI on /, MCP on /mcp/
 ```
+
+Or let an MCP client start it: `mailmindctl mcp` speaks MCP on stdin and stdout and brings
+the review UI up beside it. [12 — An agent of your own](docs/12-an-agent-of-your-own.md)
+covers pointing your own agent repository at either.

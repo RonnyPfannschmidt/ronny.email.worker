@@ -60,8 +60,12 @@ def workspace(tmp_path):
             )
         )
         scope.commit()
-        ids = {"account": account.id, "inbox": inbox.id, "archive": archive.id,
-               "message": message.id}
+        ids = {
+            "account": account.id,
+            "inbox": inbox.id,
+            "archive": archive.id,
+            "message": message.id,
+        }
 
     config = tmp_path / "mailmind.toml"
     config.write_text(CONFIG.format(db=db))

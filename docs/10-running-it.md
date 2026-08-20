@@ -52,6 +52,19 @@ and then the password question below stops being hypothetical. Everything else i
 same. Note that `mailmind.toml` is gitignored and `mailmind.dev.toml` is not, which is the
 whole difference between them: one names a real mailbox and one names a container.
 
+## Or let the client start it
+
+`mailmindctl serve` is the version you run yourself. The other shape is one an MCP client
+starts for you:
+
+```
+mailmindctl mcp --producer mail-agent --port 0
+```
+
+That speaks MCP on stdin and stdout — no port, no token — and brings the review UI up
+beside it on a free port, telling the model where it is so the agent can pass the link on.
+[12](12-an-agent-of-your-own.md) has the client configuration.
+
 ## Where the password lives
 
 The configuration never holds a password. It holds a URL saying where to find one, and the

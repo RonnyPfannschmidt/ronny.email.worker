@@ -11,6 +11,7 @@
 - [x] [09 — Iteration one](09-iteration-one.md) `#tried` `#open-questions`
 - [ ] [10 — Running it](10-running-it.md) `#sketch` `#open-questions`
 - [ ] [11 — Deployment and identity](11-deployment-and-identity.md) `#sketch` `#open-questions`
+- [ ] [12 — An agent of your own](12-an-agent-of-your-own.md) `#sketch` `#open-questions`
 
 Plus [design history](design-history/) — starting-point documents, kept verbatim, not
 authoritative.
