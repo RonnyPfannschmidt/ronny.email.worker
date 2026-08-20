@@ -37,12 +37,12 @@ nothing to copy and nothing to edit. This is the one to start with.
 podman run -d --rm --name mailmind-dev -p 3144:143 -e MAILNAME=example.org \
   -e MAIL_ADDRESS=me@example.org -e MAIL_PASS=secret \
   docker.io/antespi/docker-imap-devel:latest
-python dev/seed_mailbox.py
+uv run dev/seed_mailbox.py
 
 export MAILMIND_CONFIG=mailmind.dev.toml MAILMIND_DEV_PASSWORD=secret
-mailmindctl bootstrap && mailmindctl probe && mailmindctl sync
-mailmindctl grant --producer opencode      # prints a bearer token, once
-mailmindctl serve                          # prints a link with the login key in it
+uv run mailmindctl bootstrap && uv run mailmindctl probe && uv run mailmindctl sync
+uv run mailmindctl grant --producer opencode   # prints a bearer token, once
+uv run mailmindctl serve                       # prints a link with the login key in it
 ```
 
 The review UI has a login: `serve` prints a URL carrying a key, and following it once
@@ -96,10 +96,10 @@ keyring set imap.example.org me@example.org
 The service key alone is enough — `secret-storage://imap.example.org` uses the login's own
 username as the entry, so the common case reads as the host and no more.
 
-This is optional and now installable: `pip install -e '.[secrets]'`, or `.[dev]`, which
-pulls it in. It had been documented and unreachable — `keyring` was in no dependency list
-at all, and the test for the scheme injects a fake module into `sys.modules`, so nothing
-noticed the package it names was never installable.
+This is optional and now installable: `pip install -e '.[secrets]'`, or a plain `uv sync`,
+whose `dev` group pulls the extra in. It had been documented and unreachable — `keyring`
+was in no dependency list at all, and the test for the scheme injects a fake module into
+`sys.modules`, so nothing noticed the package it names was never installable.
 
 **`file://` — headless.** A container, a bare SSH session, CI: no session bus, so keyring
 resolves to a backend that raises rather than one that stores anything. This is not a

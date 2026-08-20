@@ -106,7 +106,7 @@ podman run -d --rm -p 3144:143 -e MAILNAME=example.org \
   docker.io/antespi/docker-imap-devel:latest
 MAILMIND_IMAP_TARGET=127.0.0.1:3144 MAILMIND_TEST_PASSWORD=secret \
   MAILMIND_IMAP_CAPS="CONDSTORE,QRESYNC,MOVE,UIDPLUS,SPECIAL-USE,IDLE" \
-  pytest tests/test_container_imap.py -m ""
+  uv run pytest tests/test_container_imap.py -m ""
 ```
 
 `MAILMIND_IMAP_CAPS` is the declared matrix for that target. Tests skip on a *declared*

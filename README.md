@@ -22,17 +22,15 @@ mail. [10 — Running it](docs/10-running-it.md) covers this and pointing it at 
 mailbox, including where the password should live.
 
 ```
-uv venv && uv pip install -e '.[dev]'
-
 podman run -d --rm --name mailmind-dev -p 3144:143 -e MAILNAME=example.org \
   -e MAIL_ADDRESS=me@example.org -e MAIL_PASS=secret \
   docker.io/antespi/docker-imap-devel:latest
-python dev/seed_mailbox.py
+uv run dev/seed_mailbox.py
 
 export MAILMIND_CONFIG=mailmind.dev.toml MAILMIND_DEV_PASSWORD=secret
-mailmindctl bootstrap && mailmindctl probe && mailmindctl sync
-mailmindctl grant --producer opencode      # prints a bearer token, once
-mailmindctl serve                          # prints a link with the login key in it
+uv run mailmindctl bootstrap && uv run mailmindctl probe && uv run mailmindctl sync
+uv run mailmindctl grant --producer opencode   # prints a bearer token, once
+uv run mailmindctl serve                       # prints a link with the login key in it
 ```
 
 An MCP client can also spawn its own connection over a pipe: `mailmindctl mcp` speaks MCP
