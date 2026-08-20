@@ -1,0 +1,247 @@
+"""The stdio transport, driven the way an MCP client drives it.
+
+A subprocess rather than an in-process call, because what is being asserted is a property
+of the pipe: that it carries protocol and nothing else, while a whole web server runs in
+the same process. The SDK defends that itself — it claims fd 1 and moves the real stdout
+somewhere private — so this is a guard on the property rather than on any one way of
+breaking it, and it would still fail if some future transport stopped defending it.
+"""
+
+from __future__ import annotations
+
+import datetime as dt
+import json
+import subprocess
+import sys
+import urllib.request
+
+import pytest
+import sqlalchemy as sa
+
+from mailmind.db import models as m
+from mailmind.db.engine import create_engine
+from mailmind.db.migrate import upgrade_to_head
+from mailmind.db.scope import make_sessionmaker, tenant_scope
+
+CONFIG = """
+database_url = "sqlite:///{db}"
+bind = "127.0.0.1"
+"""
+
+
+@pytest.fixture
+def workspace(tmp_path):
+    """A database with one account, one folder and one message sitting in it.
+
+    Seeded as rows rather than over IMAP: proposing touches nothing but the cache, so this
+    needs no server, and it doubles as a demonstration that an account the configuration
+    has never named is a working account.
+    """
+    db = tmp_path / "mm.db"
+    url = f"sqlite:///{db}"
+    upgrade_to_head(url)
+    sessions = make_sessionmaker(create_engine(url))
+    with tenant_scope(sessions, 0) as scope:
+        account = scope.add(
+            m.Account(name="dev", host="h", username="u", password_url="env://X")
+        )
+        scope.flush()
+        inbox = scope.add(m.Container(account_id=account.id, name="INBOX", generation=1))
+        archive = scope.add(m.Container(account_id=account.id, name="Archive", generation=1))
+        message = scope.add(m.Message(account_id=account.id, content_key="k1", subject="Hi"))
+        scope.flush()
+        scope.add(
+            m.Placement(
+                message_id=message.id,
+                container_id=inbox.id,
+                uid=1,
+                container_generation=1,
+                seen_at=dt.datetime.now(dt.UTC),
+            )
+        )
+        scope.commit()
+        ids = {"account": account.id, "inbox": inbox.id, "archive": archive.id,
+               "message": message.id}
+
+    config = tmp_path / "mailmind.toml"
+    config.write_text(CONFIG.format(db=db))
+    return {"config": config, "url": url, "sessions": sessions, **ids}
+
+
+class StdioClient:
+    """Spawn the server and speak newline-delimited JSON-RPC at it."""
+
+    def __init__(self, config, *args: str) -> None:
+        self.proc = subprocess.Popen(
+            [sys.executable, "-m", "mailmind.cli", "--config", str(config), "mcp", *args],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            bufsize=1,
+        )
+        self._id = 0
+        self.lines: list[str] = []
+
+    def rpc(self, method: str, params: dict | None = None, *, notify: bool = False):  # noqa: ANN201
+        message: dict = {"jsonrpc": "2.0", "method": method, "params": params or {}}
+        if not notify:
+            self._id += 1
+            message["id"] = self._id
+        self.proc.stdin.write(json.dumps(message) + "\n")
+        self.proc.stdin.flush()
+        if notify:
+            return None
+        line = self.proc.stdout.readline()
+        self.lines.append(line)
+        return json.loads(line)
+
+    def call(self, name: str, **arguments):  # noqa: ANN201
+        result = self.rpc("tools/call", {"name": name, "arguments": arguments})["result"]
+        assert not result.get("isError"), result["content"][0]["text"]
+        structured = result.get("structuredContent")
+        if structured is not None:
+            return structured.get("result", structured)
+        return json.loads(result["content"][0]["text"])
+
+    def close(self) -> str:
+        self.proc.stdin.close()
+        try:
+            self.proc.wait(timeout=20)
+        except subprocess.TimeoutExpired:  # pragma: no cover
+            self.proc.kill()
+        return self.proc.stderr.read()
+
+
+def test_stdio_serves_mcp_and_tells_the_model_where_the_reviewer_is(workspace):
+    client = StdioClient(workspace["config"], "--producer", "mail-agent", "--port", "0")
+    try:
+        init = client.rpc(
+            "initialize",
+            {
+                "protocolVersion": "2025-06-18",
+                "capabilities": {},
+                "clientInfo": {"name": "t", "version": "0"},
+            },
+        )
+        client.rpc("notifications/initialized", notify=True)
+        instructions = init["result"]["instructions"]
+        assert "http://127.0.0.1:" in instructions, (
+            "the model was never told where to send anybody"
+        )
+        url = instructions.split("The person reviewing is at ")[1].split(" ")[0]
+
+        assert len(client.rpc("tools/list")["result"]["tools"]) == 12
+
+        proposed = client.call(
+            "propose_bundle",
+            account_id=workspace["account"],
+            operation="move",
+            message_ids=[workspace["message"]],
+            target_container_id=workspace["archive"],
+            summary="tidy",
+            reason="because",
+        )
+        # The link travels with the proposal too: instructions are read once, and a
+        # bundle is the moment somebody actually needs to go and look.
+        assert proposed["note"].endswith(f"{url}bundle/{proposed['bundle_id']}")
+
+        with urllib.request.urlopen(url, timeout=20) as response:
+            page = response.read().decode()
+        assert response.status == 200
+        assert f"/bundle/{proposed['bundle_id']}" in page, "the queue did not show it"
+
+        # Ask for one more response *after* the web server has handled a request, so the
+        # read happens at the point where anything that server wrote would be sitting in
+        # the pipe ahead of the answer.
+        assert len(client.rpc("tools/list")["result"]["tools"]) == 12
+    finally:
+        stderr = client.close()
+
+    # Every line read was parsed as JSON on the way past; nothing may be left over either.
+    leftover = [line for line in client.proc.stdout.read().splitlines() if line.strip()]
+    assert leftover == [], f"something else wrote to the transport: {leftover[:2]}"
+    assert "review UI" in stderr, "the human-facing lines belong on stderr"
+
+
+def test_stdio_reuses_the_named_producer_s_grant_rather_than_widening_it(workspace):
+    """`grant --producer x --capability observe` has to narrow the stdio server too."""
+    with tenant_scope(workspace["sessions"], 0) as scope:
+        producer = scope.add(m.Producer(kind=m.ProducerKind.agent, name="narrow"))
+        scope.flush()
+        grant = scope.add(
+            m.Grant(producer_id=producer.id, token_hash="hash", capabilities=["observe"])
+        )
+        scope.flush()
+        scope.add(m.GrantAccount(grant_id=grant.id, account_id=workspace["account"]))
+        scope.commit()
+
+    client = StdioClient(workspace["config"], "--producer", "narrow", "--no-review-ui")
+    try:
+        client.rpc(
+            "initialize",
+            {
+                "protocolVersion": "2025-06-18",
+                "capabilities": {},
+                "clientInfo": {"name": "t", "version": "0"},
+            },
+        )
+        client.rpc("notifications/initialized", notify=True)
+        assert client.call("list_accounts")[0]["name"] == "dev"
+
+        refused = client.rpc(
+            "tools/call",
+            {
+                "name": "propose_bundle",
+                "arguments": {
+                    "account_id": workspace["account"],
+                    "operation": "move",
+                    "message_ids": [workspace["message"]],
+                    "target_container_id": workspace["archive"],
+                    "summary": "s",
+                    "reason": "r",
+                },
+            },
+        )["result"]
+        assert refused["isError"]
+        assert "does not allow suggest" in refused["content"][0]["text"]
+    finally:
+        client.close()
+
+    with tenant_scope(workspace["sessions"], 0) as scope:
+        grants = scope.scalars(sa.select(m.Grant)).all()
+    assert len(grants) == 1, "a second grant was minted instead of the narrow one reused"
+
+
+def test_stdio_mints_a_grant_that_cannot_be_used_over_http(workspace):
+    """It is minted for the record, not for anybody to hold.
+
+    The token is generated and thrown away, so the row names a producer and covers the
+    accounts without ever having been issued — which is what a grant for a process on the
+    end of a pipe should be.
+    """
+    client = StdioClient(workspace["config"], "--producer", "fresh", "--no-review-ui")
+    try:
+        client.rpc(
+            "initialize",
+            {
+                "protocolVersion": "2025-06-18",
+                "capabilities": {},
+                "clientInfo": {"name": "t", "version": "0"},
+            },
+        )
+        client.rpc("notifications/initialized", notify=True)
+        assert [a["name"] for a in client.call("list_accounts")] == ["dev"]
+    finally:
+        client.close()
+
+    with tenant_scope(workspace["sessions"], 0) as scope:
+        grant = scope.scalar(
+            sa.select(m.Grant).join(m.Producer).where(m.Producer.name == "fresh")
+        )
+        assert sorted(grant.capabilities) == ["assess", "observe", "suggest"]
+        assert {ga.account_id for ga in grant.accounts} == {workspace["account"]}
+        minted = scope.scalar(
+            sa.select(m.AuditEvent).where(m.AuditEvent.verb == "grant_minted")
+        )
+        assert minted.payload["transport"] == "stdio"

@@ -90,7 +90,14 @@ def _bundle(scope: TenantScope, grant: dict[str, Any], bundle_id: int) -> m.Bund
     return bundle
 
 
-def build_server(service: Service) -> MCPServer:
+def build_server(service: Service, *, review_url: str | None = None) -> MCPServer:
+    """The agent surface.
+
+    ``review_url`` is where the person reviewing is: told to the model at connect time and
+    repeated on every proposal, because a suggestion nobody is told about is a suggestion
+    nobody reviews.  It is set when this process is also serving the review UI, which is
+    what the stdio mode does.
+    """
     server = MCPServer(
         name="mailmind",
         instructions=(
@@ -105,6 +112,13 @@ def build_server(service: Service) -> MCPServer:
             "bundles — one operation, one target — because a bundle is what a person "
             "reviews as a unit, and one they cannot read is one they cannot honestly "
             "accept."
+            + (
+                f"\n\nThe person reviewing is at {review_url} — nothing you propose "
+                "happens until they open it and accept. Tell them the link when you "
+                "propose something."
+                if review_url
+                else ""
+            )
         ),
     )
 
@@ -312,7 +326,10 @@ def build_server(service: Service) -> MCPServer:
                 "status": bundle.status.value,
                 "items": len(bundle.suggestions),
                 "resource": f"mailmind://bundle/{bundle.id}",
-                "note": "Awaiting review. Nothing has changed in the mailbox.",
+                "note": (
+                    "Awaiting review. Nothing has changed in the mailbox."
+                    + (f" Review it at {review_url}bundle/{bundle.id}" if review_url else "")
+                ),
             }
 
     @server.tool()
@@ -460,23 +477,80 @@ def build_server(service: Service) -> MCPServer:
     return server
 
 
+def _view(grant: m.Grant) -> dict[str, Any]:
+    """The whole of what a caller may do, in the one shape every transport uses."""
+    return {
+        "grant_id": grant.id,
+        "tenant_id": grant.tenant_id,
+        "producer_id": grant.producer_id,
+        "capabilities": list(grant.capabilities),
+        "account_ids": {ga.account_id for ga in grant.accounts},
+    }
+
+
+def _live(grant: m.Grant | None) -> bool:
+    import datetime as dt
+
+    if grant is None or grant.revoked_at is not None:
+        return False
+    return grant.expires_at is None or grant.expires_at > dt.datetime.now(dt.UTC)
+
+
 def grant_context(service: Service, token: str) -> dict[str, Any] | None:
     """Turn a bearer token into the whole of what a caller may do."""
     with service.scope() as s:
         grant = s.scalar(sa.select(m.Grant).where(m.Grant.token_hash == _hash(token)))
-        if grant is None or grant.revoked_at is not None:
-            return None
-        import datetime as dt
+        return _view(grant) if _live(grant) else None
 
-        if grant.expires_at is not None and grant.expires_at <= dt.datetime.now(dt.UTC):
-            return None
-        return {
-            "grant_id": grant.id,
-            "tenant_id": grant.tenant_id,
-            "producer_id": grant.producer_id,
-            "capabilities": list(grant.capabilities),
-            "account_ids": {ga.account_id for ga in grant.accounts},
-        }
+
+def local_context(service: Service, producer_name: str) -> dict[str, Any]:
+    """The same view, for a server the person started themselves over stdio.
+
+    There is no bearer token on a pipe and no use for one: whoever spawned this process
+    can already read the database and the configuration, so a token would be scoping them
+    against themselves.  What the grant is still for is the record — "who proposed this"
+    has to stay answerable, and a producer row is how it is answered.
+
+    A live grant for the named producer is reused, so ``mailmindctl grant --producer x
+    --capability observe`` narrows the stdio server too.  Failing that one is minted over
+    every account, with a token generated and thrown away: the row cannot be used over
+    HTTP, which is right, because it was never issued to anybody.
+    """
+    from mailmind.service import hash_token, mint_token
+
+    with service.scope() as s:
+        producer = s.scalar(sa.select(m.Producer).where(m.Producer.name == producer_name))
+        if producer is None:
+            producer = m.Producer(kind=m.ProducerKind.agent, name=producer_name)
+            s.add(producer)
+            s.flush()
+
+        grant = s.scalar(
+            sa.select(m.Grant)
+            .where(m.Grant.producer_id == producer.id)
+            .order_by(m.Grant.created_at.desc())
+        )
+        if not _live(grant):
+            grant = m.Grant(
+                producer_id=producer.id,
+                token_hash=hash_token(mint_token()),
+                capabilities=[capability.value for capability in m.Capability],
+            )
+            s.add(grant)
+            s.flush()
+            for account_id in s.scalars(sa.select(m.Account.id)):
+                s.add(m.GrantAccount(grant_id=grant.id, account_id=account_id))
+            s.flush()
+            s.audit(
+                "grant_minted",
+                actor_kind="person",
+                subject_kind="grant",
+                subject_id=grant.id,
+                payload={"producer": producer_name, "transport": "stdio"},
+            )
+        view = _view(grant)
+        s.commit()
+        return view
 
 
 def _hash(token: str) -> str:

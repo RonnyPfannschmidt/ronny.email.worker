@@ -197,6 +197,121 @@ def status(ctx: click.Context) -> None:
         click.echo(json.dumps(bundles, indent=2))
 
 
+@main.command("mcp")
+@click.option(
+    "--producer",
+    default="local",
+    help="whose proposals these are, in the record. Reuses that producer's grant if it "
+    "has one, so `grant --producer NAME --capability observe` narrows this too.",
+)
+@click.option(
+    "--token",
+    default=None,
+    envvar="MAILMIND_TOKEN",
+    help="use an existing grant token instead, exactly as the HTTP endpoint would",
+)
+@click.option("--port", default=None, type=int, help="review UI port; 0 picks a free one")
+@click.option("--no-review-ui", is_flag=True, help="speak MCP and serve nothing")
+@click.pass_context
+def mcp_stdio(  # noqa: C901
+    ctx: click.Context,
+    producer: str,
+    token: str | None,
+    port: int | None,
+    no_review_ui: bool,
+) -> None:
+    """Speak MCP on stdin and stdout, with the review UI on a local port.
+
+    This is the shape an MCP client expects: it spawns the process and talks down a pipe,
+    so there is no port to configure, no token to paste and nothing to start first.
+
+    The review UI still needs somewhere to be, because a proposal nobody looks at is not a
+    proposal. It comes up alongside, and its address is given to the model at connect time
+    and repeated on every bundle — the agent can then say where to go and the person can
+    go there.
+    """
+    import asyncio
+    import socket
+
+    import uvicorn
+
+    from mailmind.mcp import server as mcp_server
+    from mailmind.web.app import create_app
+
+    overrides = {"port": port} if port is not None else {}
+    service = _service(ctx.obj["config_path"], **overrides)
+
+    # Nothing here writes to stdout: it is the transport, so every message goes to stderr.
+    # The MCP SDK does defend this — stdio_server claims fd 1 and moves the real stdout to
+    # a private descriptor, so a stray print cannot corrupt the protocol. That is a net
+    # under the floor rather than a reason to walk about: uvicorn's access log is turned
+    # off below because a log nobody can read is not worth writing, not because it would
+    # otherwise land on the wire.
+    def tell(message: str) -> None:
+        click.echo(message, err=True)
+
+    listener: socket.socket | None = None
+    review_url: str | None = None
+    if not no_review_ui:
+        bind = service.config.bind
+        family = socket.AF_INET6 if ":" in bind else socket.AF_INET
+        try:
+            listener = socket.create_server(
+                (bind, service.config.port), family=family, backlog=128
+            )
+        except OSError as exc:
+            raise click.ClickException(
+                f"cannot serve the review UI on {bind}:{service.config.port}: {exc}. "
+                "Use --port 0 for a free one, or --no-review-ui."
+            ) from exc
+        # Bound before the server is built, because the address has to be known in time to
+        # go into the instructions the model is given at connect time.
+        shown = f"[{bind}]" if ":" in bind else bind
+        review_url = f"http://{shown}:{listener.getsockname()[1]}/"
+
+    try:
+        context = (
+            mcp_server.grant_context(service, token)
+            if token
+            else mcp_server.local_context(service, producer)
+        )
+    except ConfigError as exc:
+        raise click.ClickException(str(exc)) from exc
+    if context is None:
+        raise click.ClickException("that token does not resolve to a grant that is still live")
+
+    server = mcp_server.build_server(service, review_url=review_url)
+
+    async def run() -> None:
+        mcp_server.CURRENT_GRANT.set(context)
+        if listener is None:
+            await server.run_stdio_async()
+            return
+        web = uvicorn.Server(
+            uvicorn.Config(
+                create_app(service, with_mcp=False),
+                log_level="warning",
+                access_log=False,
+            )
+        )
+        serving = asyncio.create_task(web.serve(sockets=[listener]))
+        try:
+            await server.run_stdio_async()
+        finally:
+            web.should_exit = True
+            await asyncio.gather(serving, return_exceptions=True)
+
+    tell(f"mailmind MCP on stdio as {producer!r}")
+    if review_url:
+        tell(f"review UI  {review_url}")
+    try:
+        asyncio.run(run())
+    except KeyboardInterrupt:  # pragma: no cover - the client closing the pipe
+        pass
+    finally:
+        service.close()
+
+
 @main.command()
 @click.option("--host", default=None)
 @click.option("--port", default=None, type=int)
