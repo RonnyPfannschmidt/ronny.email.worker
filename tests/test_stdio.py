@@ -15,6 +15,7 @@ import http.cookiejar
 import json
 import pathlib
 import socket
+import stat
 import subprocess
 import sys
 import urllib.error
@@ -189,12 +190,6 @@ def test_serve_brings_the_review_ui_up_for_the_life_of_the_session(workspace):
     """
     client = StdioClient(workspace["config"], "--serve", "--port", "0")
     try:
-        # The key is printed where the person is, and nowhere else. Reading it off stderr
-        # here is the test standing in for somebody looking at their terminal.
-        client.startup_line()
-        opened_with = client.startup_line().split()[-1]
-        assert "?key=" in opened_with
-
         init = client.rpc(
             "initialize",
             {
@@ -223,7 +218,16 @@ def test_serve_brings_the_review_ui_up_for_the_life_of_the_session(workspace):
         with pytest.raises(urllib.error.HTTPError) as shut:
             urllib.request.urlopen(url, timeout=20)
         assert shut.value.code == 401
-        assert url in opened_with, "the printed link is not the address the model was given"
+
+        # The link is left in a file, because stderr is collected into an MCP client's log
+        # and some of those are put in front of the model.
+        from mailmind.web.app import link_path
+
+        left = link_path(int(url.rstrip("/").rpartition(":")[2]))
+        assert left.exists(), "no link was left anywhere a person could find it"
+        assert stat.S_IMODE(left.stat().st_mode) == 0o600
+        opened_with = left.read_text().strip()
+        assert opened_with.startswith(url) and "?key=" in opened_with
 
         # Following the printed link is the login, and it is a person who has it.
         jar = http.cookiejar.CookieJar()
@@ -247,7 +251,10 @@ def test_serve_brings_the_review_ui_up_for_the_life_of_the_session(workspace):
 
     leftover = [line for line in client.proc.stdout.read().splitlines() if line.strip()]
     assert leftover == [], f"something else wrote to the transport: {leftover[:2]}"
-    assert "not given it" in stderr or "This session only" in stderr
+    key = opened_with.partition("?key=")[2]
+    assert key and key not in stderr, "the key reached a log an MCP client collects"
+    assert str(left) in stderr, "nothing said where the link was left"
+    assert "sandbox the agent" in stderr, "no warning about what a local deployment is"
 
     # And it went away with the session.
     host, _, port = url.removeprefix("http://").rstrip("/").rpartition(":")

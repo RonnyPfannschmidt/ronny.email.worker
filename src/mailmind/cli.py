@@ -30,6 +30,46 @@ def main(ctx: click.Context, config_path: str | None) -> None:
     ctx.obj = {"config_path": config_path}
 
 
+#: Said out loud wherever a review UI comes up, because the arrangement is easy to
+#: mistake for a stronger one than it is.
+LOCAL_WARNING = (
+    "\n  This is a local deployment. Its boundary is that the review key is never given\n"
+    "  to the agent — not that the agent cannot reach it. Anything running as you can\n"
+    "  read that key, and read the mailbox password out of your configuration without\n"
+    "  going near mailmind at all. If that matters, sandbox the agent.\n"
+    "  See docs/12-an-agent-of-your-own.md."
+)
+
+
+@main.command()
+@click.option("--open", "open_it", is_flag=True, help="follow the link in a browser")
+@click.option("--port", default=None, type=int, help="which server, if several are up")
+@click.pass_context
+def review(ctx: click.Context, open_it: bool, port: int | None) -> None:
+    """Print the link that opens the review UI, or follow it.
+
+    The link carries the key, which is why it is left in a file rather than printed by
+    anything an MCP client collects.
+    """
+    from mailmind.web.app import link_path
+
+    service = _service(ctx.obj["config_path"])
+    path = link_path(port if port is not None else service.config.port)
+    if not path.exists():
+        raise click.ClickException(
+            f"no review UI has left a link at {path} — start one with `mailmindctl serve`, "
+            "or name its port with --port"
+        )
+    link = path.read_text().strip()
+    if open_it:
+        import webbrowser
+
+        webbrowser.open(link)
+        click.echo(f"opened {link.split('?')[0]}")
+        return
+    click.echo(link)
+
+
 @main.command()
 @click.pass_context
 def bootstrap(ctx: click.Context) -> None:
@@ -259,6 +299,7 @@ def mcp_stdio(
     import uvicorn
 
     from mailmind.mcp import server as mcp_server
+    from mailmind.web import app as web_app
     from mailmind.web.app import create_app, mint_session_key
 
     if review_url and serve_ui:
@@ -338,9 +379,15 @@ def mcp_stdio(
     # stdout is the transport, so everything a person reads goes to stderr.
     click.echo(f"mailmind MCP on stdio as {producer!r}", err=True)
     if serve_ui:
-        click.echo(f"review UI  {review_url}?key={session_key}", err=True)
-        click.echo("           open that link once — it is the login, and the", err=True)
-        click.echo("           agent was not given it. This session only.", err=True)
+        # The key goes to a file and never to stderr: an MCP client collects the stderr of
+        # what it spawns into a log, and some put that log in front of the model.
+        left_at = web_app.leave_the_link(
+            listener.getsockname()[1], f"{review_url}?key={session_key}"
+        )
+        click.echo(f"review UI  {review_url}  (this session only)", err=True)
+        click.echo(f"           the link that opens it is in {left_at}", err=True)
+        click.echo("           `mailmindctl review --open` follows it for you", err=True)
+        click.echo(LOCAL_WARNING, err=True)
     else:
         click.echo(f"review UI  {review_url} — `mailmindctl serve` runs it", err=True)
     try:
@@ -371,10 +418,17 @@ def serve(ctx: click.Context, host: str | None, port: int | None) -> None:
         app = create_app(service, session_key=session_key)
     except ConfigError as exc:
         raise click.ClickException(str(exc)) from exc
+    from mailmind.web.app import leave_the_link
+
     where = f"http://{service.config.bind}:{service.config.port}"
-    click.echo(f"review UI  {where}/?key={session_key}")
+    link = f"{where}/?key={session_key}"
+    leave_the_link(service.config.port, link)
+    # Printed here, unlike the stdio mode: this command is one a person runs in their own
+    # terminal, and its output is not collected into anybody's agent log.
+    click.echo(f"review UI  {link}")
     click.echo("           open that link once — it is the login, and nothing")
     click.echo("           connecting over MCP is given it.")
+    click.echo(LOCAL_WARNING)
     # The trailing slash is not decoration: the endpoint is mounted at /mcp/ and a POST to
     # /mcp gets a 307, which an MCP client is entitled to follow and may not.
     click.echo(f"MCP        {where}/mcp/")

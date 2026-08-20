@@ -27,6 +27,12 @@ MCP        http://127.0.0.1:8765/mcp/
 Following that link once trades the key for a session cookie and drops it back out of the
 address bar. Nothing else gets in.
 
+Where the link is printed matters as much as what it is. `serve` prints it, being a command
+a person runs in their own terminal. `mailmindctl mcp --serve` does not: an MCP client
+collects the stderr of what it spawns into a log, and some put that log in front of the
+model, so there the key goes to a file with a mode on it and stderr gets only the path.
+`mailmindctl review --open` follows it.
+
 It was tempting to argue that a login on one person's own machine is ceremony protecting
 nothing — the person at the keyboard being the only person there. That stopped being true
 the moment an agent ran on the same machine, which is the ordinary case. The key is not

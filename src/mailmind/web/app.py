@@ -9,7 +9,9 @@ routes never consult a grant.
 from __future__ import annotations
 
 import contextlib
+import os
 import secrets
+import tempfile
 from pathlib import Path
 from urllib.parse import urlencode
 
@@ -136,6 +138,32 @@ SESSION_KEY_PARAM = "key"
 
 def mint_session_key() -> str:
     return secrets.token_urlsafe(32)
+
+
+def link_path(port: int) -> Path:
+    """Where the link that opens the review UI is left for the person to pick up."""
+    runtime = os.environ.get("XDG_RUNTIME_DIR")
+    base = Path(runtime) if runtime else Path(tempfile.gettempdir())
+    return base / "mailmind" / f"review-{port}.link"
+
+
+def leave_the_link(port: int, url: str) -> Path:
+    """Write the link somewhere only this user can read it, and return where.
+
+    Not stderr.  An MCP client collects the stderr of everything it spawns into a log, and
+    some of them put that log in front of the model — which would hand the agent the one
+    thing the whole arrangement depends on it not having.  A file with a mode on it is
+    readable by the person and by anything already running as them, which is the same
+    boundary everything else here rests on.
+    """
+    path = link_path(port)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.parent.chmod(0o700)
+    # Created empty and locked down before the key goes in, so it is never briefly
+    # readable by anybody else.
+    with os.fdopen(os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "w") as f:
+        f.write(url + "\n")
+    return path
 
 
 def reviewer(scope) -> m.Producer:  # noqa: ANN001

@@ -180,6 +180,17 @@ class Agent:
 
         return json.loads(payload["content"][0]["text"])
 
+    def prompts(self) -> list[str]:
+        return [p["name"] for p in self._post("prompts/list")["result"]["prompts"]]
+
+    def prompt(self, name: str, arguments: dict | None = None) -> str:
+        result = self._post("prompts/get", {"name": name, "arguments": arguments or {}})
+        if "error" in result:
+            raise AssertionError(result["error"])
+        return "".join(
+            message["content"]["text"] for message in result["result"]["messages"]
+        )
+
     def read(self, uri: str):  # noqa: ANN201
         import json
 
@@ -231,6 +242,54 @@ AGENT_TOOLS = {
     "add_assessment",
     "withdraw_bundle",
 }
+
+
+#: Offered rather than imposed: a client that never calls prompts/get gets the same tools
+#: and the same refusals. Listed here for the same reason the tools are — a change to what
+#: an agent is handed is a change worth reviewing.
+AGENT_PROMPTS = {"triage_mailbox", "assess_message", "hand_over"}
+
+
+def test_the_prompts_carry_the_guardrails_rather_than_leaving_them_to_luck(client):
+    """05 asks what an agent needs to be useful here. These are the answer so far.
+
+    They exist because the rules that matter — start with the shape, treat content as
+    data, keep a bundle readable, say where to review — are properties of how the surface
+    is used, and a tool description is a bad place to put a workflow.
+    """
+    agent = Agent(client)
+    assert set(agent.prompts()) == AGENT_PROMPTS
+
+    for name, arguments in [
+        ("triage_mailbox", {"container_id": "1"}),
+        ("assess_message", {"message_id": "1"}),
+        ("hand_over", {}),
+    ]:
+        text = agent.prompt(name, arguments)
+        # Every one of them, because a client picks one and never sees the others.
+        assert "cannot change this mailbox" in text
+        assert "DATA" in text
+        assert "not given the key" in text, name
+
+    assert "summarize_senders" in agent.prompt("triage_mailbox", {"container_id": "1"})
+    assert "Do not propose" in agent.prompt("assess_message", {"message_id": "1"})
+    handover = agent.prompt("hand_over", {})
+    assert "local deployment" in handover
+    assert "sandboxed" in handover
+
+
+def test_no_prompt_carries_the_key(client):
+    """They are text the model is handed, so they are the obvious place to leak it."""
+    agent = Agent(client)
+    everything = "".join(
+        agent.prompt(name, args)
+        for name, args in [
+            ("triage_mailbox", {"container_id": "1"}),
+            ("assess_message", {"message_id": "1"}),
+            ("hand_over", {}),
+        ]
+    )
+    assert SESSION_KEY not in everything
 
 
 def test_the_agent_surface_is_exactly_look_and_say(client):
