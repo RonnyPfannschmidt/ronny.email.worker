@@ -175,6 +175,24 @@ class ToolRefused(Exception):
     pass
 
 
+def as_a_person(client: TestClient, path: str, **kwargs):  # noqa: ANN201
+    """POST the way a browser does when somebody submits a form on a page it is showing.
+
+    The review UI refuses anything else, so a test that changes something has to arrive the
+    way a change really arrives. Sec-Fetch-User is included because a real submit carries
+    it — the service does not require it, since Safari has never sent it.
+    """
+    headers = {
+        "Sec-Fetch-Mode": "navigate",
+        "Sec-Fetch-Dest": "document",
+        "Sec-Fetch-Site": "same-origin",
+        "Sec-Fetch-User": "?1",
+        "Origin": str(client.base_url).rstrip("/"),
+    }
+    headers.update(kwargs.pop("headers", {}))
+    return client.post(path, headers=headers, **kwargs)
+
+
 # ------------------------------------------------------------------ the surface
 
 
@@ -569,7 +587,9 @@ def test_accepting_in_the_ui_actually_moves_the_mail(client, backend):
     proposed = _propose(agent)
     assert len(backend.folders["Archive"].messages) == 0
 
-    response = client.post(f"/bundle/{proposed['bundle_id']}/accept", follow_redirects=True)
+    response = as_a_person(
+        client, f"/bundle/{proposed['bundle_id']}/accept", follow_redirects=True
+    )
     assert response.status_code == 200
     assert len(backend.folders["Archive"].messages) == 1
     assert "applied" in response.text
@@ -598,7 +618,9 @@ def test_accepting_a_delete_in_the_ui_files_it_in_trash(client, backend):
         reason="Nothing here is wanted",
     )
 
-    response = client.post(f"/bundle/{proposed['bundle_id']}/accept", follow_redirects=True)
+    response = as_a_person(
+        client, f"/bundle/{proposed['bundle_id']}/accept", follow_redirects=True
+    )
     assert response.status_code == 200
     assert "no Trash container is known" not in response.text
     assert len(backend.folders["Trash"].messages) == 1
@@ -621,14 +643,17 @@ def test_the_ui_refuses_to_accept_around_something_that_moved(client, backend, s
     page = client.get(f"/bundle/{proposed['bundle_id']}").text
     if "moved since this was proposed" in page:
         assert "acknowledge_stale" in page
-    response = client.post(f"/bundle/{proposed['bundle_id']}/accept", follow_redirects=True)
+    response = as_a_person(
+        client, f"/bundle/{proposed['bundle_id']}/accept", follow_redirects=True
+    )
     assert response.status_code == 200
 
 
 def test_a_rejection_can_carry_a_reason_and_is_as_easy_as_accepting(client, backend):
     agent = Agent(client)
     proposed = _propose(agent)
-    response = client.post(
+    response = as_a_person(
+        client,
         f"/bundle/{proposed['bundle_id']}/reject",
         data={"reason": "I want to keep reading these"},
         follow_redirects=True,
@@ -677,7 +702,8 @@ def test_the_queue_shows_the_account_being_worked_in_and_no_other(client, other_
     assert f"/bundle/{theirs}" in queue
     assert f"/bundle/{mine}" not in queue
 
-    switched = client.post(
+    switched = as_a_person(
+        client,
         "/accounts/choose",
         data={"account_id": other_account["test_account_id"]},
         follow_redirects=True,
@@ -852,7 +878,7 @@ def test_a_sync_that_dies_partway_keeps_the_folders_it_finished(tmp_path):
 
     with TestClient(create_app(service), base_url="http://127.0.0.1:8765") as client:
         with pytest.raises(MailboxUnhealthy):
-            client.post(f"/accounts/{account_id}/sync")
+            as_a_person(client, f"/accounts/{account_id}/sync")
 
     with service.scope() as scope:
         cached = {
@@ -866,6 +892,70 @@ def test_a_sync_that_dies_partway_keeps_the_folders_it_finished(tmp_path):
     assert cached["INBOX"] == len(CORPUS), "the folders that finished were thrown away"
     assert cached["Archive"] == 1
     assert cached["Zzz"] == 0
+
+
+#: Each is one header away from a browser submitting a form, plus the case that started
+#: this: an agent doing the obvious thing with an address it was handed.
+NOT_A_GESTURE = {
+    "nothing at all": None,
+    "a fetch rather than a navigation": {"Sec-Fetch-Mode": "cors"},
+    "not a document being loaded": {"Sec-Fetch-Dest": "empty"},
+    "arriving from somewhere else": {"Sec-Fetch-Site": "cross-site"},
+    "an origin that is not this one": {"Origin": "http://evil.example"},
+}
+
+
+@pytest.mark.parametrize("why", list(NOT_A_GESTURE))
+def test_the_review_ui_refuses_a_change_that_is_not_a_person_at_a_browser(
+    client, backend, why
+):
+    """One POST to the address the agent is handed used to accept a bundle and move mail.
+
+    It is still not a security boundary — anything that can set a header can say all of
+    this. What it buys is that an agent doing the obvious thing with an address it was
+    given no longer reaches it, and one that does reach it has asserted in four headers
+    that a browser is showing a page to somebody. See docs/12.
+    """
+    proposed = _propose(Agent(client))
+    spoiled = NOT_A_GESTURE[why]
+    headers = {}
+    if spoiled is not None:
+        headers = {
+            "Sec-Fetch-Mode": "navigate",
+            "Sec-Fetch-Dest": "document",
+            "Sec-Fetch-Site": "same-origin",
+            "Origin": str(client.base_url).rstrip("/"),
+            **spoiled,
+        }
+
+    refused = client.post(f"/bundle/{proposed['bundle_id']}/accept", headers=headers)
+    assert refused.status_code == 403, why
+    assert "nothing here is yours to accept" in refused.text
+    assert len(backend.folders["Archive"].messages) == 0, "it applied anyway"
+
+
+def test_a_refused_change_leaves_a_mark(client, service):
+    """The refusal is the interesting half: nothing changed, but something tried."""
+    proposed = _propose(Agent(client))
+    assert client.post(f"/bundle/{proposed['bundle_id']}/accept").status_code == 403
+
+    with service.scope() as scope:
+        event = scope.scalar(
+            sa.select(m.AuditEvent).where(m.AuditEvent.verb == "ui_change_refused")
+        )
+    assert event is not None, "a refused change should be findable afterwards"
+    assert event.payload["path"].endswith("/accept")
+    assert "sec-fetch-mode" in event.payload["problem"]
+
+
+def test_a_person_at_a_browser_still_gets_through(client, backend):
+    """The other half: the check has to let the actual case work."""
+    proposed = _propose(Agent(client))
+    response = as_a_person(
+        client, f"/bundle/{proposed['bundle_id']}/accept", follow_redirects=True
+    )
+    assert response.status_code == 200
+    assert len(backend.folders["Archive"].messages) == 1
 
 
 def test_the_review_pages_forbid_remote_content(client):

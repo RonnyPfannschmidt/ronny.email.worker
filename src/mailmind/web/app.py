@@ -16,6 +16,7 @@ from fastapi import FastAPI, Form, Request
 from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
 from mcp.server.transport_security import TransportSecuritySettings
+from starlette.concurrency import run_in_threadpool
 from starlette.middleware.base import BaseHTTPMiddleware
 
 from mailmind import views
@@ -86,6 +87,41 @@ def chosen_account(scope) -> m.Account | None:  # noqa: ANN001
     return scope.scalar(sa.select(m.Account).order_by(m.Account.name))
 
 
+#: What a browser sends when a person submits a form on a page it is showing. All three
+#: are Fetch Metadata headers, which scripts are forbidden to set — inside a browser these
+#: cannot be forged, and outside one they have to be asserted deliberately.
+#:
+#: `Sec-Fetch-User: ?1` would be the better signal, being "a person did this" rather than
+#: "a document navigated". It is not required because Safari has never sent it, and a
+#: check that locks out a whole browser is a check somebody turns off.
+BROWSER_GESTURE = {
+    "sec-fetch-mode": "navigate",
+    "sec-fetch-dest": "document",
+    "sec-fetch-site": "same-origin",
+}
+
+
+def not_a_browser_gesture(request: Request) -> str | None:
+    """Why this POST does not look like a person submitting a form, if it does not.
+
+    This is not a security boundary and cannot be one — anything that can set a header can
+    say all of this. What it does is move the review UI out of reach of an agent doing the
+    obvious thing with an address it was given, so that reaching it at all means asserting,
+    in four headers, that a browser is showing a page to somebody. See
+    docs/12-an-agent-of-your-own.md for how far that goes and what it does not cover.
+    """
+    for header, expected in BROWSER_GESTURE.items():
+        actual = request.headers.get(header)
+        if actual != expected:
+            return f"{header} was {actual!r}, not {expected!r}"
+    origin = request.headers.get("origin")
+    host = request.headers.get("host", "")
+    expected_origin = f"{request.url.scheme}://{host}"
+    if origin != expected_origin:
+        return f"origin was {origin!r}, not {expected_origin!r}"
+    return None
+
+
 def reviewer(scope) -> m.Producer:  # noqa: ANN001
     """The person at the keyboard.
 
@@ -135,6 +171,27 @@ def create_app(service: Service, *, with_mcp: bool = True) -> FastAPI:
         )
         app = FastAPI(title="mailmind", lifespan=lambda _app: mcp.session_manager.run())
         app.mount("/mcp", GrantMiddleware(mcp_app, service))
+
+    @app.middleware("http")
+    async def only_a_person_at_a_browser_changes_anything(request: Request, call_next):  # noqa: ANN001, ANN202
+        """Every route that changes something goes through here.
+
+        A middleware rather than a check per route, so that a route added later is covered
+        by having been added rather than by somebody remembering.
+        """
+        if request.method == "POST" and not request.url.path.startswith("/mcp"):
+            problem = not_a_browser_gesture(request)
+            if problem is not None:
+                await run_in_threadpool(_record_refusal, service, request, problem)
+                return HTMLResponse(
+                    "<h1>Not accepted</h1><p>This did not arrive as a person submitting a "
+                    "form in a browser: " + problem + ".</p><p>The review UI is for "
+                    "whoever owns this mail, at this computer. If you are an agent, this "
+                    "is the page you were told to send somebody to, not one to act on — "
+                    "nothing here is yours to accept.</p>",
+                    status_code=403,
+                )
+        return await call_next(request)
 
     @app.middleware("http")
     async def security_headers(request: Request, call_next):  # noqa: ANN001, ANN202
@@ -347,6 +404,27 @@ def create_app(service: Service, *, with_mcp: bool = True) -> FastAPI:
         return RedirectResponse("/accounts", status_code=303)
 
     return app
+
+
+def _record_refusal(service: Service, request: Request, problem: str) -> None:
+    """Leave a mark, because a refusal is the interesting half.
+
+    Nothing was applied, so there is no state change to explain — but something tried to
+    change a mailbox without being a person, and whoever owns the mail should be able to
+    find out that it happened.
+    """
+    with contextlib.suppress(Exception), service.scope() as scope:
+        scope.audit(
+            "ui_change_refused",
+            actor_kind="service",
+            subject_kind="request",
+            payload={
+                "path": request.url.path,
+                "problem": problem,
+                "user_agent": request.headers.get("user-agent"),
+            },
+        )
+        scope.commit()
 
 
 def _back(bundle_id: int, error: str | None) -> RedirectResponse:

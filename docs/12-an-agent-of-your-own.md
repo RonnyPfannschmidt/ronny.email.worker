@@ -161,37 +161,64 @@ mounts no MCP endpoint, so there is no second way in through the port either. Wh
 the only path from a proposal to a mailbox runs through the review UI, and the only thing
 between the agent and that path is that the agent is not supposed to take it.
 
-### What is actually enforced
+### What used to be enforced, and what is now
 
-Nothing. The review UI has no login, deliberately ([11](11-deployment-and-identity.md)),
-and accepting is an ordinary form POST. Against the throwaway mailbox, holding the URL the
-model was handed:
+Nothing, at first. The review UI has no login, deliberately
+([11](11-deployment-and-identity.md)), and accepting was an ordinary form POST. Holding the
+URL the model had just been handed:
 
 ```
-model told: http://127.0.0.1:35607/ | proposed bundle 1
 POST http://127.0.0.1:35607/bundle/1/accept  ->  200
-  INBOX: 5      (was 6)
-  Archive: 1    (was 0)
+  INBOX: 5 (was 6)    Archive: 1 (was 0)
 ```
 
-No token, no browser, no form fields, no referer. One request, and mail moved. Any agent
-with a shell, an HTTP fetch tool or a Python interpreter can make that request, and it was
-told where to make it.
+No token, no browser, no form fields. One request, and mail moved.
 
-### Why it is harder to close than it looks
+Every route that changes something now requires the headers a browser sends when a person
+submits a form on a page it is showing:
+
+```
+sec-fetch-mode: navigate      sec-fetch-site: same-origin
+sec-fetch-dest: document      origin:          <this origin>
+```
+
+These are [Fetch Metadata](https://developer.mozilla.org/en-US/docs/Glossary/Fetch_metadata_request_header)
+headers, which scripts are forbidden to set — inside a browser they cannot be forged. The
+same request as above now gets a 403 that says why, and leaves a `ui_change_refused` event
+behind, because a refusal is the interesting half: nothing changed, but something tried,
+and whoever owns the mail should be able to find that out afterwards.
+
+`Sec-Fetch-User: ?1` would be the better signal — "a person did this" rather than "a
+document navigated" — and is not required, because Safari has never sent it and a check
+that locks out a whole browser is a check somebody turns off.
+
+### What this is and is not
+
+It is not a security boundary and cannot be made into one. Anything that can set a header
+can assert all four, and doing so takes about a line:
+
+```
+POST with the four headers  ->  200, and the mail moves
+```
+
+What changed is the character of the act. Before, an agent reached the review UI by doing
+the obvious thing with an address it had been given. Now it reaches it by stating, in
+headers it had to choose to send, that a browser is showing a page to a person. The first
+is an accident waiting to happen; the second is a lie. That is the whole of what a check
+like this buys, and it is worth having for exactly that reason and no other.
+
+The things that would make it a real boundary have not changed:
 
 - **The address was given away on purpose.** That is the feature: the agent knows where the
-  review is so it can tell whoever it is working for. The same fact is what makes the port
+  review is so it can tell whoever it is working for. The same fact makes the port
   reachable.
-- **`--port 0` looks like entropy and is not.** An unpredictable port would be a weak
-  capability, but it is handed over in the instructions, so the unpredictability is spent
-  the moment the session starts.
-- **CSRF tokens and same-origin checks raise the cost, not the wall.** Something that can
-  POST can also GET the page first and read the token out of it.
-- **Telling a browser from a fetch is guesswork.** Every signal is a header the caller
-  writes.
-- **HTTP cannot express "a person did this".** That is the actual requirement, and it is not
-  a thing a request can carry.
+- **`--port 0` looks like entropy and is not.** It is handed over in the instructions, so
+  the unpredictability is spent the moment the session starts.
+- **A form token would raise the cost again** — you would have to fetch and parse the page
+  you intend to act on, which is at least thematically right for a review UI. It is still
+  only cost.
+- **HTTP cannot express "a person did this".** That is the actual requirement, and no
+  request can carry it.
 
 ### What would make it a boundary
 
@@ -200,7 +227,9 @@ Roughly in increasing order of how much they actually hold:
 1. **Do not tell the agent the address.** Print it to stderr only, and tell the model that a
    review UI is running and where its operator can find the address. `--port 0` then becomes
    a real capability rather than a formality. Cheap — and it costs exactly the thing that
-   made this mode nice, which is the agent being able to say where to go.
+   made this mode nice, which is the agent being able to say where to go. Note that the
+   gesture check above does not help here and was never meant to: it raises the cost of
+   using an address, not of holding one.
 2. **A secret in the path, given to the person and not to the model.** The agent can say
    "open the link printed in your terminal"; only the human holds a URL that works. Keeps
    most of the ergonomics and makes the capability explicit rather than incidental.
