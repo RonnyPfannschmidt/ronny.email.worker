@@ -337,6 +337,8 @@ def create_app(service: Service) -> FastAPI:
                     for container in sync.discover_containers(scope, account, backend):
                         if container.selectable:
                             sync.sync_container(scope, account, container, backend)
+                            # Per folder: see the same commit in `mailmindctl sync`.
+                            scope.commit()
                 scope.commit()
         return RedirectResponse("/accounts", status_code=303)
 

@@ -176,7 +176,12 @@ def sync(ctx: click.Context, account_name: str | None) -> None:
                             f"{container.name}: +{report.added} ~{report.updated} "
                             f"-{report.vanished}"
                         )
-            scope.commit()
+                    # Per folder, not per account.  A first sync of a real mailbox is
+                    # long, and one transaction around the whole of it holds SQLite's
+                    # write lock for the duration — which every other request then waits
+                    # on and gives up.  It also made the whole sync all-or-nothing, so
+                    # interrupting an hour of fetching threw the hour away.
+                    scope.commit()
     service.close()
 
 

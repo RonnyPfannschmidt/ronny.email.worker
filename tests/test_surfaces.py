@@ -18,7 +18,7 @@ from mailmind.config import AccountConfig, Config, ConfigError, Limits, Login
 from mailmind.db import models as m
 from mailmind.db.migrate import upgrade_to_head
 from mailmind.imap import sync
-from mailmind.imap.backend import TRASH
+from mailmind.imap.backend import TRASH, MailboxUnhealthy
 from mailmind.imap.capabilities import probe_account
 from mailmind.mcp import server as mcp_server
 from mailmind.service import Service, hash_token
@@ -807,6 +807,65 @@ def test_the_mcp_endpoint_is_advertised_at_the_path_that_answers(client):
     redirected = client.post("/mcp", headers=headers, json=body, follow_redirects=False)
     assert redirected.status_code == 307
     assert redirected.headers["location"].endswith("/mcp/")
+
+
+class DiesPartway(FakeBackend):
+    """A mailbox that goes away mid-sync, the way a real one does.
+
+    Not a mock of anything: a FakeBackend that stops answering, which is the case a first
+    sync of a real mailbox has hours of exposure to.
+    """
+
+    def __init__(self, fail_on: str) -> None:
+        super().__init__()
+        self._fail_on = fail_on
+
+    def select(self, container: str, *, readonly: bool = True):  # noqa: ANN201
+        if container == self._fail_on:
+            raise MailboxUnhealthy("the connection went away")
+        return super().select(container, readonly=readonly)
+
+
+def test_a_sync_that_dies_partway_keeps_the_folders_it_finished(tmp_path):
+    """A first sync of a real mailbox is long, and it used to be all-or-nothing.
+
+    One transaction around the whole account also held SQLite's write lock for the
+    duration, so every other request waited on it and gave up.
+    """
+    url = f"sqlite:///{tmp_path / 'mm.db'}"
+    upgrade_to_head(url)
+    backend = DiesPartway(fail_on="Zzz")
+    backend.add_folder("INBOX")
+    backend.add_folder("Archive", special_use="archive")
+    backend.add_folder("Zzz")
+    for raw in CORPUS.values():
+        backend.add_message("INBOX", raw)
+    backend.add_message("Archive", CORPUS["ordinary"])
+
+    service = Service(Config(database_url=url), backend_factory=lambda _config: backend)
+    with service.scope() as scope:
+        account = scope.add(
+            m.Account(name="real", host="h", username="u", password_url="env://X")
+        )
+        scope.commit()
+        account_id = account.id
+
+    with TestClient(create_app(service), base_url="http://127.0.0.1:8765") as client:
+        with pytest.raises(MailboxUnhealthy):
+            client.post(f"/accounts/{account_id}/sync")
+
+    with service.scope() as scope:
+        cached = {
+            c.name: n
+            for c, n in scope.execute(
+                sa.select(m.Container, sa.func.count(m.Placement.id))
+                .outerjoin(m.Placement, m.Placement.container_id == m.Container.id)
+                .group_by(m.Container.id)
+            )
+        }
+    assert cached["INBOX"] == len(CORPUS), "the folders that finished were thrown away"
+    assert cached["Archive"] == 1
+    assert cached["Zzz"] == 0
 
 
 def test_the_review_pages_forbid_remote_content(client):
