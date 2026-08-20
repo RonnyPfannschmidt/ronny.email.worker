@@ -35,6 +35,13 @@ the account they are working in, and the queue is about that account. Authentica
 answers neither question here, and when it arrives on a deployment it replaces the first
 one only.
 
+The bargain has an assumption inside it worth naming: that what is on this machine is the
+person. An agent running here too — which is the ordinary case, and what
+[12](12-an-agent-of-your-own.md) is about — is also on loopback, and the review UI is an
+unauthenticated accept button. 12 sets out how far that goes and what would close it; the
+short of it is that the review port is for the person and the agent is merely not supposed
+to use it, which is a norm rather than a mechanism.
+
 **Shared.** Anything else authenticates through somebody else. mailmind does not grow a
 user table, a password reset, or a session cookie of its own; there is nothing here that
 does identity better than the things that exist to do identity, and a review UI that

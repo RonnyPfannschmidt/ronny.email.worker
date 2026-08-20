@@ -147,6 +147,88 @@ Worth asserting in your repo rather than assuming: that your agent never treats 
 body as an instruction, and that a bundle it proposes has a `reason` a person could act on.
 Both are properties of the agent, and neither is something mailmind can check for you.
 
+## The port the agent is told about and must not use
+
+The review UI is served for the person at this computer. The agent is told the address so
+it can pass it on, and the agent is not to use it. That sentence is the design; the rest of
+this section is about the distance between it and what is actually enforced.
+
+### Why it carries so much
+
+In the `--serve` shape it is the whole boundary. The agent surface has no apply — not a
+permission withheld but a capability value the enum cannot hold — and the session's UI
+mounts no MCP endpoint, so there is no second way in through the port either. Which means
+the only path from a proposal to a mailbox runs through the review UI, and the only thing
+between the agent and that path is that the agent is not supposed to take it.
+
+### What is actually enforced
+
+Nothing. The review UI has no login, deliberately ([11](11-deployment-and-identity.md)),
+and accepting is an ordinary form POST. Against the throwaway mailbox, holding the URL the
+model was handed:
+
+```
+model told: http://127.0.0.1:35607/ | proposed bundle 1
+POST http://127.0.0.1:35607/bundle/1/accept  ->  200
+  INBOX: 5      (was 6)
+  Archive: 1    (was 0)
+```
+
+No token, no browser, no form fields, no referer. One request, and mail moved. Any agent
+with a shell, an HTTP fetch tool or a Python interpreter can make that request, and it was
+told where to make it.
+
+### Why it is harder to close than it looks
+
+- **The address was given away on purpose.** That is the feature: the agent knows where the
+  review is so it can tell whoever it is working for. The same fact is what makes the port
+  reachable.
+- **`--port 0` looks like entropy and is not.** An unpredictable port would be a weak
+  capability, but it is handed over in the instructions, so the unpredictability is spent
+  the moment the session starts.
+- **CSRF tokens and same-origin checks raise the cost, not the wall.** Something that can
+  POST can also GET the page first and read the token out of it.
+- **Telling a browser from a fetch is guesswork.** Every signal is a header the caller
+  writes.
+- **HTTP cannot express "a person did this".** That is the actual requirement, and it is not
+  a thing a request can carry.
+
+### What would make it a boundary
+
+Roughly in increasing order of how much they actually hold:
+
+1. **Do not tell the agent the address.** Print it to stderr only, and tell the model that a
+   review UI is running and where its operator can find the address. `--port 0` then becomes
+   a real capability rather than a formality. Cheap — and it costs exactly the thing that
+   made this mode nice, which is the agent being able to say where to go.
+2. **A secret in the path, given to the person and not to the model.** The agent can say
+   "open the link printed in your terminal"; only the human holds a URL that works. Keeps
+   most of the ergonomics and makes the capability explicit rather than incidental.
+3. **Take the agent off loopback.** A network namespace, a container, anything without a
+   route to the host's own interface. This is the only one that holds regardless of what the
+   agent knows or is told, and it is a property of how the agent is run rather than anything
+   mailmind can do.
+4. **Put the reviewer where the agent has no path at all** — another machine, or a review
+   surface that is not HTTP: a TUI on the person's terminal, a desktop notification. The
+   strongest and the largest change.
+
+Note that none of this is special to `--serve`. A separately-run `mailmindctl serve` on
+`127.0.0.1:8765` is reachable by the same agent and is easier to guess, not harder. What
+`--serve` changes is that the address is handed over deliberately, which makes visible
+something that was already true.
+
+### What it means for the review step
+
+[03](03-review.md) asks what stops review becoming rubber-stamping. On one machine the
+question has a sharper form: what stops it being self-approval. If the agent can accept its
+own proposals, then in that configuration the review step is decorative, and the design's
+central claim — that a person decides — is true only because nothing has tried otherwise.
+
+The claim is worth stating precisely, because it is defensible in a narrower form: mailmind
+guarantees that **nothing reaches a mailbox except through an accept**, and that every
+accept is recorded against a producer. It does not currently guarantee that the accept came
+from a person. Those are different promises, and only the first one is kept by the code.
+
 ## Meets
 
 - [05](05-agent-surface.md) — what an agent may reach, and why that is the whole list
@@ -159,9 +241,11 @@ Both are properties of the agent, and neither is something mailmind can check fo
 - Nobody has pointed a model at this yet. Everything above about what an agent will reach
   for is a guess that has not met one, which is [09](09-iteration-one.md)'s finding still
   standing.
-- Over stdio the agent and the reviewer are the same person at the same machine. Does the
-  review step mean anything in that setting, or does it become the rubber-stamping
-  [03](03-review.md) is worried about, with a shorter walk to the button?
+- Which of the four mitigations above is worth building, and does the first one cost more
+  than it buys? An agent that cannot name the review address has to say "check your
+  terminal", which is worse to use and honest.
+- Is "the accept came from a person" a promise mailmind should try to make at all, or one it
+  should state plainly that it does not make and leave to how the agent is run?
 - Should there be a prompt resource — mailmind offering the agent a starting instruction
   for a mailbox of a given shape — or is that the service having opinions that belong in
   the agent's repository?
