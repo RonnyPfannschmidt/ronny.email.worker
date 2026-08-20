@@ -234,7 +234,7 @@ def test_binding_to_the_network_is_refused_unless_something_else_authenticates(t
     """
     # Top-level keys have to come before the first table, or TOML reads them into it.
     text = 'bind = "0.0.0.0"\n' + CONFIG
-    with pytest.raises(ConfigError, match="no login"):
+    with pytest.raises(ConfigError, match="bearer token"):
         check_exposure(load_config(write(tmp_path, text)))
 
     allowed = load_config(write(tmp_path, "behind_auth_proxy = true\n" + text))

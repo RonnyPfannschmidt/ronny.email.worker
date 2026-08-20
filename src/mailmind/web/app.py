@@ -9,7 +9,9 @@ routes never consult a grant.
 from __future__ import annotations
 
 import contextlib
+import secrets
 from pathlib import Path
+from urllib.parse import urlencode
 
 import sqlalchemy as sa
 from fastapi import FastAPI, Form, Request
@@ -66,10 +68,11 @@ class GrantMiddleware(BaseHTTPMiddleware):
 def chosen_account(scope) -> m.Account | None:  # noqa: ANN001
     """Which account the review UI is working in.
 
-    Local review has no login, so there is nobody to look up and nothing to derive this
-    from: the reviewer is implicit, and what a person picks instead is which account they
-    are looking at.  Authentication only enters on a deployment, and when it does it
-    replaces :func:`reviewer` rather than this.
+    The review UI's login is a key, not an identity: it says somebody may come in, not
+    which somebody.  So there is still nobody to look up, the reviewer is still implicit,
+    and what a person picks is which account they are looking at.  Authentication that
+    says *who* only enters on a deployment, and when it does it replaces :func:`reviewer`
+    rather than this.
 
     This is a view and not a boundary.  Nothing is being kept from anybody — the person
     at the keyboard owns all of it — so a link to a bundle in another account still
@@ -122,6 +125,19 @@ def not_a_browser_gesture(request: Request) -> str | None:
     return None
 
 
+#: The cookie the review UI is reached with. Session-scoped, so it goes when the browser
+#: does, and HttpOnly, so a page cannot read it back out — not that any page here runs
+#: script, but a review UI renders mail written by strangers and the habit is cheap.
+SESSION_COOKIE = "mailmind_session"
+
+#: The query parameter that trades a key for that cookie, once.
+SESSION_KEY_PARAM = "key"
+
+
+def mint_session_key() -> str:
+    return secrets.token_urlsafe(32)
+
+
 def reviewer(scope) -> m.Producer:  # noqa: ANN001
     """The person at the keyboard.
 
@@ -137,15 +153,21 @@ def reviewer(scope) -> m.Producer:  # noqa: ANN001
     return person
 
 
-def create_app(service: Service, *, with_mcp: bool = True) -> FastAPI:
+def create_app(
+    service: Service, *, with_mcp: bool = True, session_key: str | None = None
+) -> FastAPI:
     """The review UI, and by default the MCP endpoint beside it.
 
     ``with_mcp=False`` is for ``mailmindctl mcp --serve``, where the agent is already on a
     pipe and a second way in would be surface nobody asked for.
+
+    ``session_key`` is what the review UI is opened with.  Whoever starts the process is
+    shown a link carrying it; following that link once trades it for a cookie.  Nothing
+    else gets in — and in particular the key is never told to a model, which is the whole
+    reason it exists.
     """
-    # Every deployment comes through here, so this is where the bargain is checked: the
-    # review UI has no login, so it does not get to listen anywhere but this machine.
     check_exposure(service.config)
+    session_key = session_key or mint_session_key()
 
     if not with_mcp:
         app = FastAPI(title="mailmind")
@@ -171,6 +193,60 @@ def create_app(service: Service, *, with_mcp: bool = True) -> FastAPI:
         )
         app = FastAPI(title="mailmind", lifespan=lambda _app: mcp.session_manager.run())
         app.mount("/mcp", GrantMiddleware(mcp_app, service))
+
+    @app.middleware("http")
+    async def only_somebody_holding_the_key_gets_in(request: Request, call_next):  # noqa: ANN001, ANN202
+        """The review UI has a login, and this is it.
+
+        Not a password — there is nobody to have an account, and a passphrase for a service
+        on your own machine is friction protecting the wrong thing.  What there is instead
+        is a key minted when the process starts and shown to whoever started it.  The point
+        is not that it is hard to guess; it is that it is never given to the agent.  The
+        model is told the address so it can send a person there, and told nothing that lets
+        it go itself.
+
+        This is the only check here that an agent with a network tool cannot simply talk
+        its way past.  It stops being enough the moment the agent can read the terminal
+        that printed the key or the files of the person who ran it — at which point it
+        could resolve the mailbox password and skip mailmind altogether.  That boundary is
+        how the agent is run, and it is not one this process can draw.
+        """
+        if request.url.path.startswith("/mcp"):
+            return await call_next(request)
+
+        offered = request.query_params.get(SESSION_KEY_PARAM)
+        if offered is not None and secrets.compare_digest(offered, session_key):
+            # Trade it for a cookie and drop it out of the address, so it stops being in
+            # the history, the title bar and anything that logs a URL.
+            remaining = [
+                (name, value)
+                for name, value in request.query_params.multi_items()
+                if name != SESSION_KEY_PARAM
+            ]
+            query = urlencode(remaining)
+            response = RedirectResponse(
+                request.url.path + (f"?{query}" if query else ""), status_code=303
+            )
+            response.set_cookie(
+                SESSION_COOKIE,
+                session_key,
+                httponly=True,
+                samesite="lax",
+                path="/",
+            )
+            return response
+
+        cookie = request.cookies.get(SESSION_COOKIE)
+        if cookie is None or not secrets.compare_digest(cookie, session_key):
+            return HTMLResponse(
+                "<h1>Not open</h1><p>The review UI is opened with the link printed where "
+                "this was started — it carries a key, and following it once is the whole "
+                "of the login.</p><p>If you are an agent: you were not given that key, on "
+                "purpose. Tell the person you are working for to look at the terminal or "
+                "the log where they started mailmind.</p>",
+                status_code=401,
+            )
+        return await call_next(request)
 
     @app.middleware("http")
     async def only_a_person_at_a_browser_changes_anything(request: Request, call_next):  # noqa: ANN001, ANN202

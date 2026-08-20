@@ -5,42 +5,55 @@
 
 [07](07-tenancy.md) asks who a row belongs to. This asks something narrower and more
 immediate: who is allowed to press accept, and how the service knows. The two questions
-meet at the review UI, which today has no login at all.
+meet at the review UI, and they have different answers there: it has a login, and the
+login does not say who you are.
 
 ## Two modes, one bargain
 
-**Local.** One tenant, no login, and the service refuses to listen anywhere but this
-machine. A login on a developer's own box is ceremony protecting nothing — the person at
-the keyboard is the only person there. That is a defensible position, but only while the
-other half holds: nothing else may reach it.
+**Local.** One tenant, loopback only, and a login.
 
-Only half of that was ever written down. `bind` defaulted to `127.0.0.1`, and nothing
-stopped it being changed, so `--host 0.0.0.0` served an unauthenticated accept-and-apply
-button to the network and said nothing about it. It now refuses:
+The login is not a password. There is nobody here to have an account, and a passphrase
+for a service on your own machine is friction protecting the wrong thing. What there is
+instead is a **key**, minted when the process starts and printed to whoever started it:
+
+```
+$ mailmindctl serve
+review UI  http://127.0.0.1:8765/?key=JhvKuPxtd_vlHWInseYw6GskTSzFHdxcMwe8kUAhpSc
+           open that link once — it is the login, and nothing
+           connecting over MCP is given it.
+MCP        http://127.0.0.1:8765/mcp/
+```
+
+Following that link once trades the key for a session cookie and drops it back out of the
+address bar. Nothing else gets in.
+
+It was tempting to argue that a login on one person's own machine is ceremony protecting
+nothing — the person at the keyboard being the only person there. That stopped being true
+the moment an agent ran on the same machine, which is the ordinary case. The key is not
+hard to guess and does not need to be; the point is that **it is never given to the agent**.
+The model is told the address, so it can send a person to review, and told nothing that
+lets it go itself. See [12](12-an-agent-of-your-own.md) for how far that holds.
+
+Loopback still stands, for a different reason than before: the cookie is a bearer token
+and this is plain HTTP, so anything that can watch the wire can take it and replay it.
 
 ```
 $ mailmindctl serve --host 0.0.0.0
-Error: refusing to listen on 0.0.0.0: the review UI has no login, so anyone who
-can reach it can accept a suggestion and change somebody's mail. …
+Error: refusing to listen on 0.0.0.0: the review UI's session cookie is a bearer
+token and this is plain HTTP, so anyone who can watch the wire can take it and
+accept somebody's mail. …
 ```
 
 Loopback means provably loopback — `127.0.0.0/8`, `::1`, `localhost`. A hostname is not
 resolved to find out, because it could resolve to anything later and the check is meant to
 be sure rather than accommodating.
 
-Identity in this mode splits into two questions with different answers. *Who* is implicit:
-one `producer` row of kind `person`, which exists so that "who accepted this" is
-answerable, not because anybody authenticated. *Which mail* is **chosen** — a person picks
-the account they are working in, and the queue is about that account. Authentication
-answers neither question here, and when it arrives on a deployment it replaces the first
-one only.
-
-The bargain has an assumption inside it worth naming: that what is on this machine is the
-person. An agent running here too — which is the ordinary case, and what
-[12](12-an-agent-of-your-own.md) is about — is also on loopback, and the review UI is an
-unauthenticated accept button. 12 sets out how far that goes and what would close it; the
-short of it is that the review port is for the person and the agent is merely not supposed
-to use it, which is a norm rather than a mechanism.
+Identity in this mode splits into three questions with three answers. *May you come in* is
+the key. *Who* is implicit: one `producer` row of kind `person`, which exists so that "who
+accepted this" is answerable, not because anybody authenticated — the key says somebody
+may come in, never which somebody. *Which mail* is **chosen**: a person picks the account
+they are working in, and the queue is about that account. Authentication that says who
+arrives only on a deployment, and replaces the second answer only.
 
 **Shared.** Anything else authenticates through somebody else. mailmind does not grow a
 user table, a password reset, or a session cookie of its own; there is nothing here that

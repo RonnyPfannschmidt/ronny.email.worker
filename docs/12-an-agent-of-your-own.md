@@ -151,25 +151,24 @@ Worth asserting in your repo rather than assuming: that your agent never treats 
 body as an instruction, and that a bundle it proposes has a `reason` a person could act on.
 Both are properties of the agent, and neither is something mailmind can check for you.
 
-## The port the agent is told about and must not use
+## The port the agent is told about and cannot open
 
 The review UI is served for the person at this computer. The agent is told the address so
-it can pass it on, and the agent is not to use it. That sentence is the design; the rest of
-this section is about the distance between it and what is actually enforced.
+it can pass it on, and is not given the key that opens it. That asymmetry is the design,
+and this section is the history of getting there, because two of the three attempts were
+not enough and it is worth knowing why.
 
 ### Why it carries so much
 
 In the `--serve` shape it is the whole boundary. The agent surface has no apply — not a
 permission withheld but a capability value the enum cannot hold — and the session's UI
-mounts no MCP endpoint, so there is no second way in through the port either. Which means
-the only path from a proposal to a mailbox runs through the review UI, and the only thing
-between the agent and that path is that the agent is not supposed to take it.
+mounts no MCP endpoint, so there is no second way in through the port either. The only
+path from a proposal to a mailbox runs through the review UI.
 
-### What used to be enforced, and what is now
+### First: nothing at all
 
-Nothing, at first. The review UI has no login, deliberately
-([11](11-deployment-and-identity.md)), and accepting was an ordinary form POST. Holding the
-URL the model had just been handed:
+The review UI had no login. Accepting was an ordinary form POST, and holding the URL the
+model had just been handed was enough:
 
 ```
 POST http://127.0.0.1:35607/bundle/1/accept  ->  200
@@ -178,89 +177,71 @@ POST http://127.0.0.1:35607/bundle/1/accept  ->  200
 
 No token, no browser, no form fields. One request, and mail moved.
 
-Every route that changes something now requires the headers a browser sends when a person
-submits a form on a page it is showing:
+### Second: it has to look like a person did it
 
-```
-sec-fetch-mode: navigate      sec-fetch-site: same-origin
-sec-fetch-dest: document      origin:          <this origin>
-```
-
-These are [Fetch Metadata](https://developer.mozilla.org/en-US/docs/Glossary/Fetch_metadata_request_header)
-headers, which scripts are forbidden to set — inside a browser they cannot be forged. The
-same request as above now gets a 403 that says why, and leaves a `ui_change_refused` event
-behind, because a refusal is the interesting half: nothing changed, but something tried,
-and whoever owns the mail should be able to find that out afterwards.
+Every route that changes something requires the headers a browser sends when somebody
+submits a form on a page it is showing — `sec-fetch-mode: navigate`, `sec-fetch-dest:
+document`, `sec-fetch-site: same-origin`, and a matching `origin`. These are
+[Fetch Metadata](https://developer.mozilla.org/en-US/docs/Glossary/Fetch_metadata_request_header)
+headers, which scripts are forbidden to set, so inside a browser they cannot be forged.
+A refusal writes a `ui_change_refused` event, because nothing changed but something tried,
+and whoever owns the mail should be able to find that out.
 
 `Sec-Fetch-User: ?1` would be the better signal — "a person did this" rather than "a
-document navigated" — and is not required, because Safari has never sent it and a check
-that locks out a whole browser is a check somebody turns off.
+document navigated" — and is deliberately not required, because Safari has never sent it
+and a check that locks out a whole browser is a check somebody turns off.
 
-### What this is and is not
-
-It is not a security boundary and cannot be made into one. Anything that can set a header
-can assert all four, and doing so takes about a line:
+This was never a boundary and was not meant as one. It changed the character of the act:
+before, an agent reached the review UI by doing the obvious thing with an address it had
+been given; after, by stating in four headers that a browser was showing a page to a
+person. An accident became a lie. But a lie is one line of code:
 
 ```
 POST with the four headers  ->  200, and the mail moves
 ```
 
-What changed is the character of the act. Before, an agent reached the review UI by doing
-the obvious thing with an address it had been given. Now it reaches it by stating, in
-headers it had to choose to send, that a browser is showing a page to a person. The first
-is an accident waiting to happen; the second is a lie. That is the whole of what a check
-like this buys, and it is worth having for exactly that reason and no other.
+### Third: a login, for local too
 
-The things that would make it a real boundary have not changed:
+So there is one. Not a password — there is nobody here to have an account, and a
+passphrase for a service on your own machine is friction protecting the wrong thing.
+Instead a **key**, minted when the process starts and printed where the person is:
 
-- **The address was given away on purpose.** That is the feature: the agent knows where the
-  review is so it can tell whoever it is working for. The same fact makes the port
-  reachable.
-- **`--port 0` looks like entropy and is not.** It is handed over in the instructions, so
-  the unpredictability is spent the moment the session starts.
-- **A form token would raise the cost again** — you would have to fetch and parse the page
-  you intend to act on, which is at least thematically right for a review UI. It is still
-  only cost.
-- **HTTP cannot express "a person did this".** That is the actual requirement, and no
-  request can carry it.
+```
+review UI  http://127.0.0.1:38915/?key=JhvKuPxtd_vlHWInseYw6GskTSzFHdxcMwe8kUAhpSc
+           open that link once — it is the login, and the
+           agent was not given it. This session only.
+```
 
-### What would make it a boundary
+Following it once trades the key for an HttpOnly session cookie and drops it back out of
+the address. The model is told `http://127.0.0.1:38915/` and nothing else. The same forged
+request as above now gets a 401 that says, in as many words, that an agent reading it was
+not given the key on purpose and should tell the person to look at their terminal.
 
-Roughly in increasing order of how much they actually hold:
+The key is not hard to guess and does not need to be. Everything rests on it not being
+told to the agent, which is a property of what goes into the MCP instructions and is
+asserted in the test suite: no tool result, resource or instruction anywhere carries it.
 
-1. **Do not tell the agent the address.** Print it to stderr only, and tell the model that a
-   review UI is running and where its operator can find the address. `--port 0` then becomes
-   a real capability rather than a formality. Cheap — and it costs exactly the thing that
-   made this mode nice, which is the agent being able to say where to go. Note that the
-   gesture check above does not help here and was never meant to: it raises the cost of
-   using an address, not of holding one.
-2. **A secret in the path, given to the person and not to the model.** The agent can say
-   "open the link printed in your terminal"; only the human holds a URL that works. Keeps
-   most of the ergonomics and makes the capability explicit rather than incidental.
-3. **Take the agent off loopback.** A network namespace, a container, anything without a
-   route to the host's own interface. This is the only one that holds regardless of what the
-   agent knows or is told, and it is a property of how the agent is run rather than anything
-   mailmind can do.
-4. **Put the reviewer where the agent has no path at all** — another machine, or a review
-   surface that is not HTTP: a TUI on the person's terminal, a desktop notification. The
-   strongest and the largest change.
+### What it actually buys, and where it stops
 
-Note that none of this is special to `--serve`. A separately-run `mailmindctl serve` on
-`127.0.0.1:8765` is reachable by the same agent and is easier to guess, not harder. What
-`--serve` changes is that the address is handed over deliberately, which makes visible
-something that was already true.
+It moves the bar from *any agent that can make an HTTP request* to *an agent that can read
+the person's terminal or files*. That is a real step and it is the last one this process
+can take by itself.
 
-### What it means for the review step
+It stops there completely. An agent with a shell on the same account does not need the
+review UI at all: it can read `mailmind.toml`, resolve the mailbox password through the
+very indirection that keeps it out of the config file, and talk IMAP itself. At that point
+mailmind is not in the path and nothing it does matters. **The boundary that holds is how
+the agent is run** — a sandbox, a container, an account of its own — and that is not
+something this can draw for you.
 
-[03](03-review.md) asks what stops review becoming rubber-stamping. On one machine the
-question has a sharper form: what stops it being self-approval. If the agent can accept its
-own proposals, then in that configuration the review step is decorative, and the design's
-central claim — that a person decides — is true only because nothing has tried otherwise.
+So the promise is worth stating exactly:
 
-The claim is worth stating precisely, because it is defensible in a narrower form: mailmind
-guarantees that **nothing reaches a mailbox except through an accept**, and that every
-accept is recorded against a producer. It does not currently guarantee that the accept came
-from a person. Those are different promises, and only the first one is kept by the code.
+> Nothing reaches a mailbox through mailmind except an accept made by something holding
+> the review key, and every accept is recorded against a producer.
+
+Not "a person accepted it". If the thing holding the key is a person, mailmind's boundary
+is the design's boundary. If your agent can read your terminal, it is not, and no amount
+of checking inside this process changes that.
 
 ## Meets
 
@@ -274,11 +255,16 @@ from a person. Those are different promises, and only the first one is kept by t
 - Nobody has pointed a model at this yet. Everything above about what an agent will reach
   for is a guess that has not met one, which is [09](09-iteration-one.md)'s finding still
   standing.
-- Which of the four mitigations above is worth building, and does the first one cost more
-  than it buys? An agent that cannot name the review address has to say "check your
-  terminal", which is worse to use and honest.
-- Is "the accept came from a person" a promise mailmind should try to make at all, or one it
-  should state plainly that it does not make and leave to how the agent is run?
+- The key is printed to stderr, which most MCP clients put in a log the person reads and
+  some surface to the model. Is stderr the right channel, or should the link go somewhere
+  only a person looks — a file in the runtime directory, a desktop notification, the
+  controlling terminal directly?
+- A restart mints a new key, so an open tab stops working and you go back to the terminal.
+  Right, or should the key persist in the state directory so a restart is invisible?
+- Nothing binds a session to the browser that opened it. Somebody who gets the cookie has
+  it until the browser closes. For a local single-user tool that is probably proportionate.
+- Is "the accept came from a person" worth trying to promise at all, given that the honest
+  boundary is how the agent is sandboxed?
 - Should there be a prompt resource — mailmind offering the agent a starting instruction
   for a mailbox of a given shape — or is that the service having opinions that belong in
   the agent's repository?

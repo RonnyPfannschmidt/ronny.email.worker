@@ -99,7 +99,8 @@ class Config:
     #: An assertion that something in front of this process authenticates every request
     #: reaching it — a reverse proxy doing forward auth, an identity-aware proxy.  Nothing
     #: here can check that; setting it is taking responsibility for it.  Without it the
-    #: service refuses to listen anywhere but loopback, because the review UI has no login.
+    #: service refuses to listen anywhere but loopback, because the review UI's session
+    #: cookie is a bearer token travelling over plain HTTP.
     behind_auth_proxy: bool = False
 
     def account(self, name: str) -> AccountConfig:
@@ -137,25 +138,26 @@ def is_wildcard(host: str) -> bool:
 
 
 def check_exposure(config: Config) -> None:
-    """Refuse to serve an unauthenticated review UI to anything but this machine.
+    """Refuse to serve the review UI to anything but this machine over plain HTTP.
 
-    The review UI has no login, and that is deliberate: on one person's own machine a
-    login is ceremony protecting nothing, and the person at the keyboard is the only
-    person there.  The bargain has two halves, though, and only one of them was ever
-    written down — the bind address defaulted to loopback and nothing stopped it being
-    changed, so ``--host 0.0.0.0`` served an accept-and-apply button to the network.
+    The review UI does have a login — a key minted at startup, shown to whoever started
+    the process, traded once for a session cookie.  That is what keeps an agent on the
+    same machine out of it.  It is not what makes it safe to put on a network: the cookie
+    is a bearer token and this is HTTP, so anything that can watch the wire can take it,
+    replay it, and accept somebody's mail.
 
-    ``behind_auth_proxy`` is the other way to hold up the same bargain: somebody else
-    authenticates.  It is an assertion rather than a feature, which is why it has to be
-    written down rather than inferred.
+    So loopback stands, and the way past it is still to have something in front doing
+    both the transport and the authentication.  ``behind_auth_proxy`` is an assertion
+    rather than a feature, which is why it has to be written down rather than inferred.
     """
     if is_loopback(config.bind) or config.behind_auth_proxy:
         return
     raise ConfigError(
-        f"refusing to listen on {config.bind}: the review UI has no login, so anyone who "
-        "can reach it can accept a suggestion and change somebody's mail. Bind to "
-        "127.0.0.1, or put authentication in front of it and say so with "
-        "behind_auth_proxy = true. See docs/11-deployment-and-identity.md."
+        f"refusing to listen on {config.bind}: the review UI's session cookie is a bearer "
+        "token and this is plain HTTP, so anyone who can watch the wire can take it and "
+        "accept somebody's mail. Bind to 127.0.0.1, or put TLS and authentication in "
+        "front of it and say so with behind_auth_proxy = true. "
+        "See docs/11-deployment-and-identity.md."
     )
 
 

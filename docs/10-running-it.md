@@ -8,7 +8,8 @@ may do what to it. This one is written from outside, because the first thing any
 with mailmind is try to run it, and until now the answer was five lines of shell
 duplicated in two files.
 
-Serving it to anything but this machine is refused, because the review UI has no login —
+Serving it to anything but this machine is refused, because its session cookie travels
+over plain HTTP —
 [11](11-deployment-and-identity.md) has that bargain and the way out of it.
 
 ## Who this is for
@@ -41,8 +42,15 @@ python dev/seed_mailbox.py
 export MAILMIND_CONFIG=mailmind.dev.toml MAILMIND_DEV_PASSWORD=secret
 mailmindctl bootstrap && mailmindctl probe && mailmindctl sync
 mailmindctl grant --producer opencode      # prints a bearer token, once
-mailmindctl serve                          # UI on /, MCP on /mcp/
+mailmindctl serve                          # prints a link with the login key in it
 ```
+
+The review UI has a login: `serve` prints a URL carrying a key, and following it once
+trades that key for a session cookie. It is not a password and does not say who you are —
+it says somebody may come in. What it is for is that the key is never given to an agent,
+so something connecting over MCP can send you to the review UI and cannot open it itself.
+[11](11-deployment-and-identity.md) has the reasoning, [12](12-an-agent-of-your-own.md)
+has how far it holds.
 
 `podman stop mailmind-dev` takes it all away; `rm mailmind.dev.db*` takes the cache with
 it.

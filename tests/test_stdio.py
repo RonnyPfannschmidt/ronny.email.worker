@@ -11,6 +11,7 @@ thing that proposes anything.
 from __future__ import annotations
 
 import datetime as dt
+import http.cookiejar
 import json
 import pathlib
 import socket
@@ -98,6 +99,10 @@ class StdioClient:
         self._id = 0
         self.lines: list[str] = []
 
+    def startup_line(self) -> str:
+        """One of the lines printed before the server starts, as a person would read them."""
+        return self.proc.stderr.readline()
+
     def rpc(self, method: str, params: dict | None = None, *, notify: bool = False):  # noqa: ANN201
         message: dict = {"jsonrpc": "2.0", "method": method, "params": params or {}}
         if not notify:
@@ -184,6 +189,12 @@ def test_serve_brings_the_review_ui_up_for_the_life_of_the_session(workspace):
     """
     client = StdioClient(workspace["config"], "--serve", "--port", "0")
     try:
+        # The key is printed where the person is, and nowhere else. Reading it off stderr
+        # here is the test standing in for somebody looking at their terminal.
+        client.startup_line()
+        opened_with = client.startup_line().split()[-1]
+        assert "?key=" in opened_with
+
         init = client.rpc(
             "initialize",
             {
@@ -208,14 +219,24 @@ def test_serve_brings_the_review_ui_up_for_the_life_of_the_session(workspace):
             summary="tidy",
             reason="because",
         )
-        with urllib.request.urlopen(url, timeout=20) as response:
+        # What the model was told is an address, not a way in.
+        with pytest.raises(urllib.error.HTTPError) as shut:
+            urllib.request.urlopen(url, timeout=20)
+        assert shut.value.code == 401
+        assert url in opened_with, "the printed link is not the address the model was given"
+
+        # Following the printed link is the login, and it is a person who has it.
+        jar = http.cookiejar.CookieJar()
+        browser = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(jar))
+        with browser.open(opened_with, timeout=20) as response:
             page = response.read().decode()
         assert response.status == 200
         assert f"/bundle/{proposed['bundle_id']}" in page, "the queue did not show it"
+        assert [c.name for c in jar] == ["mailmind_session"]
 
         # The agent is on the pipe, so the served app offers no second way in.
         with pytest.raises(urllib.error.HTTPError) as refused:
-            urllib.request.urlopen(f"{url}mcp/", timeout=20)
+            browser.open(f"{url}mcp/", timeout=20)
         assert refused.value.code == 404
 
         # Ask for one more response after the web server has handled requests, so the read
@@ -226,7 +247,7 @@ def test_serve_brings_the_review_ui_up_for_the_life_of_the_session(workspace):
 
     leftover = [line for line in client.proc.stdout.read().splitlines() if line.strip()]
     assert leftover == [], f"something else wrote to the transport: {leftover[:2]}"
-    assert "(this session only)" in stderr
+    assert "not given it" in stderr or "This session only" in stderr
 
     # And it went away with the session.
     host, _, port = url.removeprefix("http://").rstrip("/").rpartition(":")

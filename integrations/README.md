@@ -31,6 +31,11 @@ would mean an empty configuration and a database in some arbitrary directory.
 and tells the model the address so the agent can pass it on. That is the self-contained
 shape: start the agent, get told where to review, review it while the agent is there.
 
+The review UI has a login, and the link that opens it is printed on stderr when the server
+starts — which for these clients means their MCP log. The agent is told the address and
+never the key, on purpose: it can send you to the review UI and cannot go itself. If a
+page says "Not open", the link with the key in it is in that log.
+
 Drop `--serve --port 0` if you would rather run `mailmindctl serve` yourself and have a
 queue that outlives any one session. The agent is then told the address from your
 configuration instead, and everything else is the same.

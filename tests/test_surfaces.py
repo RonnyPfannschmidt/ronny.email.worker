@@ -8,6 +8,7 @@ is here, and none of it changes a mailbox.
 from __future__ import annotations
 
 import datetime as dt
+import json
 
 import attrs
 import pytest
@@ -23,7 +24,7 @@ from mailmind.imap.capabilities import probe_account
 from mailmind.mcp import server as mcp_server
 from mailmind.service import Service, hash_token
 from mailmind.web import app as app_module
-from mailmind.web.app import create_app
+from mailmind.web.app import SESSION_KEY_PARAM, create_app
 from tests.corpus import CORPUS
 from tests.targets.fake import FakeBackend
 
@@ -85,10 +86,27 @@ def service(tmp_path, backend):
     return service
 
 
+#: The key `mailmindctl serve` would mint and print. Fixed here so a test can follow the
+#: link the way a person does.
+SESSION_KEY = "test-session-key-for-the-reviewer"
+
+
+def opened(app, base_url: str = "http://127.0.0.1:8765") -> TestClient:
+    """A client that has followed the link, the way somebody starting this would.
+
+    The cookie sticks to the client afterwards, so every test past this point is a person
+    with the review UI open rather than something that found the port.
+    """
+    client = TestClient(app, base_url=base_url)
+    client.get(f"/?{SESSION_KEY_PARAM}={SESSION_KEY}", follow_redirects=True)
+    return client
+
+
 @pytest.fixture
 def client(service):
     # A host the MCP endpoint's rebinding protection accepts.
-    with TestClient(create_app(service), base_url="http://127.0.0.1:8765") as client:
+    app = create_app(service, session_key=SESSION_KEY)
+    with opened(app) as client:
         yield client
 
 
@@ -682,7 +700,8 @@ def test_the_mcp_endpoint_answers_on_the_address_it_was_told_to_serve(service, b
         attrs.evolve(service.config, bind="127.0.0.2", port=9000),
         backend_factory=lambda _config: backend,
     )
-    with TestClient(create_app(elsewhere), base_url="http://127.0.0.2:9000") as moved:
+    app = create_app(elsewhere, session_key=SESSION_KEY)
+    with opened(app, "http://127.0.0.2:9000") as moved:
         assert [a["name"] for a in Agent(moved).call("list_accounts")] == ["test"]
 
 
@@ -749,10 +768,11 @@ def test_a_chosen_account_that_goes_away_takes_the_choice_and_not_the_producer(s
 
 
 def test_an_unauthenticated_review_ui_refuses_to_listen_to_the_network(service, backend):
-    """The review UI has no login, so it does not get to be reachable from anywhere else.
+    """Its session cookie is a bearer token and this is plain HTTP.
 
-    That was half a bargain: the bind address defaulted to loopback and nothing stopped it
-    being changed, so `--host 0.0.0.0` served an accept-and-apply button to the network.
+    The login keeps an agent on this machine out of the review UI. It is not what makes
+    the review UI safe to put on a network, where anything watching the wire can take the
+    cookie and replay it.
     """
     exposed = Service(
         attrs.evolve(service.config, bind="0.0.0.0"),  # noqa: S104 — the point of the test
@@ -760,7 +780,7 @@ def test_an_unauthenticated_review_ui_refuses_to_listen_to_the_network(service, 
     )
     with pytest.raises(ConfigError) as refused:
         create_app(exposed)
-    assert "no login" in str(refused.value)
+    assert "bearer token" in str(refused.value)
 
     # Somebody else authenticating is the other way to hold up the same bargain, and it
     # has to be said out loud because nothing here can check it.
@@ -768,8 +788,8 @@ def test_an_unauthenticated_review_ui_refuses_to_listen_to_the_network(service, 
         attrs.evolve(service.config, bind="0.0.0.0", behind_auth_proxy=True),  # noqa: S104
         backend_factory=lambda _config: backend,
     )
-    app = create_app(proxied)
-    with TestClient(app, base_url="http://127.0.0.1:8765") as client:
+    app = create_app(proxied, session_key=SESSION_KEY)
+    with opened(app) as client:
         assert client.get("/").status_code == 200
 
 
@@ -876,7 +896,7 @@ def test_a_sync_that_dies_partway_keeps_the_folders_it_finished(tmp_path):
         scope.commit()
         account_id = account.id
 
-    with TestClient(create_app(service), base_url="http://127.0.0.1:8765") as client:
+    with opened(create_app(service, session_key=SESSION_KEY)) as client:
         with pytest.raises(MailboxUnhealthy):
             as_a_person(client, f"/accounts/{account_id}/sync")
 
@@ -892,6 +912,68 @@ def test_a_sync_that_dies_partway_keeps_the_folders_it_finished(tmp_path):
     assert cached["INBOX"] == len(CORPUS), "the folders that finished were thrown away"
     assert cached["Archive"] == 1
     assert cached["Zzz"] == 0
+
+
+def test_the_review_ui_is_shut_until_the_link_is_followed(service, backend):
+    """A login for local too. Not a password — a key, minted at startup and shown to
+    whoever started it, which is never given to the agent."""
+    app = create_app(service, session_key=SESSION_KEY)
+    with TestClient(app, base_url="http://127.0.0.1:8765") as person:
+        shut = person.get("/")
+        assert shut.status_code == 401
+        assert "you were not given that key" in shut.text
+        assert person.get("/accounts").status_code == 401
+        # And the obvious guess is no better than none.
+        assert person.get(f"/?{SESSION_KEY_PARAM}=letmein").status_code == 401
+
+        # Now follow the link that was printed where this was started.
+        person.get(f"/?{SESSION_KEY_PARAM}={SESSION_KEY}", follow_redirects=True)
+        assert person.get("/").status_code == 200
+        assert person.get("/accounts").status_code == 200
+
+
+def test_following_the_link_leaves_the_key_out_of_the_address(service):
+    """It should stop being in the history, the title bar and anything that logs a URL."""
+    app = create_app(service, session_key=SESSION_KEY)
+    with TestClient(app, base_url="http://127.0.0.1:8765") as person:
+        landed = person.get(f"/?{SESSION_KEY_PARAM}={SESSION_KEY}", follow_redirects=False)
+        assert landed.status_code == 303
+        assert landed.headers["location"] == "/"
+        assert SESSION_KEY not in landed.headers["location"]
+
+        cookie = landed.headers["set-cookie"]
+        assert "HttpOnly" in cookie and "samesite=lax" in cookie.lower()
+
+        # Other query parameters survive the trade, since links carry them.
+        landed = person.get(
+            f"/bundle/1?{SESSION_KEY_PARAM}={SESSION_KEY}&error=nope", follow_redirects=False
+        )
+        assert landed.headers["location"] == "/bundle/1?error=nope"
+
+
+def test_the_key_is_never_told_to_the_agent(client, service):
+    """The asymmetry is the whole point: the agent can send a person to the review UI and
+    cannot go itself."""
+    agent = Agent(client)
+    everything = json.dumps(
+        {
+            "tools": [agent.call("list_accounts")],
+            "resources": [agent.read("mailmind://accounts")],
+            "proposal": _propose(agent),
+        }
+    )
+    assert SESSION_KEY not in everything
+
+    # Including in the instructions, which is where the address does live.
+    initialised = agent._post(  # noqa: SLF001
+        "initialize",
+        {
+            "protocolVersion": "2025-06-18",
+            "capabilities": {},
+            "clientInfo": {"name": "t", "version": "0"},
+        },
+    )
+    assert SESSION_KEY not in json.dumps(initialised)
 
 
 #: Each is one header away from a browser submitting a form, plus the case that started

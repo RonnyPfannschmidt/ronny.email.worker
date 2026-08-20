@@ -259,7 +259,7 @@ def mcp_stdio(
     import uvicorn
 
     from mailmind.mcp import server as mcp_server
-    from mailmind.web.app import create_app
+    from mailmind.web.app import create_app, mint_session_key
 
     if review_url and serve_ui:
         raise click.ClickException(
@@ -271,6 +271,10 @@ def mcp_stdio(
 
     overrides = {"port": port} if port is not None else {}
     service = _service(ctx.obj["config_path"], **overrides)
+
+    # Minted only when this process is the one serving. The model is told the address
+    # and never this: an agent can send a person to the review UI and cannot go itself.
+    session_key = mint_session_key() if serve_ui else None
 
     listener: socket.socket | None = None
     if serve_ui:
@@ -319,7 +323,7 @@ def mcp_stdio(
         # way in would be surface nobody asked for.
         web = uvicorn.Server(
             uvicorn.Config(
-                create_app(service, with_mcp=False),
+                create_app(service, with_mcp=False, session_key=session_key),
                 log_level="warning",
                 access_log=False,
             )
@@ -333,11 +337,12 @@ def mcp_stdio(
 
     # stdout is the transport, so everything a person reads goes to stderr.
     click.echo(f"mailmind MCP on stdio as {producer!r}", err=True)
-    click.echo(
-        f"review UI  {review_url}"
-        + ("  (this session only)" if serve_ui else "  — `mailmindctl serve` runs it"),
-        err=True,
-    )
+    if serve_ui:
+        click.echo(f"review UI  {review_url}?key={session_key}", err=True)
+        click.echo("           open that link once — it is the login, and the", err=True)
+        click.echo("           agent was not given it. This session only.", err=True)
+    else:
+        click.echo(f"review UI  {review_url} — `mailmindctl serve` runs it", err=True)
     try:
         asyncio.run(run())
     except KeyboardInterrupt:  # pragma: no cover - the client closing the pipe
@@ -354,21 +359,25 @@ def serve(ctx: click.Context, host: str | None, port: int | None) -> None:
     """Run the review UI and the MCP endpoint."""
     import uvicorn
 
-    from mailmind.web.app import create_app
+    from mailmind.web.app import create_app, mint_session_key
 
     # An override has to reach the configuration rather than only uvicorn: the MCP
     # endpoint builds its DNS-rebinding allow-list from the configured bind address, so
     # a service told to listen elsewhere would refuse the very Host it was serving.
     overrides = {key: value for key, value in (("bind", host), ("port", port)) if value}
     service = _service(ctx.obj["config_path"], **overrides)
+    session_key = mint_session_key()
     try:
-        app = create_app(service)
+        app = create_app(service, session_key=session_key)
     except ConfigError as exc:
         raise click.ClickException(str(exc)) from exc
     where = f"http://{service.config.bind}:{service.config.port}"
+    click.echo(f"review UI  {where}/?key={session_key}")
+    click.echo("           open that link once — it is the login, and nothing")
+    click.echo("           connecting over MCP is given it.")
     # The trailing slash is not decoration: the endpoint is mounted at /mcp/ and a POST to
     # /mcp gets a 307, which an MCP client is entitled to follow and may not.
-    click.echo(f"review UI  {where}/\nMCP        {where}/mcp/")
+    click.echo(f"MCP        {where}/mcp/")
     uvicorn.run(app, host=service.config.bind, port=service.config.port)
 
 
