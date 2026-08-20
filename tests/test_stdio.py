@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import datetime as dt
 import json
+import pathlib
 import socket
 import subprocess
 import sys
@@ -347,3 +348,45 @@ def test_stdio_mints_a_grant_that_cannot_be_used_over_http(workspace):
             sa.select(m.AuditEvent).where(m.AuditEvent.verb == "grant_minted")
         )
         assert minted.payload["transport"] == "stdio"
+
+
+#: How to get at the spawn command in each shipped configuration.
+SHIPPED = {
+    "opencode.json": lambda d: d["mcp"]["servers"]["mailmind"],
+    "mcp-servers.json": lambda d: d["mcpServers"]["mailmind"],
+}
+
+
+@pytest.mark.parametrize("name", list(SHIPPED))
+def test_the_shipped_client_configurations_still_match_the_command(name):
+    """They get copy-pasted by people who will not read `--help` first.
+
+    So they are parsed here rather than eyeballed: a flag renamed in the CLI fails in
+    integrations/, which is where somebody would otherwise find out by having an agent
+    that silently never starts.
+    """
+    from mailmind.cli import mcp_stdio
+
+    path = pathlib.Path(__file__).resolve().parent.parent / "integrations" / name
+    spec = SHIPPED[name](json.loads(path.read_text()))
+    argv = (
+        spec["command"]
+        if isinstance(spec["command"], list)
+        else [spec["command"], *spec["args"]]
+    )
+
+    assert argv[:2] == ["mailmindctl", "mcp"], f"{name} no longer spawns the stdio server"
+    # A real parse, so an option that stopped existing is a failure rather than a warning.
+    with mcp_stdio.make_context("mcp", argv[2:]) as ctx:
+        assert ctx.params["serve_ui"] is True, f"{name} should bring the review UI up"
+        assert ctx.params["port"] == 0, f"{name} should take a free port"
+        assert ctx.params["producer"], f"{name} should name a producer"
+
+    environment = spec.get("environment") or spec.get("env") or {}
+    assert "MAILMIND_CONFIG" in environment, (
+        f"{name} must name the configuration: a spawned process inherits a working "
+        "directory nobody chose"
+    )
+    assert environment["MAILMIND_CONFIG"].startswith("~/"), (
+        "the shipped path uses a tilde, which only works because config_path expands it"
+    )

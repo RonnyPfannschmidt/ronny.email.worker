@@ -160,8 +160,16 @@ def check_exposure(config: Config) -> None:
 
 
 def config_path() -> Path:
+    """Where the configuration is, and whether anybody said so.
+
+    Returns the path and whether it was *named* — by ``--config`` or ``MAILMIND_CONFIG``
+    — rather than found. The difference matters: a named path that is not there is a
+    mistake, and a default that is not there is a fresh install.
+    """
     if env := os.environ.get("MAILMIND_CONFIG"):
-        return Path(env)
+        # Expanded, because these are written into MCP client configurations by hand and
+        # a `~` in a JSON string is passed through with no shell to expand it.
+        return Path(env).expanduser()
     local = Path.cwd() / "mailmind.toml"
     if local.exists():
         return local
@@ -170,8 +178,17 @@ def config_path() -> Path:
 
 
 def load_config(path: Path | None = None) -> Config:
+    named = path is not None or "MAILMIND_CONFIG" in os.environ
     path = path or config_path()
     if not path.exists():
+        if named:
+            # Silently falling back would give an empty configuration: no accounts, and a
+            # database in whatever the working directory happens to be. For a process an
+            # MCP client spawned, that working directory is not one anybody chose.
+            raise ConfigError(
+                f"no configuration at {path} — it was named, so this is a mistake rather "
+                "than a fresh install"
+            )
         return Config()
     raw = tomllib.loads(path.read_text())
 

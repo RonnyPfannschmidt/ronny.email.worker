@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "mailmind": {
+      "command": "mailmindctl",
+      "args": ["mcp", "--producer", "agent", "--serve", "--port", "0"],
+      "env": {
+        "MAILMIND_CONFIG": "~/.config/mailmind/mailmind.toml"
+      }
+    }
+  }
+}

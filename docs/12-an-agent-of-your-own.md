@@ -56,6 +56,10 @@ processes reading the same file is also what keeps the advertised address honest
 `port` and both follow. `--review-url` says where a UI already is, for one reached some
 other way, behind a proxy or on another host.
 
+Ready-made configurations for both shapes are in
+[`integrations/`](../integrations/) — opencode's schema and the `mcpServers` form that
+Claude Desktop, Claude Code and most others take — along with where each file goes.
+
 **Over HTTP, when the agent is long-lived or somewhere else.** Run `mailmindctl serve`,
 mint a token, and connect to `http://127.0.0.1:8765/mcp/` with
 `Authorization: Bearer <token>`.

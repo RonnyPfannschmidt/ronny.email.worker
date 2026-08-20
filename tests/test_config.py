@@ -14,6 +14,7 @@ from mailmind.config import (
     ConfigError,
     Login,
     check_exposure,
+    config_path,
     load_config,
     resolve_password,
 )
@@ -263,3 +264,37 @@ def test_only_addresses_that_are_provably_this_machine_serve_without_auth(bind, 
     else:
         with pytest.raises(ConfigError):
             check_exposure(config)
+
+
+def test_a_configuration_that_was_named_and_is_not_there_is_an_error(tmp_path, monkeypatch):
+    """Falling back silently would give an empty configuration.
+
+    No accounts, and a database in whatever the working directory happens to be — which,
+    for a process an MCP client spawned, is not a directory anybody chose.
+    """
+    missing = tmp_path / "nowhere" / "mailmind.toml"
+    with pytest.raises(ConfigError, match="named"):
+        load_config(missing)
+
+    monkeypatch.setenv("MAILMIND_CONFIG", str(missing))
+    with pytest.raises(ConfigError, match="named"):
+        load_config()
+
+    # Nobody named anything, so an absent default is a fresh install rather than a mistake.
+    monkeypatch.delenv("MAILMIND_CONFIG")
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "empty"))
+    assert load_config().accounts == ()
+
+
+def test_a_tilde_in_the_config_path_is_expanded(tmp_path, monkeypatch):
+    """These are written into MCP client configurations by hand, where no shell expands."""
+    home = tmp_path / "home"
+    (home / ".config" / "mailmind").mkdir(parents=True)
+    written = home / ".config" / "mailmind" / "mailmind.toml"
+    written.write_text(CONFIG)
+
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("MAILMIND_CONFIG", "~/.config/mailmind/mailmind.toml")
+    assert config_path() == written
+    assert load_config().account("personal").host == "imap.example.org"
