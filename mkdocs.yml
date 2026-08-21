@@ -24,8 +24,15 @@ theme:
         icon: material/brightness-4
         name: Switch to light mode
 
+plugins:
+  - search
+  - gen-files:
+      scripts:
+        - scripts/gen_reference.py
+
 markdown_extensions:
   - admonition
+  - mkdocs-click
   - attr_list
   - tables
   - toc:
@@ -35,15 +42,16 @@ markdown_extensions:
 nav:
   - Home: index.md
   - Guide:
-      - Getting started: getting-started.md
-      - Configuration: configuration.md
+      - Connecting a client: connecting.md
       - Reviewing: reviewing.md
-      - Connecting an agent: agents.md
       - Security model: security-model.md
+      - Test drive: test-drive.md
+      - Setting it up: setup.md
       - Troubleshooting: troubleshooting.md
   - Reference:
-      - mailmindctl: reference/cli.md
       - MCP surface: reference/mcp.md
+      - mailmindctl: reference/cli.md
+      - Configuration: reference/configuration.md
   - Design notes:
       - design/index.md
       - 01 — Intent: design/01-intent.md

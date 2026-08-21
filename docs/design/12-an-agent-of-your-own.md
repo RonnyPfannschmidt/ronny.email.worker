@@ -16,7 +16,7 @@ Two transports, and the choice between them is about how long the agent lives ra
 about what it may do. Over stdio a client spawns `mailmindctl mcp` and talks down a pipe —
 no port, no token. Over HTTP a long-lived or remote agent presents a bearer token to
 `/mcp/`. The configurations for both are in
-[Connecting an agent](../agents.md), and shipped ready to copy in `integrations/`.
+[Connecting an agent](../connecting.md), and shipped ready to copy in `integrations/`.
 
 What `--serve` decides is not whether the model is told where the review UI is — it always
 is, at connect time and on every bundle — but whether that UI is this process or another
@@ -49,7 +49,7 @@ producer that then proposes acting on it.
 ## What the surface gives you
 
 Twelve tools, nine that look and three that say, plus six resources and three prompts;
-[the reference](../reference/mcp.md) is the list, and [Connecting an agent](../agents.md)
+[the reference](../reference/mcp.md) is the list, and [Connecting an agent](../connecting.md)
 has what to build into an agent from the start.
 
 There is no tool that applies anything. Not a permission your agent lacks — a capability

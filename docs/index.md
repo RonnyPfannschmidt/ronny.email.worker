@@ -1,42 +1,32 @@
 # mailmind
 
-Get real help with mail out of agents, without ever handing them the ability to damage it.
+An MCP server for somebody's mail, with a review UI beside it.
 
-An agent connects over MCP, browses the mail its grant covers, and says what should happen
-to it. It cannot make any of it happen. A person reviews the proposed effect — every
-message, where it is, where it would go — and accepts or rejects. Only then does the
-service touch the mailbox, and only if nothing has moved in the meantime.
+An agent connects, browses the mail its grant covers, and says what should happen to it.
+It cannot make any of it happen. A person reviews the proposed effect — every message,
+where it is, where it would go — and accepts or rejects. Only then does the service touch
+the mailbox, and only if nothing has moved since.
 
-## What that means concretely
-
-There is no tool on the agent surface that applies a change. Not a permission an agent
-lacks: `apply` is not a value the capability enum can hold, and the module that writes to
-a mailbox is not imported by anything on the agent side. The single path from a proposal
-to a mailbox runs through the review UI, and that UI has a login the agent is never given.
-
-The promise is worth stating exactly, because a looser version of it would be false:
+There is no tool on the surface that applies a change: `apply` is not a value the
+capability enum can hold, and the module that writes to a mailbox is not imported by
+anything on the agent side.
 
 > Nothing reaches a mailbox through mailmind except an accept made by something holding
 > the review key, and every accept is recorded against a producer.
 
-Not "a person accepted it". [The security model](security-model.md) is where that
-distinction is spelled out, along with what it costs you if your agent has a shell.
+Not "a person accepted it". [The security model](security-model.md) has the difference.
 
 ## Where to go
 
-| If you want to | Read |
+| | |
 |---|---|
-| See it work, against a mailbox that is not yours | [Getting started](getting-started.md) |
-| Point it at your own mailbox | [Configuration](configuration.md) |
-| Decide whether to trust it | [Security model](security-model.md) |
-| Work through a queue | [Reviewing](reviewing.md) |
-| Connect an agent of your own | [Connecting an agent](agents.md) |
-| Look something up | [`mailmindctl`](reference/cli.md), [the MCP surface](reference/mcp.md) |
-| Know why any of it is shaped this way | [Design notes](design/index.md) |
+| [Connecting a client](connecting.md) | Both transports, grants, what an agent gets |
+| [Reviewing](reviewing.md) | Where a proposal becomes a change |
+| [Security model](security-model.md) | What it promises, and where that stops |
+| [Test drive](test-drive.md) | Six commands, a container, nothing of yours |
+| [Setting it up](setup.md) | Your own mailbox |
+| [Reference](reference/mcp.md) | The MCP surface, `mailmindctl`, the configuration file |
+| [Design notes](design/index.md) | Why it is shaped this way |
 
-## Status
-
-The first iteration is built: IMAP, one tenant, and enough to sort a long untended
-mailbox. It has been driven by scripts and by a person, and — as
-[09](design/09-iteration-one.md) keeps saying — not yet by a model. Anything in these
-pages about what an agent will reach for is a guess that has not met one.
+Iteration one: IMAP, one tenant, no release — you run it from a checkout. No model has been
+pointed at it yet, so anything here about what an agent will reach for is a guess.

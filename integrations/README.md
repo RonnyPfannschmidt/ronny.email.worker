@@ -2,7 +2,7 @@
 
 Copy-pasteable MCP client configurations for mailmind. All of them spawn
 `mailmindctl mcp`, which speaks MCP over the pipe and tells the model where the review UI
-is — see [Connecting an agent](../docs/agents.md) for what the agent
+is — see [Connecting a client](../docs/connecting.md) for what the agent
 gets and what it does not.
 
 | File | For |

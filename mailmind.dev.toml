@@ -8,7 +8,7 @@
 #   mailmindctl bootstrap && mailmindctl probe && mailmindctl sync
 #
 # Checked in, unlike mailmind.toml, because there is nothing here worth keeping private.
-# See docs/getting-started.md.
+# See docs/test-drive.md.
 
 database_url = "sqlite:///mailmind.dev.db"
 bind = "127.0.0.1"

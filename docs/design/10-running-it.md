@@ -7,8 +7,8 @@ Every other document here is written from the inside — what a component is mad
 may do what to it. This one is written from outside, because the first thing anybody does
 with mailmind is try to run it.
 
-The instructions themselves now live in the guide — [Getting started](../getting-started.md)
-and [Configuration](../configuration.md). What is left here is why they say what they say.
+The instructions themselves now live in the guide — [Getting started](../test-drive.md)
+and [Configuration](../reference/configuration.md). What is left here is why they say what they say.
 
 Serving it to anything but this machine is refused, because its session cookie travels
 over plain HTTP —
@@ -35,7 +35,7 @@ That is the story this document is about:
 corpus the tests use. `mailmind.dev.toml` is checked in and points at it, so there is
 nothing to copy and nothing to edit. This is the one to start with.
 
-The commands are in [Getting started](../getting-started.md); six of them, and none of
+The commands are in [Getting started](../test-drive.md); six of them, and none of
 them edits a file.
 
 The review UI has a login: `serve` prints a URL carrying a key, and following it once
@@ -75,7 +75,7 @@ anything. [12](12-an-agent-of-your-own.md) has the client configuration for both
 The configuration never holds a password. It holds a URL saying where to find one, and the
 scheme decides. Which scheme is right depends on something the service cannot know, so it
 is a decision written down rather than defaulted to silently. The recipes are in
-[Configuration](../configuration.md#where-the-password-lives); the reasoning is this:
+[Configuration](../reference/configuration.md#where-the-password-lives); the reasoning is this:
 
 **`secret-storage://` is for a desk.** The password is stored once, by you, outside the
 repository, by something the operating system already audits. It needs a session bus to
@@ -118,7 +118,7 @@ connection, from outside, exactly as the container tier's `out_of_band` fixture 
 
 ## What you should see
 
-Recorded in [Getting started](../getting-started.md#what-you-should-see), because it is the
+Recorded in [Getting started](../test-drive.md#what-you-should-see), because it is the
 thing somebody checks their own run against: six messages, the special-use folders
 recognised, four findings, and a probe that is loud in one direction and quiet in the
 other.

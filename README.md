@@ -15,24 +15,23 @@ See [09 — Iteration one](docs/design/09-iteration-one.md) for what it does.
 
 ## Documentation
 
-[Getting started](docs/getting-started.md) runs it against a mailbox that is not yours.
-[Configuration](docs/configuration.md) points it at one that is, and decides where the
-password lives. [Security model](docs/security-model.md) is what it promises and where that
-stops. [Connecting an agent](docs/agents.md) is the other half, and
-[`mailmindctl`](docs/reference/cli.md) and [the MCP surface](docs/reference/mcp.md) are the
-lists to look things up in.
+[Connecting a client](docs/connecting.md) is the spine: both transports, what a grant is,
+and what to build into an agent. [Reviewing](docs/reviewing.md) is the other side of it, and
+[the security model](docs/security-model.md) is what the arrangement promises and where that
+stops. [Setting it up](docs/setup.md) points it at a mailbox of your own; the
+[reference](docs/reference/mcp.md) covers the MCP surface, `mailmindctl` and the
+configuration file, and is rendered from the code.
 
-Why any of it is shaped that way is in [design notes](docs/design/index.md) — sketches and
-arguments, starting with [the intent](docs/design/01-intent.md).
+Why any of it is shaped that way is in [design notes](docs/design/index.md), starting with
+[the intent](docs/design/01-intent.md).
 
 The whole of it builds as a site: `uv run --group docs mkdocs serve`.
 
 ## A first look, costing you nothing
 
 A disposable IMAP server seeded with the test corpus, so nothing here touches your own
-mail. [Getting started](docs/getting-started.md) covers this, and
-[Configuration](docs/configuration.md) covers pointing it at a real mailbox, including
-where the password should live.
+mail. [Test drive](docs/test-drive.md) is this, and [Setting it up](docs/setup.md) is
+pointing it at a real mailbox, including where the password should live.
 
 ```
 podman run -d --rm --name mailmind-dev -p 3144:143 -e MAILNAME=example.org \
@@ -48,6 +47,6 @@ uv run mailmindctl serve                       # prints a link with the login ke
 
 An MCP client can also spawn its own connection over a pipe: `mailmindctl mcp` speaks MCP
 on stdin and stdout and tells the model where the review UI is — `--serve` brings one up
-for the life of the session. [Connecting an agent](docs/agents.md)
+for the life of the session. [Connecting a client](docs/connecting.md)
 covers pointing your own agent repository at either transport, and
 [`integrations/`](integrations/) has ready-made client configurations.

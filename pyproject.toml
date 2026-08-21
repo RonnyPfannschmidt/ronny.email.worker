@@ -27,7 +27,7 @@ mailmindctl = "mailmind.cli:main"
 [project.optional-dependencies]
 # The desktop secret store, for `secret-storage://` password URLs. Optional because it
 # needs a session bus to talk to and there is nothing to talk to on a headless box —
-# see docs/configuration.md for what to use there instead.
+# see docs/reference/configuration.md for what to use there instead.
 secrets = [
     "keyring>=25",
 ]
@@ -51,6 +51,10 @@ dev = [
 docs = [
     "mkdocs>=1.6",
     "mkdocs-material>=9.5",
+    # The CLI and the MCP surface describe themselves; the reference pages are rendered
+    # from the code rather than typed out beside it and left to rot.
+    "mkdocs-click>=0.8",
+    "mkdocs-gen-files>=0.5",
 ]
 
 [tool.hatch.version]

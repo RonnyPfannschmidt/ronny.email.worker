@@ -53,6 +53,6 @@ username = "me@example.org"
 #                                               process launched from that shell.  Fine
 #                                               for a throwaway container, wrong here.
 #
-# docs/configuration.md has the reasoning.  An unknown scheme is refused when the config
+# docs/reference/configuration.md has the reasoning.  An unknown scheme is refused when the config
 # loads, not when a connection is attempted.
 password = "secret-storage://imap.example.org"

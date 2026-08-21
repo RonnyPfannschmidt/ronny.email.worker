@@ -117,7 +117,9 @@ def bootstrap(ctx: click.Context) -> None:
     type=click.Choice([c.value for c in m.Capability]),
     help="there is no apply; it is not a capability this service has",
 )
-@click.option("--account", "account_names", multiple=True, help="default: all accounts")
+@click.option(
+    "--account", "account_names", multiple=True, default=(), help="default: all accounts"
+)
 @click.pass_context
 def make_grant(
     ctx: click.Context,
