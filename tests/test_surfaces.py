@@ -1075,6 +1075,34 @@ def test_the_review_ui_refuses_a_change_that_is_not_a_person_at_a_browser(
     assert len(backend.folders["Archive"].messages) == 0, "it applied anyway"
 
 
+def test_a_browser_that_withholds_the_origin_is_still_a_person(client, backend):
+    """Chrome sends `Origin: null` for a same-origin form POST under some referrer
+    policies — ours was one — and the UI refused every button in itself.
+
+    The fetch metadata is what asserts a browser is showing a page to somebody. A missing
+    or opaque origin is not evidence against that, and treating it as evidence locked the
+    person out of their own mail.
+    """
+    proposed = _propose(Agent(client))
+    accepted = as_a_person(
+        client, f"/bundle/{proposed['bundle_id']}/accept", headers={"Origin": "null"}
+    )
+    assert accepted.status_code < 400
+    assert len(backend.folders["Archive"].messages) == 1, "the accept did not apply"
+
+
+def test_the_referrer_policy_leaves_the_origin_alone(client):
+    """The header that caused the above, pinned so it cannot come back.
+
+    A browser derives a form POST's Origin from the referrer policy, so `no-referrer`
+    means `Origin: null` on the service's own buttons. `same-origin` still sends a
+    referrer to nobody but us, which is the part that matters with strangers' links on
+    the page.
+    """
+    policy = client.get("/").headers["referrer-policy"]
+    assert policy == "same-origin", "no-referrer nulls the origin of our own form posts"
+
+
 def test_a_refused_change_leaves_a_mark(client, service):
     """The refusal is the interesting half: nothing changed, but something tried."""
     proposed = _propose(Agent(client))

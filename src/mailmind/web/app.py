@@ -122,7 +122,12 @@ def not_a_browser_gesture(request: Request) -> str | None:
     origin = request.headers.get("origin")
     host = request.headers.get("host", "")
     expected_origin = f"{request.url.scheme}://{host}"
-    if origin != expected_origin:
+    # A browser is allowed to withhold the origin of a same-origin form submission, and
+    # does: the value is derived from the referrer policy, so a strict enough one makes
+    # every button in this UI arrive with `Origin: null`.  That is not evidence of
+    # anything, and refusing it refuses the person.  An origin that is present and
+    # *different* is a different matter, and still refused.
+    if origin not in (None, "null", expected_origin):
         return f"origin was {origin!r}, not {expected_origin!r}"
     return None
 
@@ -302,7 +307,12 @@ def create_app(
         response = await call_next(request)
         if not request.url.path.startswith("/mcp"):
             response.headers["Content-Security-Policy"] = CSP
-            response.headers["Referrer-Policy"] = "no-referrer"
+            # `no-referrer` is the tighter-looking choice and was the wrong one: browsers
+            # derive a form POST's Origin from the referrer policy, so it arrived as
+            # `Origin: null` and this service refused its own buttons.  `same-origin`
+            # sends a referrer to nobody but us, which is the part that matters when the
+            # page is rendering links written by strangers.
+            response.headers["Referrer-Policy"] = "same-origin"
         return response
 
     def render(request: Request, template: str, **context) -> HTMLResponse:  # noqa: ANN003

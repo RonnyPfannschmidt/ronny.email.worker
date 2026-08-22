@@ -103,6 +103,13 @@ headers, which scripts are forbidden to set, so inside a browser they cannot be 
 A refusal writes a `ui_change_refused` event, because nothing changed but something tried,
 and whoever owns the mail should be able to find that out.
 
+The origin is checked alongside those headers, and that check spent a while refusing the
+person it was written for: browsers derive a form POST's `Origin` from the referrer policy,
+and this service was sending `Referrer-Policy: no-referrer`, so every button in the review
+UI arrived as `Origin: null`. The policy is `same-origin` now, and a missing or opaque
+origin is no longer held against a request whose fetch metadata already says same-origin —
+a browser is allowed to withhold it, and the metadata is the part doing the work.
+
 `Sec-Fetch-User: ?1` would be the better signal — "a person did this" rather than "a
 document navigated" — and is deliberately not required, because Safari has never sent it
 and a check that locks out a whole browser is a check somebody turns off.
