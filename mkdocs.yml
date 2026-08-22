@@ -47,6 +47,7 @@ nav:
       - Security model: security-model.md
       - Test drive: test-drive.md
       - Setting it up: setup.md
+      - Running a checkout: running-a-checkout.md
       - Troubleshooting: troubleshooting.md
   - Reference:
       - MCP surface: reference/mcp.md

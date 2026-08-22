@@ -22,8 +22,8 @@ The client spawns `mailmindctl mcp` and talks down a pipe. No port, no token.
 `integrations/` in the repository has this and opencode's schema, ready to copy, with where
 each file goes. Running mailmind from a git checkout rather than an install changes the
 `command` to `uv` and the args to `run --directory …` —
-[Setting it up](setup.md#or-run-a-checkout-in-place) has that shape and the two paths it
-makes absolute.
+[Running a checkout](running-a-checkout.md) has that shape and the two paths it makes
+absolute.
 
 - **Set `MAILMIND_CONFIG`.** A spawned process inherits a working directory you did not
   choose, so the `./mailmind.toml` fallback is not one to rely on.

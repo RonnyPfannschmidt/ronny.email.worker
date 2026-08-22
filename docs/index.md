@@ -25,6 +25,7 @@ Not "a person accepted it". [The security model](security-model.md) has the diff
 | [Security model](security-model.md) | What it promises, and where that stops |
 | [Test drive](test-drive.md) | Six commands, a container, nothing of yours |
 | [Setting it up](setup.md) | Your own mailbox |
+| [Running a checkout](running-a-checkout.md) | The dev version, from wherever the agent lives |
 | [Reference](reference/mcp.md) | The MCP surface, `mailmindctl`, the configuration file |
 | [Design notes](design/index.md) | Why it is shaped this way |
 

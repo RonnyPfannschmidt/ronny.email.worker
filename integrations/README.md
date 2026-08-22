@@ -39,7 +39,7 @@ The link goes to a file only you can read; the log gets its path. `mailmindctl r
 Both spawn a `mailmindctl` on PATH. Running a checkout instead means
 `"command": "uv"` and `"args": ["run", "--directory", "/path/to/ronny.email.worker",
 "mailmindctl", "mcp", …]`, with `MAILMIND_CONFIG` and `database_url` absolute because
-`--directory` moves the working directory. [Setting it up](../docs/setup.md) has the rest.
+`--directory` moves the working directory. [Running a checkout](../docs/running-a-checkout.md) has the rest.
 
 Drop `--serve --port 0` if you would rather run `mailmindctl serve` yourself and have a
 queue that outlives any one session. The agent is then told the address from your
