@@ -15,6 +15,56 @@ tool install is the easier half.
 Add `--with keyring` to the tool install if the password is going in the desktop secret
 store.
 
+## Or run a checkout in place
+
+For the latest rather than the last install, three shapes depending on where the agent
+lives. All of them run the code in the checkout, so `git pull` is the upgrade.
+
+**One-off, installing nothing:**
+
+```
+uvx --from ~/src/ronny.email.worker mailmindctl status
+```
+
+**A client that spawns it** — point the command at the checkout instead of at a
+`mailmindctl` on PATH:
+
+```json
+{
+  "mcpServers": {
+    "mailmind": {
+      "command": "uv",
+      "args": ["run", "--directory", "/home/you/src/ronny.email.worker",
+               "mailmindctl", "mcp", "--producer", "mail-agent", "--serve", "--port", "0"],
+      "env": { "MAILMIND_CONFIG": "/home/you/.config/mailmind/mailmind.toml" }
+    }
+  }
+}
+```
+
+`--directory` moves the working directory into the checkout, which is why
+`MAILMIND_CONFIG` is absolute here. Give `database_url` an absolute path too, or the
+database lands in the checkout and a second way of starting it finds an empty one.
+
+**From the agent's own repository**, which is the tidiest if you are writing one: declare
+mailmind as a dev dependency with a source, and let uv keep the two in step.
+
+```toml
+[dependency-groups]
+dev = ["mailmind[secrets]"]
+
+[tool.uv.sources]
+mailmind = { path = "../ronny.email.worker", editable = true }
+```
+
+`uv run mailmindctl …` from that repository then runs the checkout — editable, so an edit
+over there needs no reinstall, though a *dependency* change needs `uv sync`. A client
+spawns it the same way as above with `--directory` pointing at the agent repository.
+
+A git source is the same line with `{ git = "…", branch = "…" }` instead of a path, once
+there is a branch carrying the package: today `main` holds the design notes and nothing
+installable, so uv reports that it does not look like a Python project.
+
 ## Point it at a mailbox
 
 ```
