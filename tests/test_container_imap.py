@@ -146,6 +146,43 @@ def test_special_use_arrives_normalised_from_a_real_server(backend, out_of_band)
         )
 
 
+#: A German mailbox has these, and IMAP does not carry them as UTF-8: names travel in
+#: modified UTF-7, where `&` is the shift character and so has to be escaped as `&-`. A
+#: folder called `Ärger & Co` exercises both halves of that in one name.
+AWKWARD_FOLDERS = ("Gelöschte Objekte", "Entwürfe", "Ärger & Co", "with space")
+
+
+def test_folder_names_survive_the_wire_in_the_alphabet_they_were_written_in(
+    backend, out_of_band
+):
+    """187 folders on a real account, and the interesting ones are not called Archive."""
+    for name in AWKWARD_FOLDERS:
+        ensure_folder(out_of_band, name)
+
+    found = {c.name: c for c in backend.list_containers()}
+    for name in AWKWARD_FOLDERS:
+        assert name in found, f"{name!r} did not come back as it went in"
+        assert backend.select(name, readonly=True) is not None, f"{name!r} cannot be opened"
+
+
+def test_a_message_in_a_folder_with_an_umlaut_is_fetched_like_any_other(
+    backend, out_of_band
+):
+    """Selecting it is one thing; the FETCH that follows names it again."""
+    ensure_folder(out_of_band, "Ärger & Co")
+    out_of_band.append(
+        "Ärger & Co",
+        b"From: Kunde <kunde@example.net>\r\nSubject: Beschwerde\r\n"
+        b"Message-ID: <umlaut-folder@example.net>\r\n"
+        b"Date: Mon, 17 Aug 2026 09:00:00 +0000\r\n\r\nText\r\n",
+    )
+    envelopes = [e for e in backend.fetch_envelopes("Ärger & Co")]
+    subjects = [
+        str(email.message_from_bytes(e.headers or b"").get("Subject", "")) for e in envelopes
+    ]
+    assert "Beschwerde" in subjects
+
+
 def test_envelopes_come_back_with_headers_but_no_body(backend, seeded):
     envelopes = {e.uid: e for e in backend.fetch_envelopes("INBOX")}
     envelope = envelopes[seeded["ordinary"]]

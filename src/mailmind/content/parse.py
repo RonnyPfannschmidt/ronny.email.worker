@@ -137,7 +137,7 @@ def _decode(part: EmailMessage) -> str:
 
 
 def _storable(text: str) -> str:
-    """Header text with its 8-bit bytes turned back into characters, or into U+FFFD.
+    """Header or body text with the two things in it that no database will keep.
 
     ``email.headerregistry`` decodes 8-bit bytes in *address* headers with
     ``surrogateescape``, so what comes back can hold lone surrogates.  Those are not text:
@@ -150,8 +150,26 @@ def _storable(text: str) -> str:
     try:
         text.encode("utf-8")
     except UnicodeEncodeError:
-        return text.encode("utf-8", "surrogateescape").decode("utf-8", "replace")
-    return text
+        text = text.encode("utf-8", "surrogateescape").decode("utf-8", "replace")
+    # And NUL, which arrives in spam and in truncated mail: SQLite stores it, Postgres
+    # refuses it outright, and everything in between disagrees about where the string
+    # ends. It is not a character anybody wrote.
+    return text.replace("\x00", "") if "\x00" in text else text
+
+
+#: RFC 5321's ceiling on an address. Longer than this is not an address anybody can send
+#: to, and it is wider than the column that would have to hold it.
+_ADDRESS_MAX = 320
+
+
+def _usable(addr: str | None) -> bool:
+    """Is this something that could be sent to?
+
+    ``<>`` is the null return path, which arrives on bounces and is not somebody's
+    address; anything past the RFC's ceiling is not one either, and storing it would be
+    storing a string that no mail server would accept.
+    """
+    return bool(addr) and addr != "<>" and len(addr) <= _ADDRESS_MAX
 
 
 def _addresses(message: EmailMessage, header: str) -> list[tuple[str, str | None]]:
@@ -162,7 +180,7 @@ def _addresses(message: EmailMessage, header: str) -> list[tuple[str, str | None
             return out
         for addr in getattr(value, "addresses", ()) or ():
             assert isinstance(addr, Address)
-            if addr.addr_spec:
+            if _usable(addr.addr_spec):
                 out.append(
                     (
                         _storable(addr.addr_spec.lower()),
@@ -172,7 +190,7 @@ def _addresses(message: EmailMessage, header: str) -> list[tuple[str, str | None
     except Exception:
         # A header that will not parse is not a reason to lose the rest of the message.
         for name, addr in email.utils.getaddresses([str(message.get(header, ""))]):
-            if addr:
+            if _usable(addr):
                 out.append((_storable(addr.lower()), _storable(name) if name else None))
     return out
 
@@ -259,8 +277,8 @@ def parse_message(raw: bytes) -> ParsedMessage:
         links.extend(extractor.links)
         html_text_parts.append("".join(extractor.text_parts))
 
-    text_plain = "\n".join(p for p in text_plain_parts if p).strip() or None
-    text_from_html = "\n".join(p for p in html_text_parts if p).strip() or None
+    text_plain = _storable("\n".join(p for p in text_plain_parts if p).strip()) or None
+    text_from_html = _storable("\n".join(p for p in html_text_parts if p).strip()) or None
 
     for match in _URL_RE.finditer(text_plain or ""):
         links.append(Link(text=match.group(0), target=match.group(0)))

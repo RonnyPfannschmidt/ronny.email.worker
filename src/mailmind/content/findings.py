@@ -37,7 +37,11 @@ _INVISIBLE_RANGES = (
     (0x2066, 0x2069),  # bidi isolates
 )
 
-_ADDRESS_RE = re.compile(r"[\w.+-]+@[\w-]+\.[\w.-]+")
+#: Bounded the way RFC 5321 bounds an address — local part at most 64, each label at most
+#: 63 — because the unbounded version was quadratic on any long run of word characters and
+#: bodies contain those. 900 KB of one token took hours; this takes half a second. It also
+#: stops swallowing the full stop that ends a sentence into the address before it.
+_ADDRESS_RE = re.compile(r"[\w.+-]{1,64}@[\w-]{1,63}(?:\.[\w-]{1,63})+")
 
 
 def _invisible_chars(text: str) -> list[str]:
