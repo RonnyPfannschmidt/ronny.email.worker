@@ -27,10 +27,12 @@ example file seeds `personal` at `imap.example.org`, and taking it back out of t
 not take it out of the database — the row is the source of truth. `mailmindctl account list`
 then `mailmindctl account forget personal`.
 
-**Most of the mailbox says `partial`.** A cache filled before August 2026 was flagging
-every multipart message — most mail — because a sync reads headers and a multipart without
-its body looks truncated. Fixed at the source; `mailmindctl sync --full` re-reads what is
-already cached.
+**Most of the mailbox says `partial`, and everything claims an attachment.** A cache
+filled before August 2026 flagged every multipart message — most mail — because a sync
+reads headers, and a multipart without its body looks truncated and looks like one
+attachment of type `multipart/mixed`. Fixed at the source, and a migration undoes it in
+place: no re-download, because the combination of both flags with no cached body is
+diagnostic of the bug rather than of the mail.
 
 **`probe` fails.** The account declares a capability the server does not offer. Fix the
 declaration rather than working around the probe: it decides what the service attempts. The

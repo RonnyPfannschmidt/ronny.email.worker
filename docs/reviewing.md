@@ -47,8 +47,9 @@ longer guesses — a message is `partial` when something is actually wrong with 
 read, and the reason is recorded beside it. Fetching the body settles the rest, and the
 status, the attachments and the preview are all re-derived at that point.
 
-If your cache was filled before this, its flags are the older parse's: `mailmindctl sync
---full` re-reads every message rather than only what changed.
+A cache filled before this is corrected in place when the database migrates — it does not
+need re-downloading. `mailmindctl sync --full` exists for the cases that do: it re-reads
+every message rather than only what changed.
 
 ## When the mailbox has moved on
 
