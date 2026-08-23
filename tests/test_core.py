@@ -267,6 +267,54 @@ def test_a_full_sync_re_reads_what_an_incremental_one_would_skip(scope, world, b
     assert scope.get(m.Message, message.id).subject == "Lunch on Thursday"
 
 
+class Watcher:
+    """Whatever is showing progress, seen from the sync's side."""
+
+    def __init__(self) -> None:
+        self.folders: list[tuple[str, int]] = []
+        self.ticks: list[int] = []
+
+    def folder_started(self, container: str, messages: int) -> None:
+        self.folders.append((container, messages))
+
+    def messages_absorbed(self, count: int) -> None:
+        self.ticks.append(count)
+
+
+def test_a_sync_says_how_far_it_has_got_while_it_is_getting_there(
+    scope, world, backend, monkeypatch
+):
+    """A first sync is 187 folders and takes minutes. It used to print one line per folder
+    once that folder was finished, so the long part was the silent part.
+
+    The batch size is turned down here so that nine messages take several passes: the point
+    is that progress arrives *during* a folder, which a single tick at the end would also
+    satisfy by accident.
+    """
+    monkeypatch.setattr(sync, "FETCH_BATCH", 2)
+    watcher = Watcher()
+    report = sync.sync_container(
+        scope,
+        world["account"],
+        world["containers"]["INBOX"],
+        backend,
+        force_full=True,
+        progress=watcher,
+    )
+
+    assert watcher.folders == [("INBOX", len(CORPUS))], "the folder's size is known up front"
+    assert len(watcher.ticks) > 1, "one tick at the end is not progress"
+    assert sum(watcher.ticks) == len(CORPUS) == report.added + report.updated
+
+
+def test_a_sync_with_nobody_watching_is_the_same_sync(scope, world, backend):
+    """The display is optional, and the reporting is not the work."""
+    quiet = sync.sync_container(
+        scope, world["account"], world["containers"]["INBOX"], backend, force_full=True
+    )
+    assert quiet.updated == len(CORPUS)
+
+
 def test_an_incremental_sync_sees_an_out_of_band_flag_change(scope, world, backend):
     backend.out_of_band_mutate_flags("INBOX", world["uids"]["ordinary"], (r"\Seen",))
     report = sync.sync_container(scope, world["account"], world["containers"]["INBOX"], backend)

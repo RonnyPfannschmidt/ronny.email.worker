@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import datetime as dt
 import hashlib
+from typing import Protocol
 
 import attrs
 import sqlalchemy as sa
@@ -61,6 +62,25 @@ def discover_containers(
     return out
 
 
+#: How many messages a full sync asks for at once. Small enough that a first pass over a
+#: long folder can say how far it has got while it is getting there, large enough that
+#: twenty-nine thousand messages are not twenty-nine thousand round trips.
+FETCH_BATCH = 200
+
+
+class SyncProgress(Protocol):
+    """Somewhere to say how far along this is, for whoever is waiting on it.
+
+    A first sync of a real account is 187 folders and takes minutes; without this it is a
+    process that prints nothing until it is finished. Kept to two calls so that the thing
+    reporting progress can be a rich display, a log line, or nothing at all.
+    """
+
+    def folder_started(self, container: str, messages: int) -> None: ...
+
+    def messages_absorbed(self, count: int) -> None: ...
+
+
 def sync_container(
     scope: TenantScope,
     account: m.Account,
@@ -68,6 +88,7 @@ def sync_container(
     backend: MailBackend,
     *,
     force_full: bool = False,
+    progress: SyncProgress | None = None,
 ) -> SyncReport:
     selected = backend.select(container.name, readonly=True)
 
@@ -86,20 +107,37 @@ def sync_container(
         and "CONDSTORE" in backend.capabilities()
     )
 
-    if use_condstore:
-        infos = backend.fetch_changed_since(container.name, container.highestmodseq)
-        full = False
-    else:
-        infos = backend.fetch_envelopes(container.name)
-        full = True
-
     added = updated = 0
-    for info in infos:
-        was_added = _absorb(scope, account, container, info)
-        added += was_added
-        updated += not was_added
 
-    vanished = _mark_vanished(scope, container, backend, full=full)
+    def absorb(infos: list[MessageInfo]) -> None:
+        nonlocal added, updated
+        for info in infos:
+            was_added = _absorb(scope, account, container, info)
+            added += was_added
+            updated += not was_added
+        if progress is not None:
+            progress.messages_absorbed(len(infos))
+
+    if use_condstore:
+        changed = backend.fetch_changed_since(container.name, container.highestmodseq)
+        full = False
+        if progress is not None:
+            progress.folder_started(container.name, len(changed))
+        absorb(changed)
+        present = None
+    else:
+        full = True
+        # Asked for in batches so that progress is something that happens during a long
+        # folder rather than after it. The UID list is wanted again below to see what
+        # left, so it is fetched once and passed on.
+        present = backend.all_uids(container.name)
+        if progress is not None:
+            progress.folder_started(container.name, len(present))
+        for start in range(0, len(present), FETCH_BATCH):
+            batch = present[start : start + FETCH_BATCH]
+            absorb(backend.fetch_envelopes(container.name, batch))
+
+    vanished = _mark_vanished(scope, container, backend, full=full, present=present)
 
     container.uidvalidity = selected.uidvalidity
     container.uidnext = selected.uidnext
@@ -220,7 +258,12 @@ def _absorb(
 
 
 def _mark_vanished(
-    scope: TenantScope, container: m.Container, backend: MailBackend, *, full: bool
+    scope: TenantScope,
+    container: m.Container,
+    backend: MailBackend,
+    *,
+    full: bool,
+    present: list[int] | None = None,
 ) -> int:
     """Notice that something left.
 
@@ -231,7 +274,7 @@ def _mark_vanished(
     actually use is how a moved message stays fresh forever, and a suggestion resting on
     it gets applied to a UID that now means something else.
     """
-    present = set(backend.all_uids(container.name))
+    present = set(backend.all_uids(container.name) if present is None else present)
     live = scope.scalars(
         sa.select(m.Placement).where(
             m.Placement.container_id == container.id,

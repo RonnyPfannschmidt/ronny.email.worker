@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
 import sys
 from pathlib import Path
@@ -190,6 +191,111 @@ def probe(ctx: click.Context) -> None:
     raise SystemExit(1 if diverged else 0)
 
 
+@contextlib.contextmanager
+def sync_display(folders: int):  # noqa: ANN201
+    """Show where a sync has got to, if there is anybody watching.
+
+    A first sync is 187 folders and tens of thousands of messages, and used to print one
+    line per folder *after* that folder finished — so the interesting part, the long one,
+    was silent. Three bars: the folders, the folder being read, and the messages seen so
+    far, which has no total because finding one out means selecting every folder first.
+
+    Redirected or run from a unit there is nobody watching a bar, so it falls back to the
+    line per folder that a log wants: the same decision `serve` makes about its link.
+    """
+    if not sys.stdout.isatty():
+        lines = _Lines()
+        try:
+            yield lines
+        finally:
+            lines.finish()
+        return
+
+    from rich.progress import (
+        BarColumn,
+        MofNCompleteColumn,
+        Progress,
+        SpinnerColumn,
+        TextColumn,
+        TimeElapsedColumn,
+    )
+
+    with Progress(
+        SpinnerColumn(),
+        TextColumn("[progress.description]{task.description}"),
+        BarColumn(),
+        MofNCompleteColumn(),
+        TimeElapsedColumn(),
+        transient=False,
+    ) as progress:
+        yield _Bars(progress, folders)
+
+
+class _Lines:
+    """One line per folder that changed, and a count at the end. For logs and pipes."""
+
+    def __init__(self) -> None:
+        self.folders = 0
+        self.messages = 0
+
+    def folder_started(self, container: str, messages: int) -> None:
+        self.folders += 1
+
+    def messages_absorbed(self, count: int) -> None:
+        self.messages += count
+
+    def finish(self) -> None:
+        # Something, even when nothing changed: a unit whose log says nothing at all is a
+        # unit nobody can tell apart from one that never ran.
+        click.echo(f"{self.folders} folder(s), {self.messages} message(s) read")
+
+    def folder_finished(self, report) -> None:  # noqa: ANN001
+        if report.identity_broken:
+            click.secho(
+                f"{report.container}: RECREATED — {report.suggestions_killed} "
+                "suggestion(s) died with it",
+                fg="red",
+            )
+        elif report.added or report.updated or report.vanished:
+            click.echo(
+                f"{report.container}: +{report.added} ~{report.updated} -{report.vanished}"
+            )
+
+
+class _Bars:
+    """The same three facts, stacked, for somebody watching it happen."""
+
+    def __init__(self, progress, folders: int) -> None:  # noqa: ANN001
+        self._progress = progress
+        self._folders = progress.add_task("folders", total=folders)
+        self._folder = progress.add_task("waiting", total=None)
+        self._messages = progress.add_task("messages", total=None)
+        #: Grows as folders are opened. The alternative is knowing the whole mailbox up
+        #: front, which means selecting all 187 folders before reading any of them.
+        self._known = 0
+
+    def folder_started(self, container: str, messages: int) -> None:
+        self._known += messages
+        self._progress.reset(self._folder, total=messages, description=container)
+        self._progress.update(self._messages, total=self._known)
+
+    def messages_absorbed(self, count: int) -> None:
+        self._progress.advance(self._folder, count)
+        self._progress.advance(self._messages, count)
+
+    def folder_finished(self, report) -> None:  # noqa: ANN001
+        self._progress.advance(self._folders)
+        if report.identity_broken:
+            self._progress.console.print(
+                f"[red]{report.container}: RECREATED — {report.suggestions_killed} "
+                "suggestion(s) died with it[/red]"
+            )
+        elif report.added or report.updated or report.vanished:
+            self._progress.console.print(
+                f"{report.container}: +{report.added} ~{report.updated} -{report.vanished}"
+            )
+
+
 @main.command()
 @click.option("--account", "account_name", default=None)
 @click.option(
@@ -217,29 +323,29 @@ def sync(ctx: click.Context, account_name: str | None, force_full: bool) -> None
             stmt = stmt.where(m.Account.name == account_name)
         for account in scope.scalars(stmt):
             with service.backend(account) as backend:
-                for container in sync_module.discover_containers(scope, account, backend):
-                    if not container.selectable:
-                        continue
-                    report = sync_module.sync_container(
-                        scope, account, container, backend, force_full=force_full
-                    )
-                    if report.identity_broken:
-                        click.secho(
-                            f"{container.name}: RECREATED — {report.suggestions_killed} "
-                            "suggestion(s) died with it",
-                            fg="red",
+                folders = [
+                    c
+                    for c in sync_module.discover_containers(scope, account, backend)
+                    if c.selectable
+                ]
+                with sync_display(len(folders)) as display:
+                    for container in folders:
+                        report = sync_module.sync_container(
+                            scope,
+                            account,
+                            container,
+                            backend,
+                            force_full=force_full,
+                            progress=display,
                         )
-                    elif report.added or report.updated or report.vanished:
-                        click.echo(
-                            f"{container.name}: +{report.added} ~{report.updated} "
-                            f"-{report.vanished}"
-                        )
-                    # Per folder, not per account.  A first sync of a real mailbox is
-                    # long, and one transaction around the whole of it holds SQLite's
-                    # write lock for the duration — which every other request then waits
-                    # on and gives up.  It also made the whole sync all-or-nothing, so
-                    # interrupting an hour of fetching threw the hour away.
-                    scope.commit()
+                        display.folder_finished(report)
+                        # Per folder, not per account.  A first sync of a real mailbox is
+                        # long, and one transaction around the whole of it holds SQLite's
+                        # write lock for the duration — which every other request then
+                        # waits on and gives up.  It also made the whole sync
+                        # all-or-nothing, so interrupting an hour of fetching threw the
+                        # hour away.
+                        scope.commit()
     service.close()
 
 
