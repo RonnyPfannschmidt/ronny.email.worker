@@ -22,12 +22,12 @@ told.
 
 ## What you should see
 
-`sync` reports `INBOX: +6 ~0 -0`, and the cache holds the corpus with its special-use
+`sync` reports `INBOX: +9 ~0 -0`, and the cache holds the corpus with its special-use
 folders recognised:
 
 ```
 containers: Archive(None) Drafts(drafts) INBOX(None) Sent(sent) Trash(trash)
-findings:   display_name_spoofs_address 1, first_contact 6, malformed_mime 1, no_message_id 1
+findings:   display_name_spoofs_address 1, first_contact 9, malformed_mime 1, no_message_id 1
 ```
 
 `probe` reports the account `ok`, then lists twenty-seven capabilities Dovecot offers that
@@ -35,10 +35,13 @@ the account does not declare. That direction is informational. The other one is 
 
 Point a client at it with `uv run mailmindctl mcp --producer mail-agent`
 ([Connecting a client](connecting.md)), propose a delete, accept it in the UI: the message
-lands in the server's own Trash and five are left in INBOX. Nothing expunges.
+lands in the server's own Trash and eight are left in INBOX. Nothing expunges.
 
-Six messages is not an untended mailbox, which is the honest limit of this corpus — whether
-a bundle stays reviewable at hundreds is still an open question.
+Nine messages is not an untended mailbox, which is the honest limit of this corpus — whether
+a bundle stays reviewable at hundreds is still an open question. What the nine are is
+deliberate: a display name claiming an address it is not from, an instruction-shaped body, a
+truncated MIME part, a message with no `Message-ID`, and three carrying 8-bit bytes in their
+address headers — the last of which used to end a sync outright.
 
 ## Take it away
 

@@ -121,13 +121,13 @@ connection, from outside, exactly as the container tier's `out_of_band` fixture 
 
 ## What you should see
 
-Recorded in [Getting started](../test-drive.md#what-you-should-see), because it is the
-thing somebody checks their own run against: six messages, the special-use folders
-recognised, four findings, and a probe that is loud in one direction and quiet in the
+Recorded in [Test drive](../test-drive.md#what-you-should-see), because it is the
+thing somebody checks their own run against: nine messages, the special-use folders
+recognised, the findings, and a probe that is loud in one direction and quiet in the
 other.
 
 Proposing a delete over MCP and accepting it in the UI moves the message into the server's
-own Trash and leaves five in INBOX. Nothing expunges: [01](01-intent.md) says mail has no
+own Trash and leaves eight in INBOX. Nothing expunges: [01](01-intent.md) says mail has no
 undo, and this is the one place that could prove it.
 
 ## Meets
@@ -152,7 +152,7 @@ undo, and this is the one place that could prove it.
 - Is a checked-in `mailmind.dev.toml` a convenience or a footgun? It is one edit away from
   somebody committing their own host, and the thing protecting them is that a different
   filename is gitignored.
-- Six messages is not an untended mailbox. [09](09-iteration-one.md)'s real question —
+- Nine messages is not an untended mailbox. [09](09-iteration-one.md)'s real question —
   whether a bundle stays reviewable at hundreds — needs a corpus this seeder cannot supply
   by hand. Generate one, or capture a real one?
 - The container tier and this loop start the same image separately. One fixture, or is

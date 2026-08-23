@@ -136,6 +136,24 @@ def _decode(part: EmailMessage) -> str:
         return payload.decode("utf-8", "replace")
 
 
+def _storable(text: str) -> str:
+    """Header text with its 8-bit bytes turned back into characters, or into U+FFFD.
+
+    ``email.headerregistry`` decodes 8-bit bytes in *address* headers with
+    ``surrogateescape``, so what comes back can hold lone surrogates.  Those are not text:
+    SQLite refuses them, and a sync that was only caching somebody's mail dies on the
+    folder that holds one.  Re-encoding recovers the character the bytes meant where they
+    were UTF-8 — a non-ASCII domain arrives as one surrogate per byte — and leaves U+FFFD
+    only where they were never anything else.  Subjects come out of ``policy.default``
+    already replaced; addresses are the header class that does not.
+    """
+    try:
+        text.encode("utf-8")
+    except UnicodeEncodeError:
+        return text.encode("utf-8", "surrogateescape").decode("utf-8", "replace")
+    return text
+
+
 def _addresses(message: EmailMessage, header: str) -> list[tuple[str, str | None]]:
     out: list[tuple[str, str | None]] = []
     try:
@@ -145,12 +163,17 @@ def _addresses(message: EmailMessage, header: str) -> list[tuple[str, str | None
         for addr in getattr(value, "addresses", ()) or ():
             assert isinstance(addr, Address)
             if addr.addr_spec:
-                out.append((addr.addr_spec.lower(), addr.display_name or None))
+                out.append(
+                    (
+                        _storable(addr.addr_spec.lower()),
+                        _storable(addr.display_name) if addr.display_name else None,
+                    )
+                )
     except Exception:
         # A header that will not parse is not a reason to lose the rest of the message.
         for name, addr in email.utils.getaddresses([str(message.get(header, ""))]):
             if addr:
-                out.append((addr.lower(), name or None))
+                out.append((_storable(addr.lower()), _storable(name) if name else None))
     return out
 
 
@@ -206,9 +229,10 @@ def parse_message(raw: bytes) -> ParsedMessage:
                 content_type not in ("text/plain", "text/html") and disposition != "inline"
             ):
                 payload = part.get_payload(decode=True) or b""
+                filename = part.get_filename()
                 attachments.append(
                     Attachment(
-                        filename=part.get_filename(),
+                        filename=_storable(filename) if filename else None,
                         content_type=content_type,
                         size=len(payload),
                     )
@@ -251,7 +275,7 @@ def parse_message(raw: bytes) -> ParsedMessage:
     def header(name: str) -> str | None:
         try:
             value = message.get(name)
-            return str(value) if value is not None else None
+            return _storable(str(value)) if value is not None else None
         except Exception:  # noqa: BLE001
             return None
 

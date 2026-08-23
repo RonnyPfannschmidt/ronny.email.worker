@@ -510,19 +510,20 @@ def test_a_date_window_cuts_where_it_says_it_does(client):
     def window(**kwargs):
         return agent.call("list_messages", container_id=inbox["id"], **kwargs)
 
-    # The corpus runs one message a day from 2026-08-17 09:00Z. The 19th is a real
-    # message sitting exactly on the boundary below.
+    # The corpus starts at 2026-08-17 09:00Z with two messages before the 19th, which is a
+    # real message sitting exactly on the boundary below. Everything else is counted
+    # against the corpus rather than written down, so adding a message to it stays a
+    # one-file change.
+    older = 2
     boundary = "2026-08-19T09:00:00Z"
-    assert window(before=boundary)["total_matching"] == 2, "before must exclude its edge"
-    assert window(since=boundary)["total_matching"] == 4, "since must include its edge"
-    assert (
-        window(before=boundary)["total_matching"] + window(since=boundary)["total_matching"]
-        == len(CORPUS)
+    assert window(before=boundary)["total_matching"] == older, "before must exclude its edge"
+    assert window(since=boundary)["total_matching"] == len(CORPUS) - older, (
+        "since must include its edge"
     )
 
     # A bare date means midnight, so the whole of the 19th is still to come.
-    assert window(before="2026-08-19")["total_matching"] == 2
-    assert window(since="2026-08-19")["total_matching"] == 4
+    assert window(before="2026-08-19")["total_matching"] == older
+    assert window(since="2026-08-19")["total_matching"] == len(CORPUS) - older
 
     # An offset is honoured rather than ignored: 11:00+02:00 is 09:00Z.
     assert window(before="2026-08-19T11:00:00+02:00")["total_matching"] == 2

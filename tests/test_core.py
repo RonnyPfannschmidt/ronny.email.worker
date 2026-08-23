@@ -209,6 +209,39 @@ def test_malformed_mime_is_marked_not_treated_as_empty(scope, world):
     assert message.parse_status is not m.ParseStatus.ok
 
 
+@pytest.mark.parametrize(
+    ("name", "expected"),
+    [
+        # Latin-1 bytes were never UTF-8, so the character is gone and U+FFFD is honest.
+        ("eight_bit_display_name", "H\ufffdndler"),
+        ("unknown_8bit_word", "H\ufffdndler"),
+    ],
+)
+def test_eight_bit_bytes_in_a_display_name_are_cached_rather_than_fatal(
+    scope, world, name, expected
+):
+    """The whole sync used to die here, on the folder rather than on the message.
+
+    `email.headerregistry` decodes 8-bit bytes in address headers with surrogateescape,
+    SQLite refuses to store a lone surrogate, and a mailbox with 187 folders synced none of
+    them because the first one held a shop's name in Latin-1.
+    """
+    message = scope.get(m.Message, world["seed"][name])
+    assert message.from_display == expected
+    message.from_display.encode("utf-8")  # what the exception was raised by
+
+
+def test_utf_8_in_a_domain_survives_as_the_character_it_was(scope, world):
+    """The case seen in the wild, and the reason this replaces rather than drops.
+
+    Those bytes *were* UTF-8 — one surrogate per byte of a two-byte character — so putting
+    them back through utf-8 recovers the address somebody actually wrote.
+    """
+    message = scope.get(m.Message, world["seed"]["non_ascii_domain"])
+    assert message.from_address == "hallo@gr\u00fc\u00dfe.example"
+    assert message.from_display == "Gr\u00fc\u00dfe"
+
+
 def test_an_incremental_sync_sees_an_out_of_band_flag_change(scope, world, backend):
     backend.out_of_band_mutate_flags("INBOX", world["uids"]["ordinary"], (r"\Seen",))
     report = sync.sync_container(scope, world["account"], world["containers"]["INBOX"], backend)

@@ -68,4 +68,35 @@ CORPUS: dict[str, bytes] = {
         b"\r\n"
         b"first part and then the boundary never closes\r\n"
     ),
+    # Three ways 8-bit bytes reach an address header, which is the one header class
+    # `policy.default` hands back with surrogates in it rather than U+FFFD. Each of these
+    # ended a sync before `_storable`: SQLite will not store a lone surrogate, and the
+    # folder holding one took the whole account down with it.
+    "eight_bit_display_name": (
+        b'From: "H\xe4ndler" <shop@example.net>\r\n'
+        b"To: me@example.org\r\n"
+        b"Subject: Your order\r\n"
+        b"Date: Sun, 23 Aug 2026 09:00:00 +0000\r\n"
+        b"Message-ID: <8bit@example.net>\r\n"
+        b"\r\n"
+        b"Latin-1 bytes, unencoded, in the display name.\r\n"
+    ),
+    "unknown_8bit_word": (
+        b"From: =?unknown-8bit?Q?H=E4ndler?= <shop2@example.net>\r\n"
+        b"To: me@example.org\r\n"
+        b"Subject: Your other order\r\n"
+        b"Date: Sun, 23 Aug 2026 10:00:00 +0000\r\n"
+        b"Message-ID: <unknown8bit@example.net>\r\n"
+        b"\r\n"
+        b"An encoded word whose charset says it is not known.\r\n"
+    ),
+    "non_ascii_domain": (
+        b"From: Gr\xc3\xbc\xc3\x9fe <hallo@gr\xc3\xbc\xc3\x9fe.example>\r\n"
+        b"To: me@example.org\r\n"
+        b"Subject: Hallo\r\n"
+        b"Date: Sun, 23 Aug 2026 11:00:00 +0000\r\n"
+        b"Message-ID: <umlautdomain@example.net>\r\n"
+        b"\r\n"
+        b"UTF-8 in the domain, which is where this was found in the wild.\r\n"
+    ),
 }
