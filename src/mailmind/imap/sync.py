@@ -262,6 +262,12 @@ def fetch_and_cache_body(
     cache.record_mechanical_assessment(scope, message, parsed)
     if account.cache_bodies:
         cache.cache_body(scope, message, parsed)
+        # A preview is body text, so it cannot exist before the body does — a sync sees
+        # headers only. Nothing used to set it afterwards either, so every preview in
+        # every listing was empty and the search index's preview column held nothing,
+        # while the tool describing it promised subjects, senders *and* previews.
+        message.preview = parsed.preview
+        cache.index_message(scope, message)
         scope.flush()
         cache.evict_bodies(scope, budget_bytes)
     return parsed.body_text

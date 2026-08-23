@@ -159,12 +159,69 @@ def count_search_messages(
     return int(scope.session.execute(sa.text(sql), params).scalar_one())
 
 
+#: The three FTS5 operators a person might reasonably type. Everything else in a query is
+#: text to look for, including the punctuation that makes an address an address.
+_OPERATORS = frozenset({"AND", "OR", "NOT"})
+
+
+def fts_query(text: str) -> str | None:
+    """Turn what somebody typed into something FTS5 will accept.
+
+    An agent searching a mailbox types an address, a domain, a URL — `alice@example.com`,
+    `list.example`, `https://…` — and every one of those was a syntax error, because the
+    query went to MATCH as written and FTS5 reads `@`, `.`, `:`, `-` and `"` as syntax. An
+    error is the worst possible answer here: the caller cannot tell a broken query from a
+    mailbox with nothing in it, and a model has no way to know what to fix.
+
+    So a query is words rather than a language. Each whitespace-separated chunk becomes a
+    quoted phrase — quoted, FTS5 tokenizes the punctuation away and matches the words in
+    order, which is exactly what searching for an address means — and a trailing ``*``
+    still asks for a prefix. ``AND``, ``OR`` and ``NOT`` in capitals are kept as operators,
+    because somebody typing those means them; anywhere they would leave the expression
+    dangling they are dropped instead of failing.
+
+    Returns None when there is nothing left to search for, which is not an error either.
+    """
+    parts: list[str] = []
+    for chunk in text.split():
+        if chunk in _OPERATORS:
+            # An operator with nothing to its left, or following another operator, is not
+            # an operator: it is a word somebody typed at the start of a sentence.
+            if parts and parts[-1] not in _OPERATORS:
+                parts.append(chunk)
+            continue
+        prefix = chunk.endswith("*")
+        body = chunk[:-1] if prefix else chunk
+        body = body.replace('"', '""')
+        if not body.strip():
+            continue
+        if parts and parts[-1] not in _OPERATORS:
+            parts.append("AND")
+        parts.append(f'"{body}"' + ("*" if prefix else ""))
+    while parts and parts[-1] in _OPERATORS:
+        parts.pop()
+    return " ".join(parts) or None
+
+
 def _search_where(
     scope: TenantScope, query: str, account_ids: set[int] | None
 ) -> tuple[str | None, dict[str, object]]:
-    """The clause both of those share, so that the count counts what the search searched."""
-    where = "message_fts MATCH :q AND tenant_id = :tid"
-    params: dict[str, object] = {"q": query, "tid": scope.tenant_id}
+    """The clause both of those share, so that the count counts what the search searched.
+
+    A message the cache still holds but no folder still shows — expunged, or in a folder
+    that was recreated — is left in the index and excluded here. Otherwise the count says
+    forty and the listing hands back thirty, and the difference reads as truncation.
+    """
+    prepared = fts_query(query)
+    if prepared is None:
+        return None, {}
+    where = (
+        "message_fts MATCH :q AND tenant_id = :tid AND EXISTS ("
+        "  SELECT 1 FROM placement p JOIN container c ON c.id = p.container_id"
+        "  WHERE p.message_id = message_fts.message_id"
+        "    AND p.gone_at IS NULL AND p.container_generation = c.generation)"
+    )
+    params: dict[str, object] = {"q": prepared, "tid": scope.tenant_id}
     if account_ids is not None:
         if not account_ids:
             # An empty set means no mail rather than all of it.

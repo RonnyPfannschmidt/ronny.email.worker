@@ -72,6 +72,11 @@ The whole surface is in [the reference](reference/mcp.md), rendered from the ser
 
 Whatever the client, four things carry:
 
+- **Search is words, not syntax, and shallow until bodies arrive.** An address, a domain
+  or a URL searches for itself rather than failing on punctuation, and every word has to
+  appear. What it looks at is subjects, senders and previews — and a preview exists only
+  once something has fetched that message's body, so a folder nobody has opened is
+  searchable by who wrote it and what it is called, not yet by what it says.
 - **Summarise before enumerating.** `summarize_senders` answers in one call what listing
   thousands of messages would. Every observation is capped by `max_messages_per_request`
   and comes back in one envelope — `returned`, `total_matching`, `truncated`, `note` — so

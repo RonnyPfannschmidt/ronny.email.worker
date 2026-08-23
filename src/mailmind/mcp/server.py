@@ -181,6 +181,14 @@ def build_server(service: Service, *, review_url: str | None = None) -> MCPServe
     def search_messages(query: str, account_id: int | None = None, limit: int = 50) -> dict:
         """Full-text search over the local cache of subjects, senders and previews.
 
+        A query is words, not a query language: `alice@example.com`, `list.example` and
+        `https://…` all search for what they say rather than failing on punctuation. Every
+        word has to appear; a trailing `*` matches a prefix; AND, OR and NOT in capitals
+        mean what they look like.
+
+        A preview exists once a body has been fetched, so a message nobody has opened is
+        searchable by subject and sender and not yet by what it says.
+
         Bounded the way list_messages is: more matches than the limit returns fewer and
         says how many matched.
         """
