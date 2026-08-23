@@ -11,8 +11,11 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import sqlalchemy as sa
 from alembic import command
 from alembic.config import Config
+from alembic.runtime.migration import MigrationContext
+from alembic.script import ScriptDirectory
 
 MIGRATIONS = Path(__file__).parent / "migrations"
 
@@ -32,3 +35,41 @@ def upgrade_to_head(url: str) -> None:
 
 def downgrade_to(url: str, revision: str) -> None:
     command.downgrade(alembic_config(url), revision)
+
+
+class SchemaBehind(Exception):
+    """The database was built by an older version of this code than is running."""
+
+
+def current_revision(url: str) -> str | None:
+    engine = sa.create_engine(url)
+    try:
+        with engine.connect() as connection:
+            return MigrationContext.configure(connection).get_current_revision()
+    finally:
+        engine.dispose()
+
+
+def head_revision(url: str) -> str | None:
+    return ScriptDirectory.from_config(alembic_config(url)).get_current_head()
+
+
+def require_current_schema(url: str) -> None:
+    """Refuse to touch a database this code no longer matches.
+
+    The alternative is what happened: a service running from a checkout that had moved on,
+    a column the schema did not have, and a SQLAlchemy traceback in the middle of a sync
+    saying `no such column`. Which is true, and says nothing about what to do.
+
+    Migrating here instead would mean every command quietly rewriting somebody's mail
+    cache the first time it ran. `bootstrap` is where that happens, because it is the
+    command whose job is to make the database ready.
+    """
+    head = head_revision(url)
+    current = current_revision(url)
+    if current == head:
+        return
+    raise SchemaBehind(
+        f"this database is at {current or 'no revision'} and this build needs {head} — "
+        "run `mailmindctl bootstrap` to bring it up to date"
+    )

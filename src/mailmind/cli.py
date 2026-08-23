@@ -13,14 +13,27 @@ import sqlalchemy as sa
 
 from mailmind.config import ConfigError, load_config
 from mailmind.db import models as m
-from mailmind.db.migrate import upgrade_to_head
+from mailmind.db.migrate import SchemaBehind, require_current_schema, upgrade_to_head
 from mailmind.service import TENANT_ZERO, Service, hash_token, mint_token
 
 
-def _service(config_path: str | None, **overrides: object) -> Service:
+def _service(
+    config_path: str | None, *, needs_schema: bool = True, **overrides: object
+) -> Service:
+    """The service, and a refusal to work against a database this build does not match.
+
+    Every command but `bootstrap` asks for the schema it was written against. Without
+    that, a checkout that has moved on meets the old schema at the first query and says
+    `no such column` from somewhere in the middle of a sync.
+    """
     config = load_config(Path(config_path)) if config_path else load_config()
     if overrides:
         config = attrs.evolve(config, **overrides)
+    if needs_schema:
+        try:
+            require_current_schema(config.database_url)
+        except SchemaBehind as exc:
+            raise click.ClickException(str(exc)) from exc
     return Service(config)
 
 
@@ -75,8 +88,12 @@ def review(ctx: click.Context, open_it: bool, port: int | None) -> None:
 @main.command()
 @click.pass_context
 def bootstrap(ctx: click.Context) -> None:
-    """Create tenant zero's accounts from configuration, and a token for an agent."""
-    service = _service(ctx.obj["config_path"])
+    """Migrate the database, and create tenant zero's accounts from configuration.
+
+    The one command that may meet a database older than itself, because bringing it up to
+    date is what it is for.
+    """
+    service = _service(ctx.obj["config_path"], needs_schema=False)
     upgrade_to_head(service.config.database_url)
 
     with service.scope(TENANT_ZERO) as scope:

@@ -7,10 +7,18 @@ version of the code, where getting it wrong means quietly rewriting somebody's m
 
 from __future__ import annotations
 
+import pytest
 import sqlalchemy as sa
 from alembic import command
 
-from mailmind.db.migrate import alembic_config, upgrade_to_head
+from mailmind.db.migrate import (
+    SchemaBehind,
+    alembic_config,
+    current_revision,
+    head_revision,
+    require_current_schema,
+    upgrade_to_head,
+)
 
 #: One of each shape the old parser could leave behind, plus the one it could not.
 BEFORE = [
@@ -79,3 +87,28 @@ def test_the_phantom_attachment_is_undone_and_nothing_else_is(tmp_path):
     assert after["maybe-real"] == ("partial", 0), "a defect with no attachment is not this bug"
     assert after["single-part"] == ("ok", 1), "headers can describe a real attachment"
     assert after["judged"] == ("partial", 1), "a verdict passed on the whole message stands"
+
+
+def test_a_database_older_than_the_code_is_refused_with_what_to_run(tmp_path):
+    """What used to happen instead: `sqlalchemy.exc.OperationalError: no such column:
+    message.parse_detail`, from the middle of a sync, in a service running out of a
+    checkout that had moved on while it was up. True, and no help.
+    """
+    url = f"sqlite:///{tmp_path / 'behind.db'}"
+    command.upgrade(alembic_config(url), "0003detail")
+
+    with pytest.raises(SchemaBehind) as behind:
+        require_current_schema(url)
+    assert "0003detail" in str(behind.value), "say where it is"
+    assert head_revision(url) in str(behind.value), "and where it should be"
+    assert "mailmindctl bootstrap" in str(behind.value), "and what to do about it"
+
+    upgrade_to_head(url)
+    require_current_schema(url)
+    assert current_revision(url) == head_revision(url)
+
+
+def test_a_database_that_does_not_exist_yet_is_refused_the_same_way(tmp_path):
+    """A fresh install has no schema either, and `bootstrap` is equally the answer."""
+    with pytest.raises(SchemaBehind, match="no revision"):
+        require_current_schema(f"sqlite:///{tmp_path / 'absent.db'}")

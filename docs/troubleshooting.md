@@ -34,6 +34,12 @@ attachment of type `multipart/mixed`. Fixed at the source, and a migration undoe
 place: no re-download, because the combination of both flags with no cached body is
 diagnostic of the bug rather than of the mail.
 
+**"this database is at 0002choice and this build needs 0004phantom".** The code moved on
+and the database did not — which is ordinary when mailmind is run from a checkout that
+`git pull` updates under a running service. `mailmindctl bootstrap` migrates it; nothing
+else does, so that no command quietly rewrites a mail cache the first time it runs. Stop
+the service first if one is running.
+
 **`probe` fails.** The account declares a capability the server does not offer. Fix the
 declaration rather than working around the probe: it decides what the service attempts. The
 twenty-odd it prints in the other direction are informational.

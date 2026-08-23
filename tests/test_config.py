@@ -306,7 +306,11 @@ def test_a_command_line_override_reaches_the_configuration(tmp_path):
     """
     from mailmind.cli import _service
 
-    service = _service(str(write(tmp_path, CONFIG)), bind="192.0.2.10", port=9000)
+    # No schema check: this is about the configuration reaching the service, and there is
+    # no database here to have a schema.
+    service = _service(
+        str(write(tmp_path, CONFIG)), needs_schema=False, bind="192.0.2.10", port=9000
+    )
     assert (service.config.bind, service.config.port) == ("192.0.2.10", 9000)
 
 
