@@ -18,6 +18,7 @@ import socket
 import stat
 import subprocess
 import sys
+import time
 import urllib.error
 import urllib.request
 
@@ -261,6 +262,44 @@ def test_serve_brings_the_review_ui_up_for_the_life_of_the_session(workspace):
     with socket.socket() as probe:
         probe.settimeout(2)
         assert probe.connect_ex((host, int(port))) != 0, "the review UI outlived the session"
+
+
+def test_serve_keeps_the_key_out_of_a_log_and_says_where_it_left_it(workspace):
+    """`serve` prints the link for a person at a terminal. Under systemd there is none.
+
+    A unit that sends stdout to the journal would put the login key in it, and one that
+    sends stdout to /dev/null — which is what a unit written against the old behaviour does
+    — left nothing at all to go on. So when stdout is not a terminal the key stays in the
+    file it is written to anyway, and stderr gets the path.
+    """
+    proc = subprocess.Popen(
+        [sys.executable, "-m", "mailmind.cli", "--config", str(workspace["config"]), "serve"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    from mailmind.web.app import link_path
+
+    left = link_path(workspace["port"])
+    try:
+        deadline = time.monotonic() + 30
+        while not left.exists() and time.monotonic() < deadline:  # pragma: no branch
+            assert proc.poll() is None, "serve exited before it served"
+            time.sleep(0.1)
+        assert left.exists(), "no link was left anywhere a person could find it"
+        assert stat.S_IMODE(left.stat().st_mode) == 0o600
+        link = left.read_text().strip()
+        key = link.partition("?key=")[2]
+        assert key, "the link that was left does not open anything"
+    finally:
+        proc.terminate()
+        stdout, stderr = proc.communicate(timeout=20)
+        left.unlink(missing_ok=True)
+
+    assert key not in stdout and key not in stderr, "the key reached something that keeps it"
+    assert str(left) in stderr, "nothing said where the link was left"
+    assert "mailmindctl review --open" in stderr, "nothing said how to follow it"
+    assert "sandbox the agent" in stderr, "no warning about what a local deployment is"
 
 
 @pytest.mark.parametrize(

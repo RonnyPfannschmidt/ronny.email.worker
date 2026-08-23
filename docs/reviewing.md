@@ -7,6 +7,10 @@ Where a proposal becomes a change, and the one step that cannot be skipped.
 `mailmindctl serve` prints a link with the login key in it. Open it once: the key becomes a
 session cookie and leaves the address bar.
 
+`serve` prints it only to a terminal. Redirected, or run as a systemd unit, there is
+nobody reading and something keeping, so the key stays in its file and stderr gets the path
+instead — which is what the journal then shows.
+
 When the UI belongs to a `mailmindctl mcp --serve` session, the link is **not** printed —
 clients collect that process's stderr into a log, and some show the log to the model. It
 goes to a file only you can read, and stderr gets the path. `mailmindctl review --open`

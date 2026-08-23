@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import sys
 from pathlib import Path
 
 import attrs
@@ -424,16 +425,28 @@ def serve(ctx: click.Context, host: str | None, port: int | None) -> None:
 
     where = f"http://{service.config.bind}:{service.config.port}"
     link = f"{where}/?key={session_key}"
-    leave_the_link(service.config.port, link)
-    # Printed here, unlike the stdio mode: this command is one a person runs in their own
-    # terminal, and its output is not collected into anybody's agent log.
-    click.echo(f"review UI  {link}")
-    click.echo("           open that link once — it is the login, and nothing")
-    click.echo("           connecting over MCP is given it.")
-    click.echo(LOCAL_WARNING)
+    left_at = leave_the_link(service.config.port, link)
+    #: Is there a person reading this, or a log keeping it? The key goes to the first and
+    #: never to the second.
+    a_terminal = sys.stdout.isatty()
+    if a_terminal:
+        # Printed in full, unlike the stdio mode: this is a command a person runs in their
+        # own terminal, and a terminal is not collected into anybody's log.
+        click.echo(f"review UI  {link}")
+        click.echo("           open that link once — it is the login, and nothing")
+        click.echo("           connecting over MCP is given it.")
+    else:
+        # Under systemd or a redirect there is no person reading this, and whatever is
+        # reading it keeps what it reads. So the key stays in the file it was already
+        # written to, and what goes out is where to find it — on stderr, because a unit
+        # that sends stdout to /dev/null is the ordinary way to run this.
+        click.echo(f"review UI  {where}/", err=True)
+        click.echo(f"           the link that opens it is in {left_at}", err=True)
+        click.echo("           `mailmindctl review --open` follows it for you", err=True)
+    click.echo(LOCAL_WARNING, err=not a_terminal)
     # The trailing slash is not decoration: the endpoint is mounted at /mcp/ and a POST to
     # /mcp gets a 307, which an MCP client is entitled to follow and may not.
-    click.echo(f"MCP        {where}/mcp/")
+    click.echo(f"MCP        {where}/mcp/", err=not a_terminal)
     uvicorn.run(app, host=service.config.bind, port=service.config.port)
 
 
