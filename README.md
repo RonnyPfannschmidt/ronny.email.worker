@@ -41,8 +41,8 @@ uv run dev/seed_mailbox.py
 
 export MAILMIND_CONFIG=mailmind.dev.toml MAILMIND_DEV_PASSWORD=secret
 uv run mailmindctl bootstrap && uv run mailmindctl probe && uv run mailmindctl sync
-uv run mailmindctl grant --producer opencode   # prints a bearer token, once
-uv run mailmindctl serve                       # prints a link with the login key in it
+uv run mailmindctl grant --producer opencode   # a bearer token, printed once
+uv run mailmindctl serve                       # a link with the login key in it
 ```
 
 An MCP client can also spawn its own connection over a pipe: `mailmindctl mcp` speaks MCP

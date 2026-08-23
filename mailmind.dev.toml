@@ -26,6 +26,6 @@ caps = ["CONDSTORE", "MOVE", "UIDPLUS", "SPECIAL-USE", "IDLE"]
 [accounts.dev.login]
 username = "me@example.org"
 # env:// here and nowhere else: this is a container's throwaway password, not a secret.
-# For a mailbox that matters, see docs/configuration.md — secret-storage:// at a desk,
+# For a mailbox that matters, see docs/reference/configuration.md — secret-storage:// at a desk,
 # file:// on a headless box, and env:// on neither.
 password = "env://MAILMIND_DEV_PASSWORD"

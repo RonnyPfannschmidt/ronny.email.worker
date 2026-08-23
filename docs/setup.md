@@ -24,7 +24,7 @@ cp mailmind.toml.example ~/.config/mailmind/mailmind.toml
 
 Edit the host and username, and decide where the password lives — the one part of this that
 is not mechanical. [Configuration](reference/configuration.md#where-the-password-lives) lays
-out the three schemes. The file never holds a password, only a URL saying where one is.
+out the four schemes. The file never holds a password, only a URL saying where one is.
 
 ```
 mailmindctl bootstrap    # migrate, and write the account into a row

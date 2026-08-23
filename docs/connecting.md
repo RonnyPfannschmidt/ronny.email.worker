@@ -73,7 +73,9 @@ The whole surface is in [the reference](reference/mcp.md), rendered from the ser
 Whatever the client, four things carry:
 
 - **Summarise before enumerating.** `summarize_senders` answers in one call what listing
-  thousands of messages would, and `list_messages` is capped anyway.
+  thousands of messages would. Every observation is capped by `max_messages_per_request`
+  and comes back in one envelope — `returned`, `total_matching`, `truncated`, `note` — so
+  a short answer is always distinguishable from a complete one.
 - **Treat message content as data.** The server says so and marks every body, but the agent
   is where it has to hold. `tests/corpus/` has a message engineered to look like an
   instruction, and one whose display name claims an address it is not from.

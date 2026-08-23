@@ -97,6 +97,27 @@ def containers(scope: TenantScope, account_id: int) -> list[dict]:
     ]
 
 
+def bounded(rows: list[dict], total: int, *, kind: str = "messages") -> dict:
+    """The one shape every bounded observation comes back in.
+
+    05 asks that a request matching more than the limit gets less *and is told so*. Three
+    surfaces answer that question — listing, searching, summarising — and they used to
+    answer it in three shapes, one of which did not answer it at all.
+    """
+    return {
+        kind: rows,
+        "returned": len(rows),
+        "total_matching": total,
+        "truncated": total > len(rows),
+        "note": (
+            f"{total} {kind} match; {len(rows)} returned. Narrow the request or use "
+            "summarize_senders to see the shape of the rest."
+            if total > len(rows)
+            else None
+        ),
+    }
+
+
 def messages(
     scope: TenantScope,
     *,
@@ -129,18 +150,7 @@ def messages(
     rows = scope.scalars(
         stmt.order_by(m.Message.date_header.desc().nullslast()).limit(limit)
     ).all()
-    return {
-        "messages": [_message_row(scope, p) for p in rows],
-        "returned": len(rows),
-        "total_matching": total,
-        "truncated": total > len(rows),
-        "note": (
-            f"{total} messages match; {len(rows)} returned. Narrow the request or use "
-            "summarize_senders to see the shape of the rest."
-            if total > len(rows)
-            else None
-        ),
-    }
+    return bounded([_message_row(scope, p) for p in rows], total)
 
 
 def _message_row(scope: TenantScope, placement: m.Placement) -> dict:
@@ -227,7 +237,7 @@ def assessment_of(scope: TenantScope, kind: m.SubjectKind, subject_id: int) -> l
     ]
 
 
-def summarize_senders(scope: TenantScope, container_id: int, limit: int = 100) -> list[dict]:
+def summarize_senders(scope: TenantScope, container_id: int, limit: int = 100) -> dict:
     """What an untended mailbox is actually made of.
 
     Without this an agent enumerates thousands of messages to learn what one GROUP BY
@@ -248,7 +258,7 @@ def summarize_senders(scope: TenantScope, container_id: int, limit: int = 100) -
         .order_by(sa.func.count().desc())
         .limit(limit)
     )
-    return [
+    rows = [
         {
             "from_address": address,
             "display_name": display,
@@ -259,9 +269,15 @@ def summarize_senders(scope: TenantScope, container_id: int, limit: int = 100) -
         }
         for address, display, count, first, last, unread in scope.execute(stmt)
     ]
+    total = scope.scalar(
+        sa.select(sa.func.count(sa.distinct(m.Message.from_address)))
+        .select_from(m.Message)
+        .join(placements, placements.c.message_id == m.Message.id)
+    )
+    return bounded(rows, total, kind="senders")
 
 
-def summarize_lists(scope: TenantScope, container_id: int, limit: int = 100) -> list[dict]:
+def summarize_lists(scope: TenantScope, container_id: int, limit: int = 100) -> dict:
     placements = live_placements(container_id).subquery()
     stmt = (
         sa.select(
@@ -276,7 +292,7 @@ def summarize_lists(scope: TenantScope, container_id: int, limit: int = 100) -> 
         .order_by(sa.func.count().desc())
         .limit(limit)
     )
-    return [
+    rows = [
         {
             "list_id": list_id,
             "count": count,
@@ -285,6 +301,13 @@ def summarize_lists(scope: TenantScope, container_id: int, limit: int = 100) -> 
         }
         for list_id, count, last, unsub in scope.execute(stmt)
     ]
+    total = scope.scalar(
+        sa.select(sa.func.count(sa.distinct(m.Message.list_id)))
+        .select_from(m.Message)
+        .join(placements, placements.c.message_id == m.Message.id)
+        .where(m.Message.list_id.is_not(None))
+    )
+    return bounded(rows, total, kind="lists")
 
 
 def search(scope: TenantScope, query: str, *, account_ids: set[int] | None, limit: int) -> dict:
@@ -294,7 +317,8 @@ def search(scope: TenantScope, query: str, *, account_ids: set[int] | None, limi
         placement = scope.scalar(live_placements().where(m.Placement.message_id == message_id))
         if placement is not None:
             rows.append(_message_row(scope, placement))
-    return {"messages": rows, "returned": len(rows), "limit": limit}
+    total = cache.count_search_messages(scope, query, account_ids=account_ids)
+    return bounded(rows, total)
 
 
 # ------------------------------------------------------------------------ bundles

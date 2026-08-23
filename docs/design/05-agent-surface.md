@@ -22,7 +22,10 @@ its own scope, cannot name a tenant, and cannot assert who it is — all of that
 before it says anything.
 
 Observation is bounded. A request that would return more than the limit gets less, and is told
-so, rather than silently returning a slice that looks complete.
+so, rather than silently returning a slice that looks complete. That is one rule and therefore
+one envelope: listing, searching and summarising all answer with `returned`, `total_matching`,
+`truncated` and a `note`. They did not, for a while — search returned no total and the
+summaries returned bare lists, which is exactly the slice that looks complete.
 
 ## Its prompt is its own business
 

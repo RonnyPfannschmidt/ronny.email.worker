@@ -136,17 +136,44 @@ def search_messages(
     cannot police.  ``None`` means every account of the tenant, which is the reviewer's
     view and never an agent's; an empty set means no mail rather than all of it.
     """
-    sql = "SELECT message_id FROM message_fts WHERE message_fts MATCH :q AND tenant_id = :tid"
-    params: dict[str, object] = {"q": query, "tid": scope.tenant_id, "limit": limit}
+    where, params = _search_where(scope, query, account_ids)
+    if where is None:
+        return []
+    params["limit"] = limit
+    sql = f"SELECT message_id FROM message_fts WHERE {where} ORDER BY rank LIMIT :limit"
+    return [row[0] for row in scope.session.execute(sa.text(sql), params)]
+
+
+def count_search_messages(
+    scope: TenantScope, query: str, *, account_ids: set[int] | None = None
+) -> int:
+    """How many the search matched, which is not how many it returned.
+
+    05 asks for an observation that never looks complete when it is not.  The message
+    listing has said so since it was written; this is the other half of the same promise.
+    """
+    where, params = _search_where(scope, query, account_ids)
+    if where is None:
+        return 0
+    sql = f"SELECT count(*) FROM message_fts WHERE {where}"
+    return int(scope.session.execute(sa.text(sql), params).scalar_one())
+
+
+def _search_where(
+    scope: TenantScope, query: str, account_ids: set[int] | None
+) -> tuple[str | None, dict[str, object]]:
+    """The clause both of those share, so that the count counts what the search searched."""
+    where = "message_fts MATCH :q AND tenant_id = :tid"
+    params: dict[str, object] = {"q": query, "tid": scope.tenant_id}
     if account_ids is not None:
         if not account_ids:
-            return []
+            # An empty set means no mail rather than all of it.
+            return None, params
         names = [f"aid{index}" for index, _ in enumerate(sorted(account_ids))]
         placeholders = ", ".join(f":{name}" for name in names)
-        sql += f" AND account_id IN ({placeholders})"
+        where += f" AND account_id IN ({placeholders})"
         params.update(dict(zip(names, sorted(account_ids), strict=True)))
-    sql += " ORDER BY rank LIMIT :limit"
-    return [row[0] for row in scope.session.execute(sa.text(sql), params)]
+    return where, params
 
 
 def record_mechanical_assessment(

@@ -541,12 +541,40 @@ def test_summarising_senders_is_one_call_not_an_enumeration(client):
         for c in agent.call("list_containers", account_id=account["id"])
         if c["name"] == "INBOX"
     )
-    senders = agent.call("summarize_senders", container_id=inbox["id"])
-    assert len(senders) == len(CORPUS)
+    summary = agent.call("summarize_senders", container_id=inbox["id"])
+    # Bounded like every other observation, and by the same configured limit: this fixture
+    # allows three, so what comes back is three of nine and says so.
+    assert summary["total_matching"] == len(_corpus_senders())
+    senders = summary["senders"]
     assert all(s["count"] >= 1 for s in senders)
+    assert {s["from_address"] for s in senders} <= _corpus_senders()
     lists = agent.call("summarize_lists", container_id=inbox["id"])
-    assert [entry["list_id"] for entry in lists] == ["Weekly <weekly.list.example>"]
-    assert lists[0]["has_unsubscribe"] is True
+    assert [entry["list_id"] for entry in lists["lists"]] == ["Weekly <weekly.list.example>"]
+    assert lists["lists"][0]["has_unsubscribe"] is True
+
+
+def test_a_summary_that_leaves_something_out_says_how_much(client):
+    """05 again: an observation must never look complete when it is not, and summarising
+    is an observation. It used to be the one that did not say."""
+    agent = Agent(client)
+    account = agent.call("list_accounts")[0]
+    inbox = next(
+        c
+        for c in agent.call("list_containers", account_id=account["id"])
+        if c["name"] == "INBOX"
+    )
+    summary = agent.call("summarize_senders", container_id=inbox["id"], limit=2)
+    assert summary["returned"] == 2
+    assert summary["total_matching"] > 2
+    assert summary["truncated"] is True
+    assert "senders match" in summary["note"]
+
+
+def _corpus_senders() -> set[str]:
+    """Every distinct From in the corpus, parsed the way the cache parses it."""
+    from mailmind.content.parse import parse_message
+
+    return {parse_message(raw).from_address for raw in CORPUS.values()}
 
 
 def test_a_message_arrives_marked_as_data(client):
@@ -577,12 +605,12 @@ def test_search_is_served_from_the_local_cache(client):
 def _propose(agent: Agent) -> dict:
     account = agent.call("list_accounts")[0]
     containers = {c["name"]: c for c in agent.call("list_containers", account_id=account["id"])}
-    senders = agent.call("summarize_senders", container_id=containers["INBOX"]["id"])
-    newsletter = next(s for s in senders if s["from_address"] == "news@list.example")
+    # Named rather than summarised for: this fixture caps observation at three, so the
+    # summary is legitimately truncated and the newsletter may not be in it.
     messages = agent.call(
         "list_messages",
         container_id=containers["INBOX"]["id"],
-        from_address=newsletter["from_address"],
+        from_address="news@list.example",
     )["messages"]
     return agent.call(
         "propose_bundle",

@@ -1,9 +1,9 @@
 """the account a person is working in
 
-Local review has no login, so there is nobody to look up: the reviewer is implicit and
-what a person chooses instead is which account they are looking at.  That choice is per
-person rather than per tenant, which is also the shape it needs on a deployment where
-several authenticated people share one.
+The review UI's login is a key rather than an identity, so there is nobody to look up: the
+reviewer is implicit, and what a person chooses instead is which account they are looking
+at.  That choice is per person rather than per tenant, which is also the shape it needs
+on a deployment where several authenticated people share one.
 
 Revision ID: 0002choice
 Revises: 0001initial

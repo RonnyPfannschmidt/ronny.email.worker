@@ -179,7 +179,11 @@ def build_server(service: Service, *, review_url: str | None = None) -> MCPServe
 
     @server.tool()
     def search_messages(query: str, account_id: int | None = None, limit: int = 50) -> dict:
-        """Full-text search over the local cache of subjects, senders and previews."""
+        """Full-text search over the local cache of subjects, senders and previews.
+
+        Bounded the way list_messages is: more matches than the limit returns fewer and
+        says how many matched.
+        """
         grant = _require(m.Capability.observe)
         with scope() as s:
             if account_id is not None:
@@ -238,24 +242,32 @@ def build_server(service: Service, *, review_url: str | None = None) -> MCPServe
             return views.message_detail(s, message_id, include_body=True)
 
     @server.tool()
-    def summarize_senders(container_id: int, limit: int = 100) -> list[dict]:
+    def summarize_senders(container_id: int, limit: int = 100) -> dict:
         """Who a folder is from: counts, unread counts and date ranges per sender.
 
         Start here on a large mailbox. It answers in one call what enumerating thousands
         of messages would.
+
+        Bounded like everything else here: more senders than the limit returns fewer and
+        says how many there were.
         """
         grant = _require(m.Capability.observe)
+        cap = service.config.limits.max_messages_per_request
         with scope() as s:
             _container(s, grant, container_id)
-            return views.summarize_senders(s, container_id, limit=limit)
+            return views.summarize_senders(s, container_id, limit=min(limit, cap))
 
     @server.tool()
-    def summarize_lists(container_id: int, limit: int = 100) -> list[dict]:
-        """Mailing lists and bulk senders in a folder, by List-Id."""
+    def summarize_lists(container_id: int, limit: int = 100) -> dict:
+        """Mailing lists and bulk senders in a folder, by List-Id.
+
+        Bounded, and says so when it is.
+        """
         grant = _require(m.Capability.observe)
+        cap = service.config.limits.max_messages_per_request
         with scope() as s:
             _container(s, grant, container_id)
-            return views.summarize_lists(s, container_id, limit=limit)
+            return views.summarize_lists(s, container_id, limit=min(limit, cap))
 
     @server.tool()
     def request_sync(container_id: int) -> dict:
