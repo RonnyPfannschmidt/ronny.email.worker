@@ -401,6 +401,98 @@ def mcp_stdio(
         service.close()
 
 
+@main.group()
+def account() -> None:
+    """The accounts this mailmind knows about.
+
+    Adding one belongs in the review UI, because the ``account`` row is the source of
+    truth and the configuration is seed data for it.  Undoing a *seed* does not: a copy
+    of the example file, bootstrapped once, leaves an account behind that nothing else
+    here can remove and that the review UI goes on offering.
+    """
+
+
+@account.command("list")
+@click.pass_context
+def list_accounts(ctx: click.Context) -> None:
+    """What is in the database, and whether the configuration still asks for it."""
+    service = _service(ctx.obj["config_path"])
+    configured = {a.name for a in service.config.accounts}
+    with service.scope(TENANT_ZERO) as scope:
+        chosen = {
+            p.current_account_id
+            for p in scope.scalars(sa.select(m.Producer))
+            if p.current_account_id
+        }
+        for row in scope.scalars(sa.select(m.Account).order_by(m.Account.name)):
+            folders = scope.scalar(
+                sa.select(sa.func.count())
+                .select_from(m.Container)
+                .where(m.Container.account_id == row.id)
+            )
+            notes = []
+            if row.name not in configured:
+                notes.append("not in the configuration")
+            if row.id in chosen:
+                notes.append("being reviewed")
+            trailer = f"  ({', '.join(notes)})" if notes else ""
+            click.echo(
+                f"{row.name}  {row.username}@{row.host}:{row.port}  "
+                f"{row.health.value}  {folders} folder(s){trailer}"
+            )
+
+
+@account.command("forget")
+@click.argument("name")
+@click.pass_context
+def forget_account(ctx: click.Context, name: str) -> None:
+    """Remove an account this mailmind should never have had.
+
+    Only one it holds no mail for: there is no cascade behind this and dropping folders
+    and messages out from under a cache is not something to do in passing.
+    """
+    service = _service(ctx.obj["config_path"])
+    if any(a.name == name for a in service.config.accounts):
+        raise click.ClickException(
+            f"{name!r} is still named in the configuration, so `bootstrap` would seed it "
+            "again — take it out of the file first"
+        )
+    with service.scope(TENANT_ZERO) as scope:
+        row = scope.scalar(sa.select(m.Account).where(m.Account.name == name))
+        if row is None:
+            raise click.ClickException(f"no account named {name!r}")
+        folders = scope.scalar(
+            sa.select(sa.func.count())
+            .select_from(m.Container)
+            .where(m.Container.account_id == row.id)
+        )
+        if folders:
+            raise click.ClickException(
+                f"{name!r} holds {folders} cached folder(s); forgetting it would leave "
+                "them behind, and nothing here removes them yet"
+            )
+        for producer in scope.scalars(
+            sa.select(m.Producer).where(m.Producer.current_account_id == row.id)
+        ):
+            # The preference goes, the producer stays: it is what "who accepted this"
+            # points at.
+            producer.current_account_id = None
+        for link in scope.scalars(
+            sa.select(m.GrantAccount).where(m.GrantAccount.account_id == row.id)
+        ):
+            scope.delete(link)
+        scope.audit(
+            "account_forgotten",
+            actor_kind="person",
+            subject_kind="account",
+            subject_id=row.id,
+            payload={"name": row.name, "host": row.host},
+        )
+        scope.delete(row)
+        scope.commit()
+    click.echo(f"forgot {name}")
+
+
 @main.command()
 @click.option("--host", default=None)
 @click.option("--port", default=None, type=int)

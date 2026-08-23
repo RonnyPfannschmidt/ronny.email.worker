@@ -8,7 +8,8 @@ may do what to it. This one is written from outside, because the first thing any
 with mailmind is try to run it.
 
 The instructions themselves now live in the guide — [Getting started](../test-drive.md)
-and [Configuration](../reference/configuration.md). What is left here is why they say what they say.
+and [Configuration](../reference/configuration.md). What is left here is why they say what
+they say.
 
 Serving it to anything but this machine is refused, because its session cookie travels
 over plain HTTP —
@@ -142,6 +143,10 @@ undo, and this is the one place that could prove it.
 - ~~Should `mailmindctl account add` exist?~~ Answered: adding an account is a thing you
   do in the review UI, so the `account` row is the source of truth and this file is seed
   data for it. See [11](11-deployment-and-identity.md). The form itself is not built.
+  `mailmindctl account forget` does exist, and is the other half of that answer rather
+  than a contradiction of it: seeding is what this file does, so undoing a seed is what
+  the command line has to be able to do. It refuses an account still named in the file,
+  and one holding cached mail.
 - Is a checked-in `mailmind.dev.toml` a convenience or a footgun? It is one edit away from
   somebody committing their own host, and the thing protecting them is that a different
   filename is gitignored.

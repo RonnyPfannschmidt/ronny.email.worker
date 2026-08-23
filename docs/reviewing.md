@@ -61,3 +61,9 @@ scoping looks identical and *is* a boundary.
 Adding an account belongs here — the row is the source of truth and the file is seed data —
 but the form is not built. Today you add it to [the configuration](reference/configuration.md)
 and run `mailmindctl bootstrap`.
+
+Which means a seed can be wrong, and a wrong one used to be permanent: bootstrap a copy of
+the example file once and `imap.example.org` is in this list forever.
+`mailmindctl account list` shows what is there and which of it the configuration no longer
+asks for; `mailmindctl account forget NAME` removes one, provided it holds no cached mail
+and the file has stopped naming it.

@@ -106,6 +106,10 @@ class TenantScope:
         self.session.add(obj)
         return obj
 
+    def delete(self, obj: Any) -> None:
+        """Remove a row that was loaded through this scope, and so is this tenant's."""
+        self.session.delete(obj)
+
     def flush(self) -> None:
         self.session.flush()
 

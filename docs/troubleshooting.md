@@ -22,6 +22,11 @@ rebinding protection allows loopback and nothing else.
 the right port with `mailmindctl review --port` — a session that used `--serve --port 0`
 took a free one.
 
+**An account you never configured is in the list.** A bootstrap against a copy of the
+example file seeds `personal` at `imap.example.org`, and taking it back out of the file does
+not take it out of the database — the row is the source of truth. `mailmindctl account list`
+then `mailmindctl account forget personal`.
+
 **`probe` fails.** The account declares a capability the server does not offer. Fix the
 declaration rather than working around the probe: it decides what the service attempts. The
 twenty-odd it prints in the other direction are informational.
