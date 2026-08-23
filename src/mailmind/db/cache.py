@@ -80,6 +80,7 @@ def upsert_message(
     message.in_reply_to = parsed.in_reply_to
     message.preview = parsed.preview
     message.parse_status = m.ParseStatus(parsed.parse_status)
+    message.parse_detail = parsed.parse_detail
     scope.flush()
 
     if created:
@@ -300,6 +301,20 @@ def cache_body(scope: TenantScope, message: m.Message, parsed: ParsedMessage) ->
     body.cached_at = dt.datetime.now(dt.UTC)
     body.last_read_at = body.cached_at
     return body
+
+
+def refresh_from_body(scope: TenantScope, message: m.Message, parsed: ParsedMessage) -> None:
+    """Re-derive what only a body can settle, now that there is one.
+
+    A sync sees headers: no preview, no attachments, and no way to tell a truncated
+    multipart from one whose body it simply has not asked for.  Fetching the body answers
+    all three, and the index has to be told about the preview.
+    """
+    message.preview = parsed.preview
+    message.parse_status = m.ParseStatus(parsed.parse_status)
+    message.parse_detail = parsed.parse_detail
+    message.has_attachments = bool(parsed.attachments)
+    index_message(scope, message)
 
 
 def evict_bodies(scope: TenantScope, budget_bytes: int) -> int:

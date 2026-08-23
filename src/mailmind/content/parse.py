@@ -195,7 +195,27 @@ def _addresses(message: EmailMessage, header: str) -> list[tuple[str, str | None
     return out
 
 
-def parse_message(raw: bytes) -> ParsedMessage:
+#: Defects that mean "there is no body here", which is not news when the body was never
+#: fetched. A sync reads the header block alone, so every multipart message — most mail —
+#: came back from it flagged as damaged, and the flag that was supposed to point at the
+#: three genuinely broken messages pointed at 58% of a real mailbox instead.
+_NO_BODY_DEFECTS = frozenset(
+    {
+        "StartBoundaryNotFoundDefect",
+        "CloseBoundaryNotFoundDefect",
+        "MultipartInvariantViolationDefect",
+        "MissingHeaderBodySeparatorDefect",
+    }
+)
+
+
+def parse_message(raw: bytes, *, headers_only: bool = False) -> ParsedMessage:
+    """Read a message, or as much of one as has been fetched.
+
+    ``headers_only`` says the blob is a header block rather than a whole message, which a
+    sync's is. Nothing is concluded about the body then — not its text, not its
+    attachments, and not that it is malformed for being absent.
+    """
     detail: list[str] = []
     status = "ok"
     try:
@@ -220,9 +240,12 @@ def parse_message(raw: bytes) -> ParsedMessage:
             size_bytes=len(raw),
         )
 
-    if message.defects:
+    defects = [type(d).__name__ for d in message.defects]
+    if headers_only:
+        defects = [d for d in defects if d not in _NO_BODY_DEFECTS]
+    if defects:
         status = "partial"
-        detail.extend(type(d).__name__ for d in message.defects)
+        detail.extend(defects)
 
     roles = (("from", "From"), ("to", "To"), ("cc", "Cc"), ("reply_to", "Reply-To"))
     addresses: list[tuple[str, str, str | None]] = []
@@ -238,7 +261,10 @@ def parse_message(raw: bytes) -> ParsedMessage:
     html_parts: list[str] = []
     attachments: list[Attachment] = []
     try:
-        for part in message.walk():
+        # Nothing to walk: the parts are in the body, and there is no body. Guessing from
+        # the top-level content type is how every multipart message came to be recorded as
+        # carrying one attachment of type `multipart/mixed`.
+        for part in () if headers_only else message.walk():
             if part.is_multipart():
                 continue
             disposition = (part.get_content_disposition() or "").lower()

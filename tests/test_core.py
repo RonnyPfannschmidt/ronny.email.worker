@@ -150,9 +150,69 @@ def test_a_message_with_no_message_id_is_still_cached_and_flagged(scope, world):
     assert "no_message_id" in codes
 
 
-def test_malformed_mime_is_marked_not_treated_as_empty(scope, world):
+def test_malformed_mime_is_marked_once_there_is_a_body_to_judge(scope, world, backend):
+    """A sync reads headers, and a truncated multipart's headers are a healthy multipart's.
+
+    Flagging it at sync time meant flagging every multipart message — most of a real
+    mailbox — for a body that had not been fetched. The judgement waits for the body now,
+    and says what was wrong with it when it comes.
+    """
+    message = scope.get(m.Message, world["seed"]["malformed_mime"])
+    assert message.parse_status is m.ParseStatus.ok, "nothing was wrong with the headers"
+
+    placement = scope.scalar(
+        sa.select(m.Placement).where(m.Placement.message_id == message.id)
+    )
+    container = scope.get(m.Container, placement.container_id)
+    sync.fetch_and_cache_body(
+        scope, world["account"], container, placement, backend, budget_bytes=10_000_000
+    )
+    scope.flush()
+
     message = scope.get(m.Message, world["seed"]["malformed_mime"])
     assert message.parse_status is not m.ParseStatus.ok
+    assert "Boundary" in (message.parse_detail or ""), message.parse_detail
+
+
+def test_an_ordinary_multipart_message_is_not_reported_as_damaged(scope, world, backend):
+    """The finding that started this: 16,755 of 29,079 messages in a real mailbox marked
+    partial, and 16,659 of those merely multipart."""
+    uid = backend.add_message(
+        "INBOX",
+        b"From: Shop <shop@example.net>\r\nSubject: Rechnung\r\n"
+        b"Message-ID: <invoice@example.net>\r\nDate: Mon, 17 Aug 2026 09:00:00 +0000\r\n"
+        b'MIME-Version: 1.0\r\nContent-Type: multipart/mixed; boundary="B"\r\n\r\n'
+        b"--B\r\nContent-Type: text/plain\r\n\r\nDie Rechnung liegt bei.\r\n"
+        b'--B\r\nContent-Type: application/pdf\r\nContent-Disposition: attachment; '
+        b'filename="rechnung.pdf"\r\n\r\n%PDF-1.4\r\n--B--\r\n',
+    )
+    sync.sync_container(scope, world["account"], world["containers"]["INBOX"], backend)
+    scope.flush()
+
+    placement = scope.scalar(
+        sa.select(m.Placement).where(
+            m.Placement.container_id == world["containers"]["INBOX"].id,
+            m.Placement.uid == uid,
+        )
+    )
+    message = scope.get(m.Message, placement.message_id)
+    assert message.parse_status is m.ParseStatus.ok
+    assert message.parse_detail is None
+    # And no attachment is invented from a body nobody fetched.
+    assert message.has_attachments is False
+
+    sync.fetch_and_cache_body(
+        scope,
+        world["account"],
+        world["containers"]["INBOX"],
+        placement,
+        backend,
+        budget_bytes=10_000_000,
+    )
+    scope.flush()
+    message = scope.get(m.Message, placement.message_id)
+    assert message.has_attachments is True, "the body says there is one"
+    assert message.parse_status is m.ParseStatus.ok
 
 
 @pytest.mark.parametrize(
@@ -186,6 +246,25 @@ def test_utf_8_in_a_domain_survives_as_the_character_it_was(scope, world):
     message = scope.get(m.Message, world["seed"]["non_ascii_domain"])
     assert message.from_address == "hallo@gr\u00fc\u00dfe.example"
     assert message.from_display == "Gr\u00fc\u00dfe"
+
+
+def test_a_full_sync_re_reads_what_an_incremental_one_would_skip(scope, world, backend):
+    """The cache holds what the parser made of a message, not the message. So when the
+    parser is corrected, the way to correct the cache is to read it all again — and an
+    incremental sync, by design, reads nothing that has not changed."""
+    message = scope.get(m.Message, world["seed"]["ordinary"])
+    message.subject = "whatever an older parse made of it"
+    scope.flush()
+
+    quiet = sync.sync_container(scope, world["account"], world["containers"]["INBOX"], backend)
+    assert quiet.added == quiet.updated == 0, "nothing changed on the server"
+    assert scope.get(m.Message, message.id).subject == "whatever an older parse made of it"
+
+    again = sync.sync_container(
+        scope, world["account"], world["containers"]["INBOX"], backend, force_full=True
+    )
+    assert again.full
+    assert scope.get(m.Message, message.id).subject == "Lunch on Thursday"
 
 
 def test_an_incremental_sync_sees_an_out_of_band_flag_change(scope, world, backend):

@@ -322,6 +322,9 @@ class Message(Base, TenantScoped):
     has_list_unsubscribe: Mapped[bool] = mapped_column(default=False)
     in_reply_to: Mapped[str | None] = mapped_column(sa.String(512), default=None)
     preview: Mapped[str | None] = mapped_column(sa.Text, default=None)
+    #: Why, when the status is not ``ok``. A flag with no reason behind it cannot be acted
+    #: on, and cannot be told apart from a flag that is firing on everything.
+    parse_detail: Mapped[str | None] = mapped_column(sa.Text, default=None)
     parse_status: Mapped[ParseStatus] = mapped_column(
         _enum(ParseStatus, "parse_status"), default=ParseStatus.ok
     )

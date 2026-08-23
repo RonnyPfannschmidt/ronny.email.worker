@@ -39,6 +39,17 @@ Archive is one decision shown a hundred times; a hundred messages each doing the
 is a hundred decisions dressed as one. The `[limits]` are there so a bundle can be
 *rendered*, not so it can be understood.
 
+## What "partial" means on a message
+
+A sync reads header blocks, not messages, so what it can judge is limited: whether a
+multipart message's parts are intact is a question about a body it has not fetched. It no
+longer guesses — a message is `partial` when something is actually wrong with what was
+read, and the reason is recorded beside it. Fetching the body settles the rest, and the
+status, the attachments and the preview are all re-derived at that point.
+
+If your cache was filled before this, its flags are the older parse's: `mailmindctl sync
+--full` re-reads every message rather than only what changed.
+
 ## When the mailbox has moved on
 
 Each suggestion carries the premise it was proposed under. It is checked before the bundle

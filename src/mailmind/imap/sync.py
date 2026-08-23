@@ -186,7 +186,9 @@ def _absorb(
 ) -> bool:
     """Fold one FETCH result into the cache.  Returns whether it was new here."""
     raw = info.raw or info.headers or b""
-    parsed = parse_message(raw)
+    # A sync fetches the header block, so say so: a multipart message read without its
+    # body is not a damaged message, and its parts are not knowable from here.
+    parsed = parse_message(raw, headers_only=info.raw is None)
     # RFC822.SIZE, because `raw` here is usually the header block alone.
     message, _ = cache.upsert_message(scope, account.id, parsed, size_bytes=info.size or None)
     cache.index_message(scope, message)
@@ -262,12 +264,10 @@ def fetch_and_cache_body(
     cache.record_mechanical_assessment(scope, message, parsed)
     if account.cache_bodies:
         cache.cache_body(scope, message, parsed)
-        # A preview is body text, so it cannot exist before the body does — a sync sees
-        # headers only. Nothing used to set it afterwards either, so every preview in
-        # every listing was empty and the search index's preview column held nothing,
-        # while the tool describing it promised subjects, senders *and* previews.
-        message.preview = parsed.preview
-        cache.index_message(scope, message)
+        # A preview, the attachments, and whether the MIME was actually broken: all three
+        # are body questions, and a sync sees headers. Nothing used to answer them
+        # afterwards either.
+        cache.refresh_from_body(scope, message, parsed)
         scope.flush()
         cache.evict_bodies(scope, budget_bytes)
     return parsed.body_text

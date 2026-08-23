@@ -192,9 +192,22 @@ def probe(ctx: click.Context) -> None:
 
 @main.command()
 @click.option("--account", "account_name", default=None)
+@click.option(
+    "--full",
+    "force_full",
+    is_flag=True,
+    help="re-read every message rather than what changed, which is how a cache filled by "
+    "an older parse gets corrected",
+)
 @click.pass_context
-def sync(ctx: click.Context, account_name: str | None) -> None:
-    """Bring the local cache into step with the mailboxes."""
+def sync(ctx: click.Context, account_name: str | None, force_full: bool) -> None:
+    """Bring the local cache into step with the mailboxes.
+
+    Incremental by default: a folder is asked what changed since last time.  ``--full``
+    asks for all of it, which is what to do after this program learns to read something it
+    was reading wrongly — the cache holds what the parser made of a message, not the
+    message.
+    """
     from mailmind.imap import sync as sync_module
 
     service = _service(ctx.obj["config_path"])
@@ -207,7 +220,9 @@ def sync(ctx: click.Context, account_name: str | None) -> None:
                 for container in sync_module.discover_containers(scope, account, backend):
                     if not container.selectable:
                         continue
-                    report = sync_module.sync_container(scope, account, container, backend)
+                    report = sync_module.sync_container(
+                        scope, account, container, backend, force_full=force_full
+                    )
                     if report.identity_broken:
                         click.secho(
                             f"{container.name}: RECREATED — {report.suggestions_killed} "
