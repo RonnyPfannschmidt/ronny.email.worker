@@ -35,5 +35,9 @@ twenty-odd it prints in the other direction are informational.
 that raises. Use `file://`. The same goes for a daemon started at boot: no unlocked keyring
 to read.
 
+**`pass://` hangs, or gives up after a minute.** gpg is waiting for a passphrase and
+nothing can prompt for one — a service started at boot has no pinentry and no tty. Either
+give the agent a cached passphrase before the service starts, or use `file://` there.
+
 **`secret-storage://` needs the keyring package.** `uv sync` installs it through the `dev`
 group; otherwise `pip install -e '.[secrets]'`, or `uv tool install --with keyring .`.

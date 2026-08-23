@@ -93,12 +93,14 @@ the password is in your shell history and in the environment of every process yo
 from that shell, including the agent. It is the wrong default and it is no longer the one
 in the example.
 
-Two alternatives were looked at and not taken, recorded so the next person does not have
-to look them up: `keyrings.alt` adds encrypted file-backed keyring backends, and
-`keyring_pass` bridges keyring to `pass`. Either would let one scheme cover both cases, at
-the cost of a dependency that stores secrets itself rather than delegating to something
-the operating system already audits. `file://` already covers the headless case without
-that, so neither is worth the surface yet.
+**`pass://` is password-store, and is a scheme rather than a keyring backend.**
+`keyring_pass` bridges keyring to `pass` and would have made this a configuration detail of
+somebody else's package; `keyrings.alt` would have added encrypted file-backed backends the
+same way. Both were looked at and neither taken, because the seam here is already a URL and
+a scheme, and `pass show` is a command that hands back a line. Adding a dependency that
+decrypts secrets itself, to reach a program that already does, is more surface for less.
+What mailmind knows about password-store is its convention — first line is the password —
+and that is the whole of the coupling.
 
 `keyring` itself had been documented and unreachable — it was in no dependency list at all,
 and the test for the scheme injects a fake module into `sys.modules`, so nothing noticed

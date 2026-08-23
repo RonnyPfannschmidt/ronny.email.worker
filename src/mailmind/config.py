@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import ipaddress
 import os
+import subprocess
 import tomllib
 from pathlib import Path
 
@@ -19,7 +20,12 @@ DEFAULT_CAPS = ("CONDSTORE", "MOVE", "UIDPLUS", "SPECIAL-USE", "IDLE")
 
 #: Where a password may come from.  Nothing here reads a password out of the config file
 #: itself, and there is deliberately no scheme that would let it.
-PASSWORD_SCHEMES = frozenset({"env", "file", "secret-storage"})
+PASSWORD_SCHEMES = frozenset({"env", "file", "pass", "secret-storage"})
+
+#: How long to wait for `pass`.  Long enough for somebody to type a gpg passphrase into
+#: pinentry, short enough that a service with no one at the keyboard fails rather than
+#: hangs on a prompt nobody will ever see.
+PASS_TIMEOUT_SECONDS = 60
 
 
 class ConfigError(Exception):
@@ -34,6 +40,7 @@ class Login:
 
     - ``env://NAME`` — an environment variable
     - ``file:///path/to/secret`` — a file, stripped of trailing whitespace
+    - ``pass://entry/name`` — password-store, through the ``pass`` command
     - ``secret-storage://service/user`` — the desktop secret store; ``user`` may be
       omitted, in which case the login's own username is used
 
@@ -261,6 +268,43 @@ def resolve_password(url: str, *, username: str | None = None) -> str:
         if not path.exists():
             raise ConfigError(f"password file {path} does not exist")
         return path.read_text().strip()
+
+    if scheme == "pass":
+        if not rest:
+            raise ConfigError("pass:// needs an entry name")
+        if rest.startswith("-"):
+            raise ConfigError(f"pass entry {rest!r} would be read as an option")
+        try:
+            shown = subprocess.run(  # noqa: S603 - a fixed argv, no shell
+                ["pass", "show", "--", rest],  # noqa: S607 - found on PATH on purpose
+                capture_output=True,
+                text=True,
+                timeout=PASS_TIMEOUT_SECONDS,
+                check=False,
+            )
+        except FileNotFoundError as exc:
+            raise ConfigError(
+                "pass:// needs the pass command on PATH — https://www.passwordstore.org"
+            ) from exc
+        except subprocess.TimeoutExpired as exc:
+            raise ConfigError(
+                f"pass show {rest} answered nothing in {PASS_TIMEOUT_SECONDS}s; gpg is "
+                "probably waiting for a passphrase nobody is there to type"
+            ) from exc
+        if shown.returncode != 0:
+            # pass diagnoses itself on stderr, and only ever writes the entry to stdout,
+            # so quoting the first line back cannot quote back a password.
+            said = shown.stderr.strip().splitlines()
+            raise ConfigError(
+                f"pass show {rest} failed: {said[0] if said else f'exit {shown.returncode}'}"
+            )
+        # The convention the whole password-store ecosystem is built on: the first line is
+        # the password and everything after it is notes. `pass` prints the file, so the
+        # newline that ends that line is ours to drop and nothing else is.
+        password = shown.stdout.split("\n", 1)[0]
+        if not password:
+            raise ConfigError(f"the pass entry {rest} begins with an empty line")
+        return password
 
     if scheme == "secret-storage":
         service, _, user = rest.partition("/")

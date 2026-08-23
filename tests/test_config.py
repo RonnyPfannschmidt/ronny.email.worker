@@ -74,6 +74,15 @@ def test_a_password_that_is_not_a_url_is_refused_at_load_time(tmp_path):
         load_config(write(tmp_path, text))
 
 
+def test_every_scheme_the_resolver_knows_is_a_scheme_a_login_accepts():
+    """The two lists are one list. A scheme that resolves but is refused at load time is a
+    documented feature nobody can turn on."""
+    from mailmind.config import PASSWORD_SCHEMES
+
+    for scheme in PASSWORD_SCHEMES:
+        Login(username="me@example.org", password=f"{scheme}://somewhere")
+
+
 def test_an_unknown_scheme_is_refused_at_load_time(tmp_path):
     text = CONFIG.replace("env://", "vault://")
     with pytest.raises(ConfigError, match="password must be a URL"):
@@ -129,6 +138,81 @@ def test_file_urls_resolve_and_lose_trailing_whitespace(tmp_path):
 def test_a_missing_password_file_is_an_error(tmp_path):
     with pytest.raises(ConfigError, match="does not exist"):
         resolve_password(f"file://{tmp_path / 'absent'}")
+
+
+#: A `pass` that does what password-store does — prints the whole entry, first line and
+#: all — without needing gpg, a key, or a store on the machine running the suite. The real
+#: command is exercised by hand; what this pins is what mailmind does with what it prints.
+FAKE_PASS = """#!/bin/sh
+[ "$1" = show ] || exit 64
+shift
+[ "$1" = -- ] && shift
+case "$1" in
+{cases}
+*) echo "Error: $1 is not in the password store." >&2; exit 1 ;;
+esac
+"""
+
+
+@pytest.fixture
+def fake_pass(tmp_path, monkeypatch):
+    """Put a `pass` on PATH that prints the entries a test asks for."""
+
+    def install(entries: dict[str, str]) -> None:
+        cases = "\n".join(
+            f"{name}) printf '%s' \"{body}\" ;;" for name, body in entries.items()
+        )
+        binary = tmp_path / "bin" / "pass"
+        binary.parent.mkdir(parents=True, exist_ok=True)
+        binary.write_text(FAKE_PASS.format(cases=cases))
+        binary.chmod(0o755)
+        monkeypatch.setenv("PATH", str(binary.parent), prepend=False)
+
+    return install
+
+
+def test_pass_urls_take_the_first_line_and_leave_the_notes(fake_pass):
+    """password-store's whole convention: line one is the password, the rest is notes."""
+    fake_pass({"mail/uberspace": "opensesame\nurl: imap.example.org\nuser: me\n"})
+    assert resolve_password("pass://mail/uberspace") == "opensesame"
+
+
+def test_a_pass_entry_of_one_line_survives_having_no_newline(fake_pass):
+    fake_pass({"mail/plain": "opensesame"})
+    assert resolve_password("pass://mail/plain") == "opensesame"
+
+
+def test_a_pass_password_keeps_the_spaces_it_was_stored_with(fake_pass):
+    """Unlike a file, which is stripped: what pass prints before the newline is the whole
+    of the password, and a generated one can legitimately end in a space."""
+    fake_pass({"mail/spaced": "open sesame \nnotes\n"})
+    assert resolve_password("pass://mail/spaced") == "open sesame "
+
+
+def test_an_entry_that_is_not_in_the_store_says_which(fake_pass):
+    fake_pass({"mail/there": "x\n"})
+    with pytest.raises(ConfigError, match="not in the password store"):
+        resolve_password("pass://mail/absent")
+
+
+def test_an_entry_that_begins_with_a_blank_line_is_not_an_empty_password(fake_pass):
+    fake_pass({"mail/blank": "\nopensesame\n"})
+    with pytest.raises(ConfigError, match="empty line"):
+        resolve_password("pass://mail/blank")
+
+
+def test_pass_urls_need_an_entry_and_not_an_option(fake_pass):
+    fake_pass({})
+    with pytest.raises(ConfigError, match="needs an entry name"):
+        resolve_password("pass://")
+    with pytest.raises(ConfigError, match="would be read as an option"):
+        resolve_password("pass://--help")
+
+
+def test_without_the_pass_command_the_scheme_says_so(tmp_path, monkeypatch):
+    monkeypatch.setenv("PATH", str(tmp_path / "empty"))
+    with pytest.raises(ConfigError, match="needs the pass command"):
+        resolve_password("pass://mail/anything")
 
 
 def test_secret_storage_urls_reach_the_keyring(monkeypatch):

@@ -72,6 +72,7 @@ is built from the row, so an account added another way works without being named
 | Scheme | For |
 |---|---|
 | `secret-storage://service[/user]` | A desktop session. Needs `keyring` and a session bus. |
+| `pass://entry/name` | A [password-store](https://www.passwordstore.org) you already keep. |
 | `file://path` | Headless. A file with a mode on it; `systemd-creds`, a mounted secret. |
 | `env://NAME` | A throwaway container, and nothing else. |
 
@@ -79,6 +80,14 @@ With no `/user`, `secret-storage://` uses the login's own username, so
 `keyring set imap.example.org me@example.org` matches
 `secret-storage://imap.example.org`. Everything after `file://` is the path, so
 `file:///abs`, `file://~/rel` and `file://rel` all mean what they look like.
+
+`pass://` runs `pass show` and takes **the first line**, which is the convention the whole
+password-store ecosystem is built on: line one is the password, everything after it is
+notes. The trailing newline goes and nothing else does, so a password ending in a space
+survives. mailmind never touches the store itself — no gpg, no decryption, no
+`PASSWORD_STORE_DIR` — it asks the command and reads a line. If gpg needs a passphrase and
+nothing can prompt for one, the call gives up after a minute and says so rather than
+hanging a sync forever.
 
 `env://` puts the password in your shell history and in the environment of every process you
 launch from that shell, the agent included.
