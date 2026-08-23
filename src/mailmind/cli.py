@@ -436,8 +436,10 @@ def list_accounts(ctx: click.Context) -> None:
             if row.id in chosen:
                 notes.append("being reviewed")
             trailer = f"  ({', '.join(notes)})" if notes else ""
+            # Not `user@host`: a username is usually an address already, and two @ in a
+            # row reads as a typo.
             click.echo(
-                f"{row.name}  {row.username}@{row.host}:{row.port}  "
+                f"{row.name}  {row.username} on {row.host}:{row.port}  "
                 f"{row.health.value}  {folders} folder(s){trailer}"
             )
 
