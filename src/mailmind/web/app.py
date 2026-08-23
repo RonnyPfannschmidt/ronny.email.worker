@@ -9,6 +9,7 @@ routes never consult a grant.
 from __future__ import annotations
 
 import contextlib
+import datetime as dt
 import os
 import secrets
 import tempfile
@@ -28,7 +29,7 @@ from mailmind.config import check_exposure, is_wildcard
 from mailmind.db import models as m
 from mailmind.imap import apply as applier
 from mailmind.imap import sync
-from mailmind.imap.backend import TRASH
+from mailmind.imap.backend import TRASH, MailboxUnhealthy
 from mailmind.mcp import server as mcp_server
 from mailmind.service import Service
 from mailmind.suggest import model as suggest
@@ -449,6 +450,11 @@ def create_app(
             except applier.NotApplicable as exc:
                 scope.commit()
                 return _back(bundle_id, str(exc))
+            except MailboxUnhealthy as exc:
+                # The accept stands and is recorded; what failed is reaching the mailbox.
+                note_unhealthy(scope, account, exc)
+                scope.commit()
+                return _back(bundle_id, str(exc))
             scope.commit()
         return _back(bundle_id, None)
 
@@ -508,16 +514,34 @@ def create_app(
         with service.scope() as scope:
             account = scope.get(m.Account, account_id)
             if account is not None:
-                with service.backend(account) as backend:
-                    for container in sync.discover_containers(scope, account, backend):
-                        if container.selectable:
-                            sync.sync_container(scope, account, container, backend)
-                            # Per folder: see the same commit in `mailmindctl sync`.
-                            scope.commit()
+                try:
+                    with service.backend(account) as backend:
+                        for container in sync.discover_containers(scope, account, backend):
+                            if container.selectable:
+                                sync.sync_container(scope, account, container, backend)
+                                # Per folder: see the same commit in `mailmindctl sync`.
+                                scope.commit()
+                except MailboxUnhealthy as exc:
+                    # A mailbox that cannot be reached is news about the mailbox, not a
+                    # failure of this request. The page it returns to shows what happened.
+                    note_unhealthy(scope, account, exc)
                 scope.commit()
         return RedirectResponse("/accounts", status_code=303)
 
     return app
+
+
+def note_unhealthy(scope, account, exc: Exception) -> None:  # noqa: ANN001
+    """Write down that the mailbox could not be reached, where the person will see it.
+
+    The accounts page already renders ``health`` and ``health_detail``, so a mailbox that
+    has stopped answering says so there rather than in a log nobody is reading — and an
+    account that is not ``ok`` is one no suggestion is applied against, which is the
+    behaviour wanted while it is broken.
+    """
+    account.health = m.AccountHealth.down
+    account.health_detail = str(exc)
+    account.health_checked_at = dt.datetime.now(dt.UTC)
 
 
 def _record_refusal(service: Service, request: Request, problem: str) -> None:

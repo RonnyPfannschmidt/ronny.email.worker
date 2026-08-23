@@ -15,7 +15,7 @@ from imapclient.exceptions import IMAPClientError
 from imapclient.imapclient import join_message_ids, seq_to_parenstr
 from imapclient.response_parser import parse_fetch_response
 
-from mailmind.config import AccountConfig
+from mailmind.config import AccountConfig, ConfigError
 from mailmind.imap.backend import (
     SPECIAL_USE,
     ContainerInfo,
@@ -61,8 +61,21 @@ class ImapBackend:
         self._selected: str | None = None
         self._readonly = True
         try:
+            password = account.login.resolve()
+        except ConfigError as exc:
+            raise MailboxUnhealthy(f"the password could not be read: {exc}") from exc
+        try:
             self._client = IMAPClient(account.host, port=account.port, ssl=account.use_ssl)
-            self._client.login(account.login.username, account.login.resolve())
+        except (IMAPClientError, OSError) as exc:
+            # A refused connection, a name that does not resolve, a certificate that does
+            # not cover the host asked for: all OSError, none of them a fault in this
+            # process, and all of them things the person is told rather than shown a
+            # traceback of.
+            raise MailboxUnhealthy(
+                f"cannot reach {account.host}:{account.port}: {exc}"
+            ) from exc
+        try:
+            self._client.login(account.login.username, password)
         except IMAPClientError as exc:
             raise MailboxUnhealthy(f"login failed: {exc}") from exc
         self._caps = frozenset(_text(c).upper() for c in self._client.capabilities())

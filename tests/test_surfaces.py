@@ -956,10 +956,14 @@ def test_a_sync_that_dies_partway_keeps_the_folders_it_finished(tmp_path):
         account_id = account.id
 
     with opened(create_app(service, session_key=SESSION_KEY)) as client:
-        with pytest.raises(MailboxUnhealthy):
-            as_a_person(client, f"/accounts/{account_id}/sync")
+        died = as_a_person(client, f"/accounts/{account_id}/sync")
+    # The person pressed a button, so what comes back is a page, not a stack trace.
+    assert died.status_code < 400
 
     with service.scope() as scope:
+        account = scope.get(m.Account, account_id)
+        assert account.health is m.AccountHealth.down, "the mailbox failed and nothing said so"
+        assert "the connection went away" in account.health_detail
         cached = {
             c.name: n
             for c, n in scope.execute(
@@ -971,6 +975,45 @@ def test_a_sync_that_dies_partway_keeps_the_folders_it_finished(tmp_path):
     assert cached["INBOX"] == len(CORPUS), "the folders that finished were thrown away"
     assert cached["Archive"] == 1
     assert cached["Zzz"] == 0
+
+
+def test_a_mailbox_that_cannot_be_reached_says_so_on_the_page(tmp_path):
+    """Pressing sync against a host that will not answer was an internal server error.
+
+    The connection is made when the button is pressed, so the failure lands in the route
+    rather than inside the sync — and the person who pressed it is the one who needs to
+    know what happened.
+    """
+    url = f"sqlite:///{tmp_path / 'mm.db'}"
+    upgrade_to_head(url)
+
+    def unreachable(_config):
+        raise MailboxUnhealthy(
+            "cannot reach imap.example.org:993: certificate verify failed: Hostname mismatch"
+        )
+
+    service = Service(Config(database_url=url), backend_factory=unreachable)
+    with service.scope() as scope:
+        account = scope.add(
+            m.Account(
+                name="real",
+                host="imap.example.org",
+                username="u",
+                password_url="env://X",
+            )
+        )
+        scope.commit()
+        account_id = account.id
+
+    with opened(create_app(service, session_key=SESSION_KEY)) as client:
+        pressed = as_a_person(client, f"/accounts/{account_id}/sync", follow_redirects=True)
+        assert pressed.status_code == 200, "a mailbox being down is not a bug in the request"
+        assert "Hostname mismatch" in pressed.text, "the page does not say what went wrong"
+
+    with service.scope() as scope:
+        account = scope.get(m.Account, account_id)
+    assert account.health is m.AccountHealth.down
+    assert "cannot reach imap.example.org:993" in account.health_detail
 
 
 def test_the_review_ui_is_shut_until_the_link_is_followed(service, backend):
