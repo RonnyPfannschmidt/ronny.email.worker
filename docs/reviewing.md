@@ -47,7 +47,7 @@ longer guesses — a message is `partial` when something is actually wrong with 
 read, and the reason is recorded beside it. Fetching the body settles the rest, and the
 status, the attachments and the preview are all re-derived at that point.
 
-A cache filled before this is corrected in place by a migration — `mailmindctl bootstrap`
+A cache filled before this is corrected in place by a migration — `mailmindctl migrate`
 runs it, and no re-downloading is needed. `mailmindctl sync --full` exists for the cases
 that do: it re-reads every message rather than only what changed.
 
@@ -72,9 +72,9 @@ scoping looks identical and *is* a boundary.
 
 Adding an account belongs here — the row is the source of truth and the file is seed data —
 but the form is not built. Today you add it to [the configuration](reference/configuration.md)
-and run `mailmindctl bootstrap`.
+and run `mailmindctl account seed`.
 
-Which means a seed can be wrong, and a wrong one used to be permanent: bootstrap a copy of
+Which means a seed can be wrong, and a wrong one used to be permanent: seed from a copy of
 the example file once and `imap.example.org` is in this list forever.
 `mailmindctl account list` shows what is there and which of it the configuration no longer
 asks for; `mailmindctl account forget NAME` removes one, provided it holds no cached mail

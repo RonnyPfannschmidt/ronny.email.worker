@@ -22,7 +22,7 @@ rebinding protection allows loopback and nothing else.
 the right port with `mailmindctl review --port` — a session that used `--serve --port 0`
 took a free one.
 
-**An account you never configured is in the list.** A bootstrap against a copy of the
+**An account you never configured is in the list.** Seeding from a copy of the
 example file seeds `personal` at `imap.example.org`, and taking it back out of the file does
 not take it out of the database — the row is the source of truth. `mailmindctl account list`
 then `mailmindctl account forget personal`.
@@ -36,7 +36,7 @@ diagnostic of the bug rather than of the mail.
 
 **"this database is at 0002choice and this build needs 0004phantom".** The code moved on
 and the database did not — which is ordinary when mailmind is run from a checkout that
-`git pull` updates under a running service. `mailmindctl bootstrap` migrates it; nothing
+`git pull` updates under a running service. `mailmindctl migrate` brings it up; nothing
 else does, so that no command quietly rewrites a mail cache the first time it runs. Stop
 the service first if one is running.
 

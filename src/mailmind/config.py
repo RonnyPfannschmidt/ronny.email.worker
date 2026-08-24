@@ -97,7 +97,7 @@ class Limits:
 class Config:
     database_url: str = "sqlite:///mailmind.db"
     #: Accounts to seed the database with.  Not what a connection is built from — that is
-    #: the ``account`` row, which this is bootstrapped into and which the review UI will
+    #: the ``account`` row, which this is seeded into and which the review UI will
     #: also write.
     accounts: tuple[AccountConfig, ...] = ()
     limits: Limits = Limits()

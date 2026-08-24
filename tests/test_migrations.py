@@ -101,7 +101,7 @@ def test_a_database_older_than_the_code_is_refused_with_what_to_run(tmp_path):
         require_current_schema(url)
     assert "0003detail" in str(behind.value), "say where it is"
     assert head_revision(url) in str(behind.value), "and where it should be"
-    assert "mailmindctl bootstrap" in str(behind.value), "and what to do about it"
+    assert "mailmindctl migrate" in str(behind.value), "and what to do about it"
 
     upgrade_to_head(url)
     require_current_schema(url)
@@ -109,6 +109,6 @@ def test_a_database_older_than_the_code_is_refused_with_what_to_run(tmp_path):
 
 
 def test_a_database_that_does_not_exist_yet_is_refused_the_same_way(tmp_path):
-    """A fresh install has no schema either, and `bootstrap` is equally the answer."""
+    """A fresh install has no schema either, and `migrate` is equally the answer."""
     with pytest.raises(SchemaBehind, match="no revision"):
         require_current_schema(f"sqlite:///{tmp_path / 'absent.db'}")

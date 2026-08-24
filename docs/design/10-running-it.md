@@ -135,7 +135,7 @@ undo, and this is the one place that could prove it.
 - [04](04-mailbox-access.md) for the declaration: the dev config declares exactly the five
   capabilities the service attempts, and deliberately not QRESYNC, which Dovecot offers
   and mailmind does not use.
-- [07](07-tenancy.md) for tenant zero, which the bootstrap creates and this story never
+- [07](07-tenancy.md) for tenant zero, which the first migration creates and this story never
   has to mention.
 - [09](09-iteration-one.md) for the container tier, which starts the same image for the
   test suite and currently starts its own.

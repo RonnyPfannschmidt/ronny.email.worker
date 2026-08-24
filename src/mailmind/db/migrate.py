@@ -2,7 +2,7 @@
 
 Alembic normally reads ``alembic.ini`` relative to the working directory, which is fine
 for a developer and not fine for an installed command or a test. This builds the config
-in memory instead, so ``mailmindctl bootstrap`` and the test suite create their schema the
+in memory instead, so ``mailmindctl migrate`` and the test suite create their schema the
 same way — by running the migrations, not by a second definition of the schema that can
 drift away from them.
 """
@@ -62,8 +62,8 @@ def require_current_schema(url: str) -> None:
     saying `no such column`. Which is true, and says nothing about what to do.
 
     Migrating here instead would mean every command quietly rewriting somebody's mail
-    cache the first time it ran. `bootstrap` is where that happens, because it is the
-    command whose job is to make the database ready.
+    cache the first time it ran — 0004 rewrites rows, not only tables. `migrate` is where
+    that happens, because that is the whole of what it is for.
     """
     head = head_revision(url)
     current = current_revision(url)
@@ -71,5 +71,5 @@ def require_current_schema(url: str) -> None:
         return
     raise SchemaBehind(
         f"this database is at {current or 'no revision'} and this build needs {head} — "
-        "run `mailmindctl bootstrap` to bring it up to date"
+        "run `mailmindctl migrate` to bring it up to date"
     )

@@ -5,7 +5,7 @@
 #     docker.io/antespi/docker-imap-devel:latest
 #   python dev/seed_mailbox.py
 #   export MAILMIND_CONFIG=mailmind.dev.toml MAILMIND_DEV_PASSWORD=secret
-#   mailmindctl bootstrap && mailmindctl probe && mailmindctl sync
+#   mailmindctl migrate && mailmindctl account seed && mailmindctl probe && mailmindctl sync
 #
 # Checked in, unlike mailmind.toml, because there is nothing here worth keeping private.
 # See docs/test-drive.md.

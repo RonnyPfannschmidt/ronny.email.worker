@@ -27,13 +27,17 @@ is not mechanical. [Configuration](reference/configuration.md#where-the-password
 out the four schemes. The file never holds a password, only a URL saying where one is.
 
 ```
-mailmindctl bootstrap    # migrate, and write the account into a row
+mailmindctl migrate      # bring the database up to this build's schema
+mailmindctl account seed # write the configured account into a row
 mailmindctl probe        # declared capabilities against what the server offers
 mailmindctl sync         # fill the cache
 mailmindctl serve        # review UI and MCP endpoint, and a link to open
 ```
 
-`bootstrap` is idempotent; run it again after adding an account to the file. `probe` exits
+Both are idempotent. `migrate` is the one to run after updating the code; `account seed`
+after adding an account to the file — and it reports where a row and the file disagree,
+since the row is what a connection is built from. `--update` resolves that in the file's
+favour. `probe` exits
 non-zero when the server does not offer something the account declares, which is the
 direction that would otherwise fail at three in the morning.
 

@@ -143,7 +143,7 @@ data for it.**
 It was ambiguous in a way that did not work. Connections were built by taking the row's
 name back to the configuration and looking it up there, so an account created any other
 way existed and was unusable at the same time — which is every account a web form would
-ever create. A connection is now built from the row's own columns. `mailmindctl bootstrap`
+ever create. A connection is now built from the row's own columns. `mailmindctl account seed`
 still seeds configured accounts into rows, and a file that names no accounts is a normal
 thing rather than a broken one.
 

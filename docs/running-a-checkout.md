@@ -4,7 +4,7 @@ For the latest rather than the last install, or because you are changing the cod
 shape here runs what is in the checkout, so `git pull` is the upgrade.
 
 `git pull` on a checkout that a service is running from changes the code under it. When
-the change includes a migration, every command except `bootstrap` refuses until the
+the change includes a migration, every command except `migrate` refuses until the
 database catches up, and says so — which is better than the `no such column` traceback that
 taught us to add the check.
 

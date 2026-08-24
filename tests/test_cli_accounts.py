@@ -1,8 +1,10 @@
-"""Forgetting an account, which is the only half of managing one that lives here.
+"""Seeding accounts from the configuration, and forgetting one that should not be there.
 
-Adding belongs in the review UI — the row is the source of truth and the configuration is
-seed data for it. But a seed that was wrong is a row nothing could remove: bootstrap a copy
-of the example file once and `imap.example.org` is in the review UI forever.
+Adding an account belongs in the review UI — the row is the source of truth and the
+configuration is seed data for it. What lives here is the seeding itself, the difference
+between a row and the file that seeded it, and undoing a seed that was wrong: run
+`account seed` against a copy of the example file once and `imap.example.org` is in the
+review UI forever.
 """
 
 from __future__ import annotations
@@ -116,3 +118,92 @@ def test_an_account_holding_cached_mail_is_not_forgotten_in_passing(tmp_path):
     refused = run(config, "account", "forget", "leftover")
     assert refused.exit_code != 0
     assert "cached folder" in refused.output
+
+
+def test_seeding_converges_and_then_has_nothing_to_say(tmp_path):
+    """Run twice, the second run is silent: seeding is something you can leave in a script
+    without it telling you about a mailbox it did not change."""
+    config, _ = seeded(tmp_path)
+    first = run(config, "account", "seed", "--update")
+    assert first.exit_code == 0, first.output
+    assert first.output.strip(), "the fixture's row does not match the configuration"
+
+    quiet = run(config, "account", "seed")
+    assert quiet.exit_code == 0, quiet.output
+    assert quiet.output.strip() == "", "a seed with nothing to do should say nothing"
+
+
+def test_a_row_that_disagrees_with_the_configuration_is_reported_not_overwritten(tmp_path):
+    """The row is what a connection is built from, so a file that has moved on is a fact
+    worth stating rather than one to act on unasked. An account went on connecting to a
+    host its configuration had stopped naming, and nothing anywhere said so."""
+    config, url = seeded(tmp_path)
+    service = Service(Config(database_url=url))
+    with service.scope(TENANT_ZERO) as scope:
+        row = scope.scalar(sa.select(m.Account).where(m.Account.name == "wanted"))
+        row.host = "old.example"
+        scope.commit()
+    service.close()
+
+    reported = run(config, "account", "seed")
+    assert "host is 'old.example'" in reported.output
+    assert "imap.example.net" in reported.output
+    assert "--update" in reported.output
+
+    service = Service(Config(database_url=url))
+    with service.scope(TENANT_ZERO) as scope:
+        assert scope.scalar(sa.select(m.Account).where(m.Account.name == "wanted")).host == (
+            "old.example"
+        ), "reporting is not writing"
+    service.close()
+
+    applied = run(config, "account", "seed", "--update")
+    assert applied.exit_code == 0, applied.output
+    service = Service(Config(database_url=url))
+    with service.scope(TENANT_ZERO) as scope:
+        assert scope.scalar(
+            sa.select(m.Account).where(m.Account.name == "wanted")
+        ).host == "imap.example.net"
+    service.close()
+
+
+def test_a_capability_the_configuration_dropped_stops_being_declared(tmp_path):
+    """A declaration decides what the service attempts, so a stale one is not harmless.
+
+    What it must not do is delete the row: `probe` writes what the server offered into the
+    same table with `declared` false, so a row is not a declaration — the flag on it is.
+    Deleting rows the file does not name threw away every capability the last probe found,
+    which on a real account was thirty-three of them.
+    """
+    config, url = seeded(tmp_path)
+    service = Service(Config(database_url=url))
+    with service.scope(TENANT_ZERO) as scope:
+        account = scope.scalar(sa.select(m.Account).where(m.Account.name == "wanted"))
+        scope.add(m.AccountCapability(account_id=account.id, name="QRESYNC", declared=True))
+        scope.add(
+            m.AccountCapability(
+                account_id=account.id, name="SORT", declared=False, probed_present=True
+            )
+        )
+        scope.commit()
+    service.close()
+
+    reported = run(config, "account", "seed")
+    assert "still declares QRESYNC" in reported.output
+    assert "SORT" not in reported.output, "a probed capability is not a declaration"
+    run(config, "account", "seed", "--update")
+
+    service = Service(Config(database_url=url))
+    with service.scope(TENANT_ZERO) as scope:
+        account = scope.scalar(sa.select(m.Account).where(m.Account.name == "wanted"))
+        held = {
+            c.name: c
+            for c in scope.scalars(
+                sa.select(m.AccountCapability).where(
+                    m.AccountCapability.account_id == account.id
+                )
+            )
+        }
+    assert held["QRESYNC"].declared is False, "the claim is withdrawn"
+    assert held["SORT"].probed_present is True, "and what the probe learned is still there"
+    service.close()

@@ -91,7 +91,7 @@ class TenantScoped:
 
 
 class Tenant(Base):
-    """A person, and everything of theirs.  Tenant zero is created by the bootstrap."""
+    """A person, and everything of theirs.  Tenant zero is created by the first migration."""
 
     __tablename__ = "tenant"
 

@@ -57,7 +57,7 @@ def _apply_tenant_criteria(state: Any) -> None:
         raise Unscoped(
             "ORM statement issued on a session with no tenant bound. "
             "Use TenantScope, or pass execution_options(mailmind_unscoped=True) "
-            "for genuinely tenant-free work such as bootstrap."
+            "for genuinely tenant-free work such as migrating."
         )
 
     state.statement = state.statement.options(
@@ -175,7 +175,7 @@ def tenant_scope(sessions: sessionmaker[Session], tenant_id: int) -> Iterator[Te
 
 @contextmanager
 def unscoped_session(sessions: sessionmaker[Session]) -> Iterator[Session]:
-    """For bootstrap and administration only — tenancy is not enforced here.
+    """For migrations and administration only — tenancy is not enforced here.
 
     Every ORM statement issued through it must carry
     ``execution_options(mailmind_unscoped=True)``, which is deliberately noisy.

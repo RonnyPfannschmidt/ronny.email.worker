@@ -48,7 +48,7 @@ configuration instead, and everything else is the same.
 ## Before the first connection
 
 ```
-mailmindctl bootstrap && mailmindctl probe && mailmindctl sync
+mailmindctl migrate && mailmindctl account seed && mailmindctl probe && mailmindctl sync
 ```
 
 The agent can call `request_sync` afterwards, but the first one is worth doing by hand

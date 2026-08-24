@@ -12,7 +12,8 @@ podman run -d --rm --name mailmind-dev -p 3144:143 -e MAILNAME=example.org \
 uv run dev/seed_mailbox.py
 
 export MAILMIND_CONFIG=mailmind.dev.toml MAILMIND_DEV_PASSWORD=secret
-uv run mailmindctl bootstrap && uv run mailmindctl probe && uv run mailmindctl sync
+uv run mailmindctl migrate && uv run mailmindctl account seed
+uv run mailmindctl probe && uv run mailmindctl sync
 uv run mailmindctl grant --producer opencode   # a bearer token, printed once
 uv run mailmindctl serve                       # a link with the login key in it
 ```

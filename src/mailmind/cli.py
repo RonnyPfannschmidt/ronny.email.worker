@@ -13,7 +13,12 @@ import sqlalchemy as sa
 
 from mailmind.config import ConfigError, load_config
 from mailmind.db import models as m
-from mailmind.db.migrate import SchemaBehind, require_current_schema, upgrade_to_head
+from mailmind.db.migrate import (
+    SchemaBehind,
+    current_revision,
+    require_current_schema,
+    upgrade_to_head,
+)
 from mailmind.service import TENANT_ZERO, Service, hash_token, mint_token
 
 
@@ -22,7 +27,7 @@ def _service(
 ) -> Service:
     """The service, and a refusal to work against a database this build does not match.
 
-    Every command but `bootstrap` asks for the schema it was written against. Without
+    Every command but `migrate` asks for the schema it was written against. Without
     that, a checkout that has moved on meets the old schema at the first query and says
     `no such column` from somewhere in the middle of a sync.
     """
@@ -87,43 +92,37 @@ def review(ctx: click.Context, open_it: bool, port: int | None) -> None:
 
 @main.command()
 @click.pass_context
-def bootstrap(ctx: click.Context) -> None:
-    """Migrate the database, and create tenant zero's accounts from configuration.
+def migrate(ctx: click.Context) -> None:
+    """Bring the database up to the schema this build was written against.
 
-    The one command that may meet a database older than itself, because bringing it up to
-    date is what it is for.
+    The only command that may meet a database older than itself; every other one refuses
+    and says to run this. Which is the split: a migration can rewrite what is cached — 0004
+    does — and that is not something a command whose job is something else should do on the
+    way past.
     """
     service = _service(ctx.obj["config_path"], needs_schema=False)
-    upgrade_to_head(service.config.database_url)
+    url = service.config.database_url
+    was = current_revision(url)
+    upgrade_to_head(url)
+    now = current_revision(url)
+    if was == now:
+        click.echo(f"already at {now}")
+    else:
+        click.echo(f"{was or 'empty database'} → {now}")
+    service.close()
 
-    with service.scope(TENANT_ZERO) as scope:
-        for account_config in service.config.accounts:
-            account = scope.scalar(
-                sa.select(m.Account).where(m.Account.name == account_config.name)
-            )
-            if account is None:
-                account = m.Account(
-                    name=account_config.name,
-                    host=account_config.host,
-                    port=account_config.port,
-                    use_ssl=account_config.use_ssl,
-                    username=account_config.login.username,
-                    password_url=account_config.login.password,
-                    cache_bodies=account_config.cache_bodies,
-                )
-                scope.add(account)
-                scope.flush()
-                click.echo(f"created account {account.name}")
-            for cap in account_config.caps:
-                if not scope.scalar(
-                    sa.select(m.AccountCapability.id).where(
-                        m.AccountCapability.account_id == account.id,
-                        m.AccountCapability.name == cap,
-                    )
-                ):
-                    scope.add(m.AccountCapability(account_id=account.id, name=cap))
-        scope.commit()
-    click.echo("bootstrapped tenant zero")
+
+#: What a configured account and its row have to say to each other. The row is the source
+#: of truth once it exists, so a difference is reported rather than resolved — unless
+#: somebody says which way it should go.
+SEEDED_FIELDS = (
+    ("host", lambda config: config.host),
+    ("port", lambda config: config.port),
+    ("use_ssl", lambda config: config.use_ssl),
+    ("username", lambda config: config.login.username),
+    ("password_url", lambda config: config.login.password),
+    ("cache_bodies", lambda config: config.cache_bodies),
+)
 
 
 @main.command("grant")
@@ -545,8 +544,8 @@ def account() -> None:
 
     Adding one belongs in the review UI, because the ``account`` row is the source of
     truth and the configuration is seed data for it.  Undoing a *seed* does not: a copy
-    of the example file, bootstrapped once, leaves an account behind that nothing else
-    here can remove and that the review UI goes on offering.
+    of the example file, seeded once, leaves an account behind that nothing else here can
+    remove and that the review UI goes on offering.
     """
 
 
@@ -582,6 +581,104 @@ def list_accounts(ctx: click.Context) -> None:
             )
 
 
+@account.command("seed")
+@click.option(
+    "--update",
+    "apply_changes",
+    is_flag=True,
+    help="write the configuration's values over the row's, for the accounts that differ",
+)
+@click.pass_context
+def seed_accounts(ctx: click.Context, apply_changes: bool) -> None:
+    """Create the account rows the configuration names and the database does not have.
+
+    Seed data, which is what the configuration is: a connection is built from the row.
+    That is why a change to the file does not reach a running account by itself — and why
+    this reports the difference rather than passing over it, which is how an account went
+    on connecting to a host its configuration had stopped naming.
+    """
+    service = _service(ctx.obj["config_path"])
+    with service.scope(TENANT_ZERO) as scope:
+        for account_config in service.config.accounts:
+            row = scope.scalar(
+                sa.select(m.Account).where(m.Account.name == account_config.name)
+            )
+            if row is None:
+                row = m.Account(
+                    name=account_config.name,
+                    host=account_config.host,
+                    port=account_config.port,
+                    use_ssl=account_config.use_ssl,
+                    username=account_config.login.username,
+                    password_url=account_config.login.password,
+                    cache_bodies=account_config.cache_bodies,
+                )
+                scope.add(row)
+                scope.flush()
+                click.echo(f"created account {row.name}")
+            else:
+                _reconcile(row, account_config, apply_changes=apply_changes)
+            _reconcile_capabilities(scope, row, account_config, apply_changes=apply_changes)
+        scope.commit()
+    service.close()
+
+
+def _reconcile(row, account_config, *, apply_changes: bool) -> None:  # noqa: ANN001
+    for field, of_config in SEEDED_FIELDS:
+        wanted = of_config(account_config)
+        held = getattr(row, field)
+        if held == wanted:
+            continue
+        if apply_changes:
+            setattr(row, field, wanted)
+            click.echo(f"{row.name}: {field} {held!r} → {wanted!r}")
+        else:
+            click.secho(
+                f"{row.name}: {field} is {held!r}, the configuration says {wanted!r} "
+                "— `--update` writes it",
+                fg="yellow",
+            )
+
+
+def _reconcile_capabilities(scope, row, account_config, *, apply_changes: bool) -> None:  # noqa: ANN001
+    """The declared half of the capability rows, which is not all of them.
+
+    ``probe`` writes what a server offered into the same table with ``declared`` false, so
+    a row is not a declaration — the flag on it is. Deleting rows the configuration does
+    not name would throw away everything the last probe learned.
+    """
+    wanted = set(account_config.caps)
+    held = {
+        c.name: c
+        for c in scope.scalars(
+            sa.select(m.AccountCapability).where(m.AccountCapability.account_id == row.id)
+        )
+    }
+    for name in sorted(wanted):
+        capability = held.get(name)
+        if capability is None:
+            scope.add(m.AccountCapability(account_id=row.id, name=name, declared=True))
+            click.echo(f"{row.name}: declares {name}")
+        elif not capability.declared:
+            capability.declared = True
+            click.echo(f"{row.name}: declares {name}, which was only ever offered")
+    for name, capability in sorted(held.items()):
+        # A declaration decides what the service attempts, so one the file has dropped is
+        # a claim nobody is making any more. The row stays: the probe's half of it is a
+        # fact about the server, not about the configuration.
+        if name in wanted or not capability.declared:
+            continue
+        if apply_changes:
+            capability.declared = False
+            click.echo(f"{row.name}: no longer declares {name}")
+        else:
+            click.secho(
+                f"{row.name}: still declares {name}, which the configuration does not "
+                "— `--update` withdraws that",
+                fg="yellow",
+            )
+
+
 @account.command("forget")
 @click.argument("name")
 @click.pass_context
@@ -594,8 +691,8 @@ def forget_account(ctx: click.Context, name: str) -> None:
     service = _service(ctx.obj["config_path"])
     if any(a.name == name for a in service.config.accounts):
         raise click.ClickException(
-            f"{name!r} is still named in the configuration, so `bootstrap` would seed it "
-            "again — take it out of the file first"
+            f"{name!r} is still named in the configuration, so `account seed` would put "
+            "it back — take it out of the file first"
         )
     with service.scope(TENANT_ZERO) as scope:
         row = scope.scalar(sa.select(m.Account).where(m.Account.name == name))

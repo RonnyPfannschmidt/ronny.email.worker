@@ -9,7 +9,7 @@ accepting the results in a small web UI.
 ## What it is
 
 One process. `/mcp` is a streamable-HTTP MCP endpoint; everything else is the review UI.
-SQLite behind both. `mailmindctl` bootstraps, probes, syncs and serves.
+SQLite behind both. `mailmindctl` migrates, seeds, probes, syncs and serves.
 
 An agent gets twelve tools — nine that look, three that say — and six resources. There is
 no tool that applies anything, no `apply` value in the capability enum, and the module

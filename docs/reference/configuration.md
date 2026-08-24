@@ -64,7 +64,7 @@ password = "secret-storage://imap.example.org"
 applies become best-effort ones that say so. `QRESYNC` is absent because nothing here uses
 it. `cache_bodies = false` keeps message bodies out of the local database entirely.
 
-Accounts here are seed data: `bootstrap` writes them into `account` rows, and a connection
+Accounts here are seed data: `account seed` writes them into `account` rows, and a connection
 is built from the row, so an account added another way works without being named here.
 
 ## Where the password lives

@@ -28,7 +28,7 @@ def account_config(account: m.Account) -> AccountConfig:
     """What a connection needs, taken from the row rather than from the file.
 
     The row is the source of truth.  Configured accounts are seeded into it by the
-    bootstrap, and an account added through the review UI will only ever exist as one —
+    seeding, and an account added through the review UI will only ever exist as one —
     looking the name back up in the configuration would have made such an account exist
     and be unusable at the same time.
 

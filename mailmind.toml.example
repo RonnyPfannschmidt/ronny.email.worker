@@ -11,7 +11,7 @@ bind = "127.0.0.1"
 port = 8765
 # behind_auth_proxy = false
 
-# Accounts below are seed data.  `mailmindctl bootstrap` writes them into `account` rows,
+# Accounts below are seed data.  `mailmindctl account seed` writes them into `account` rows,
 # and the rows are what a connection is built from — so an account added another way works
 # without ever being named here.
 
