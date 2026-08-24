@@ -315,6 +315,23 @@ def test_a_sync_with_nobody_watching_is_the_same_sync(scope, world, backend):
     assert quiet.updated == len(CORPUS)
 
 
+def test_what_a_sync_will_read_is_countable_before_it_reads_it(scope, world, backend):
+    """The progress total. A folder about to be read whole can be counted with STATUS; a
+    folder about to be asked what changed cannot, and saying a number anyway is worse than
+    saying none — which is what a total that grew as folders reported in amounted to."""
+    from mailmind.cli import messages_to_read
+
+    folders = list(world["containers"].values())
+    first_time = [c for c in folders if c.name != "INBOX"]  # never fully synced
+    assert messages_to_read(first_time, backend, force_full=False) == 0, "empty but knowable"
+
+    inbox = world["containers"]["INBOX"]
+    assert messages_to_read([inbox], backend, force_full=True) == len(CORPUS)
+    assert messages_to_read([inbox], backend, force_full=False) is None, (
+        "INBOX was fully synced by the fixture, so this sync asks what changed"
+    )
+
+
 def test_an_incremental_sync_sees_an_out_of_band_flag_change(scope, world, backend):
     backend.out_of_band_mutate_flags("INBOX", world["uids"]["ordinary"], (r"\Seen",))
     report = sync.sync_container(scope, world["account"], world["containers"]["INBOX"], backend)

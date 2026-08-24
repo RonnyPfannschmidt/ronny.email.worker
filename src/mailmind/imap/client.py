@@ -145,6 +145,24 @@ class ImapBackend:
         )
         return [self._info(uid, data) for uid, data in result.items()]
 
+    def message_counts(self, containers: list[str]) -> dict[str, int]:
+        """STATUS, which answers without selecting and without disturbing \\Recent.
+
+        One round trip per folder. LIST-STATUS would answer for all of them at once and is
+        offered by every server this has met, but imapclient gives no way to read the
+        STATUS responses that come back beside the LIST ones, and reaching under it for
+        them is more protocol than a progress bar is worth.
+        """
+        counts = {}
+        for name in containers:
+            try:
+                counts[name] = int(self._client.folder_status(name, ["MESSAGES"])[b"MESSAGES"])
+            except IMAPClientError:
+                # A folder that will not answer is one the sync is about to have an
+                # opinion about. Not here.
+                continue
+        return counts
+
     def all_uids(self, container: str) -> list[int]:
         self._ensure_selected(container)
         return sorted(int(uid) for uid in self._client.search(["ALL"]))

@@ -183,6 +183,21 @@ def test_a_message_in_a_folder_with_an_umlaut_is_fetched_like_any_other(
     assert "Beschwerde" in subjects
 
 
+def test_status_counts_what_the_folder_actually_holds(backend, seeded, out_of_band):
+    """The sync's progress total comes from STATUS, so STATUS has to agree with the mailbox.
+
+    Asked of a real server rather than of the fake, because the fake counts a list it holds
+    and this counts what Dovecot says without opening the folder.
+    """
+    ensure_folder(out_of_band, "Zähler")
+    counts = backend.message_counts(["INBOX", "Zähler"])
+    assert counts["INBOX"] == len(CORPUS)
+    assert counts["Zähler"] == 0
+
+    # And selecting it afterwards agrees, which is what the second bar is counted against.
+    assert backend.select("INBOX", readonly=True).message_count == len(CORPUS)
+
+
 def test_envelopes_come_back_with_headers_but_no_body(backend, seeded):
     envelopes = {e.uid: e for e in backend.fetch_envelopes("INBOX")}
     envelope = envelopes[seeded["ordinary"]]

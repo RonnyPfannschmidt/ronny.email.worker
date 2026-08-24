@@ -207,8 +207,24 @@ def probe(ctx: click.Context) -> None:
     raise SystemExit(1 if diverged else 0)
 
 
+def messages_to_read(folders, backend, *, force_full: bool) -> int | None:  # noqa: ANN001
+    """How many messages this sync will read, if that is knowable before it starts.
+
+    A folder being read end to end — one that has never had a full sync, or all of them
+    when `--full` says so — can be counted first: STATUS answers without opening it. A
+    folder being asked what changed cannot, because the answer is the question.
+
+    So the total is real or it is absent. It used to be neither: it grew as folders
+    reported in, which reads as progress against a moving target.
+    """
+    whole = [c.name for c in folders if force_full or c.last_full_sync_at is None]
+    if not whole:
+        return None
+    return sum(backend.message_counts(whole).values())
+
+
 @contextlib.contextmanager
-def sync_display(folders: int):  # noqa: ANN201
+def sync_display(folders: int, messages: int | None):  # noqa: ANN201
     """Show where a sync has got to, if there is anybody watching.
 
     A first sync is 187 folders and tens of thousands of messages, and used to print one
@@ -244,7 +260,7 @@ def sync_display(folders: int):  # noqa: ANN201
         TimeElapsedColumn(),
         transient=False,
     ) as progress:
-        yield _Bars(progress, folders)
+        yield _Bars(progress, folders, messages)
 
 
 class _Lines:
@@ -281,19 +297,23 @@ class _Lines:
 class _Bars:
     """The same three facts, stacked, for somebody watching it happen."""
 
-    def __init__(self, progress, folders: int) -> None:  # noqa: ANN001
+    def __init__(self, progress, folders: int, messages: int | None) -> None:  # noqa: ANN001
         self._progress = progress
         self._folders = progress.add_task("folders", total=folders)
         self._folder = progress.add_task("waiting", total=None)
-        self._messages = progress.add_task("messages", total=None)
-        #: Grows as folders are opened. The alternative is knowing the whole mailbox up
-        #: front, which means selecting all 187 folders before reading any of them.
-        self._known = 0
+        self._messages = progress.add_task("messages", total=messages)
+        #: What the folders being read end to end were counted at, before reading any of
+        #: them. A folder answering with more than that — mail arrived while this ran, or
+        #: it turned out to need a full read after all — raises it rather than overrunning.
+        self._expected = messages or 0
+        self._promised = 0
 
     def folder_started(self, container: str, messages: int) -> None:
-        self._known += messages
+        self._promised += messages
         self._progress.reset(self._folder, total=messages, description=container)
-        self._progress.update(self._messages, total=self._known)
+        if self._promised > self._expected:
+            self._expected = self._promised
+            self._progress.update(self._messages, total=self._expected)
 
     def messages_absorbed(self, count: int) -> None:
         self._progress.advance(self._folder, count)
@@ -344,7 +364,8 @@ def sync(ctx: click.Context, account_name: str | None, force_full: bool) -> None
                     for c in sync_module.discover_containers(scope, account, backend)
                     if c.selectable
                 ]
-                with sync_display(len(folders)) as display:
+                expected = messages_to_read(folders, backend, force_full=force_full)
+                with sync_display(len(folders), expected) as display:
                     for container in folders:
                         report = sync_module.sync_container(
                             scope,

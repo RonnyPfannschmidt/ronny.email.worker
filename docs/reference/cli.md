@@ -9,9 +9,11 @@ rewrite what is cached, so nothing else does it on the way past. `account seed` 
 other half — the configuration is seed data, the row is what a connection is built from,
 and where they disagree it says so rather than deciding.
 
-`sync` shows stacked progress at a terminal — the folders, the folder being read, and
-messages against the total discovered so far — and prints a line per changed folder plus a
-closing count when its output is going somewhere else.
+`sync` shows stacked progress at a terminal — the folders, the folder being read, and the
+messages. The message total is real when it can be: a folder about to be read end to end is
+counted with STATUS before anything is read, and one about to be asked what changed has no
+knowable total, so it gets none rather than a made-up one. Output going somewhere else gets
+a line per changed folder and a closing count instead.
 
 ::: mkdocs-click
     :module: mailmind.cli

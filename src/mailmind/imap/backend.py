@@ -110,6 +110,10 @@ class MailBackend(Protocol):
 
     def all_uids(self, container: str) -> list[int]: ...
 
+    def message_counts(self, containers: list[str]) -> dict[str, int]:
+        """How many messages each of these holds, without opening any of them."""
+        ...
+
     def fetch_raw(self, container: str, uid: int) -> bytes: ...
 
     def store_flags(

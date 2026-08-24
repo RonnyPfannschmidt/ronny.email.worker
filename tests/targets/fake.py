@@ -173,6 +173,14 @@ class FakeBackend:
             self._info(m, with_raw=False) for m in folder.messages.values() if m.modseq > modseq
         ]
 
+    def message_counts(self, containers: list[str]) -> dict[str, int]:
+        self._check_reachable()
+        return {
+            name: len(self.folders[name].messages)
+            for name in containers
+            if name in self.folders
+        }
+
     def all_uids(self, container: str) -> list[int]:
         self._check_reachable()
         return sorted(self._folder(container).messages)
