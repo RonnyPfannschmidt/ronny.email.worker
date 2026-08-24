@@ -18,6 +18,7 @@ stays here unchanged.
 | Date | Document | Status |
 |---|---|---|
 | 2026-08-12 | [mailmind — Testability & CI Plan](2026-08-12-mailmind-testability-and-ci-plan.md) | not yet folded into specs |
+| 2026-08-24 | [Would `aioimaplib` do instead of the synchronous client?](2026-08-24-aioimaplib-evaluation.md) | measurements, not a spec |
 
 ### 2026-08-12 — mailmind — Testability & CI Plan
 
@@ -26,3 +27,10 @@ it references material it does not define: invariants I1–I7, the §7 capacity 
 connection state machine (`READY → DEGRADED → QUARANTINED → …`), the idea lifecycle, the
 MCP tool surface, the single-threaded core, and a `mailmindctl` CLI. Treat those
 references as open questions, not as settled design.
+
+### 2026-08-24 — Would `aioimaplib` do instead of the synchronous client?
+
+An evaluation rather than a design: what the async IMAP client does when driven through the
+surface `mailmind.imap.client` needs, measured against the container tier's Dovecot. The
+answer was no, and the reasons are dated — two of the three blockers are upstream bugs, so
+the question survives its answer.

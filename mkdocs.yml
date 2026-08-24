@@ -70,6 +70,7 @@ nav:
       - History:
           - design/history/index.md
           - Testability & CI plan: design/history/2026-08-12-mailmind-testability-and-ci-plan.md
+          - aioimaplib evaluation: design/history/2026-08-24-aioimaplib-evaluation.md
 
 strict: true
 
