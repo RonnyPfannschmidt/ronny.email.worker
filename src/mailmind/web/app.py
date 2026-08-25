@@ -35,6 +35,7 @@ from mailmind.mcp import oauth
 from mailmind.mcp import server as mcp_server
 from mailmind.service import Service
 from mailmind.suggest import model as suggest
+from mailmind.suggest import staleness
 
 TEMPLATES = Jinja2Templates(directory=str(Path(__file__).parent / "templates"))
 
@@ -409,11 +410,14 @@ def create_app(
     def queue(request: Request):  # noqa: ANN202
         with service.scope() as scope:
             suggest.expire_due(scope)
-            scope.commit()
             header = chrome(scope)
             current = header["current_account"]
             # None means every account, which is only reachable when there are none at all.
             here = {current["id"]} if current else None
+            # A bundle whose messages all moved on is not work anybody can do, so it stops
+            # being offered here rather than after somebody opens it to find out.
+            staleness.sweep_queue(scope, here)
+            scope.commit()
             bundles = views.bundle_summaries(scope, [m.BundleStatus.proposed], account_ids=here)
             recent = views.bundle_summaries(
                 scope,
@@ -423,6 +427,7 @@ def create_app(
                     m.BundleStatus.rejected,
                     m.BundleStatus.expired,
                     m.BundleStatus.withdrawn,
+                    m.BundleStatus.stale,
                 ],
                 account_ids=here,
             )[:10]
@@ -436,8 +441,6 @@ def create_app(
                 return HTMLResponse("no such bundle", status_code=404)
             if bundle.status is m.BundleStatus.proposed:
                 # The first of the two staleness checks: before it is shown.
-                from mailmind.suggest import staleness
-
                 staleness.refresh_bundle(scope, bundle)
                 scope.commit()
             detail = views.bundle_detail(scope, bundle_id)

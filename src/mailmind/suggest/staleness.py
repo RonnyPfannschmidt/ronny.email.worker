@@ -77,6 +77,12 @@ def refresh_bundle(scope: TenantScope, bundle: m.Bundle) -> dict[int, Freshness]
 
     Called before the bundle is shown.  Items that have gone stale are marked, not
     hidden: 03 says a reviewer is told what changed.
+
+    A bundle whose every item dies this way dies with them.  It cannot be accepted —
+    there is nothing left to apply — and it must not have to be *rejected*, because
+    rejecting is a person saying no and no person said anything: the mail moved on by
+    itself.  So it goes to :attr:`~mailmind.db.models.BundleStatus.stale` here, which
+    takes it out of the queue and leaves a record of what actually happened.
     """
     verdicts: dict[int, Freshness] = {}
     for suggestion in bundle.suggestions:
@@ -97,4 +103,56 @@ def refresh_bundle(scope: TenantScope, bundle: m.Bundle) -> dict[int, Freshness]
                 subject_id=suggestion.id,
                 payload={"detail": verdict.detail},
             )
+
+    _close_if_nothing_survived(scope, bundle)
     return verdicts
+
+
+def _close_if_nothing_survived(scope: TenantScope, bundle: m.Bundle) -> None:
+    """Take a bundle out of the queue once staleness has emptied it.
+
+    Only when something actually went stale.  A bundle the reviewer emptied by excluding
+    every item is a different story with a person in it, and is not this.
+    """
+    if bundle.status is not m.BundleStatus.proposed:
+        return
+    live = [
+        s
+        for s in bundle.suggestions
+        if s.status in (m.SuggestionStatus.proposed, m.SuggestionStatus.accepted)
+    ]
+    died = [s for s in bundle.suggestions if s.status is m.SuggestionStatus.stale]
+    if live or not died:
+        return
+
+    bundle.status = m.BundleStatus.stale
+    scope.audit(
+        "bundle_stale",
+        actor_kind="service",
+        subject_kind="bundle",
+        subject_id=bundle.id,
+        payload={"items": len(died)},
+    )
+
+
+def sweep_queue(scope: TenantScope, account_ids: set[int] | None = None) -> int:
+    """Refresh every bundle still awaiting review, and return how many closed.
+
+    Drawing the queue is the moment somebody is about to act on it, so it is also the
+    moment a bundle that quietly died should stop being offered.  Without this a bundle
+    whose messages all moved keeps its place in the list until somebody opens it, which is
+    exactly the click this is meant to save them.
+
+    The work is one freshness check per live item of each proposed bundle.  A review queue
+    is a human queue — a handful of bundles somebody is going to read — so this is bounded
+    by what a person can get through, not by the size of the mailbox.
+    """
+    stmt = sa.select(m.Bundle).where(m.Bundle.status == m.BundleStatus.proposed)
+    if account_ids is not None:
+        stmt = stmt.where(m.Bundle.account_id.in_(account_ids))
+    closed = 0
+    for bundle in scope.scalars(stmt):
+        refresh_bundle(scope, bundle)
+        if bundle.status is m.BundleStatus.stale:
+            closed += 1
+    return closed

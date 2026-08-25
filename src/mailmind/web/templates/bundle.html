@@ -134,6 +134,12 @@ message was untouched between the check and the change — it does not mean it w
     <button>Reject</button>
   </form>
 </div>
+{% elif bundle.status == "stale" %}
+<p class="small warn">
+  Every message this referred to moved on before anybody decided, so there is nothing left
+  to apply and this closed itself. Nobody rejected it — see what changed against each
+  message above.
+</p>
 {% else %}
 <p class="small muted">
   {{ bundle.status }}{% if bundle.decided_by %} by {{ bundle.decided_by }}{% endif %}

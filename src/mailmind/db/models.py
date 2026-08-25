@@ -555,6 +555,11 @@ class BundleStatus(enum.Enum):
     withdrawn = "withdrawn"
     superseded = "superseded"
     expired = "expired"
+    #: Every message this referred to moved on before anybody decided.  There is nothing
+    #: left to apply and nobody rejected it — the same thing ``stale`` means for a single
+    #: suggestion, said about the whole bundle.  Terminal, and reached without a decision,
+    #: which is why it is not ``rejected``: the reviewer did not turn it down.
+    stale = "stale"
 
 
 class Bundle(Base, TenantScoped):

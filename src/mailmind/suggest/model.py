@@ -169,6 +169,15 @@ def accept(
         raise ProposalRefused(f"this bundle is {bundle.status.value}, not awaiting review")
 
     staleness.refresh_bundle(scope, bundle)
+    if bundle.status is m.BundleStatus.stale:
+        # Everything it referred to moved on, so refreshing closed it just now.  Say that,
+        # rather than the older "every item has died", which read as a refusal to act on a
+        # bundle still sitting in the queue and left no way to clear it.
+        raise ProposalRefused(
+            "every message in this bundle moved on before it was accepted, so there is "
+            "nothing left to apply; it has been closed rather than rejected, because "
+            "nobody turned it down"
+        )
     stale = [s for s in bundle.suggestions if s.status is m.SuggestionStatus.stale]
     if stale and not acknowledge_stale:
         raise ProposalRefused(

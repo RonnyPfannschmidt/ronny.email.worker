@@ -760,6 +760,42 @@ def test_the_ui_refuses_to_accept_around_something_that_moved(client, backend, s
     assert response.status_code == 200
 
 
+def test_a_bundle_whose_every_message_moved_leaves_the_queue_by_itself(
+    client, backend, service
+):
+    """The stuck bundle, from where a person meets it.
+
+    Every message was filed by hand before the bundle was looked at. There is nothing to
+    apply, so accepting cannot work; rejecting would have recorded a refusal nobody made.
+    The queue used to keep showing it either way.
+    """
+    agent = Agent(client)
+    proposed = _propose(agent)
+
+    with service.scope() as scope:
+        bundle = scope.get(m.Bundle, proposed["bundle_id"])
+        uids = [s.premise_uid for s in bundle.suggestions]
+    for uid in uids:
+        backend.out_of_band_move("INBOX", uid, "Trash")
+    with service.scope() as scope:
+        account = scope.scalar(sa.select(m.Account).where(m.Account.name == "test"))
+        inbox = scope.scalar(sa.select(m.Container).where(m.Container.name == "INBOX"))
+        sync.sync_container(scope, account, inbox, backend)
+        scope.commit()
+
+    page = client.get(f"/bundle/{proposed['bundle_id']}").text
+    assert "closed itself" in page
+    assert "Accept — do this to the mailbox" not in page, "a dead bundle offers no buttons"
+
+    with service.scope() as scope:
+        assert scope.get(m.Bundle, proposed["bundle_id"]).status is m.BundleStatus.stale
+
+    # Gone from what is waiting, and nothing was done to the mailbox on the way out.
+    queue = client.get("/").text
+    assert "Newsletter issues" not in queue.split("Awaiting review")[-1].split("<h2")[0]
+    assert len(backend.folders["Archive"].messages) == 0
+
+
 def test_a_rejection_can_carry_a_reason_and_is_as_easy_as_accepting(client, backend):
     agent = Agent(client)
     proposed = _propose(agent)

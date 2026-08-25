@@ -12,6 +12,7 @@ import datetime as dt
 import pytest
 import sqlalchemy as sa
 
+from mailmind import views
 from mailmind.db import models as m
 from mailmind.imap import apply as applier
 from mailmind.imap import sync
@@ -495,6 +496,90 @@ def test_a_bundle_that_lost_every_item_is_not_reported_as_applied(scope, world, 
         applier.apply_bundle(scope, bundle, backend)
     assert "nothing was done to the mailbox" in str(refused.value)
     assert bundle.status is m.BundleStatus.accepted
+
+
+def test_a_bundle_nobody_decided_and_nothing_survived_closes_itself(scope, world, backend):
+    """The bug: it could be neither accepted nor honestly closed.
+
+    Accepting is impossible, because there is nothing left to apply. Rejecting would work
+    mechanically and would record a person saying no — but no person said anything, the
+    mail moved on by itself. So the bundle left in the queue could only be cleared by
+    writing down something that did not happen.
+
+    It now dies the way its items did.
+    """
+    from mailmind.suggest import staleness
+
+    bundle = _bundle(scope, world, ["newsletter"])
+    assert bundle.status is m.BundleStatus.proposed
+
+    # Filed by the person in their own client, and the next sync notices.
+    backend.out_of_band_move("INBOX", world["uids"]["newsletter"], "Archive")
+    sync.sync_container(scope, world["account"], world["containers"]["INBOX"], backend)
+    staleness.refresh_bundle(scope, bundle)
+
+    assert bundle.status is m.BundleStatus.stale
+    assert bundle.decided_by_id is None, "nobody decided it, so nobody is recorded as having"
+    assert bundle.decided_at is None
+
+    # And it is out of the queue rather than sitting there looking actionable.
+    waiting = views.bundle_summaries(scope, [m.BundleStatus.proposed])
+    assert [b for b in waiting if b["bundle_id"] == bundle.id] == []
+
+
+def test_drawing_the_queue_retires_what_died_in_it(scope, world, backend):
+    """Somebody looking at the queue is about to act on it.
+
+    So that is the moment a dead bundle stops being offered, rather than after they open
+    it to find out. Otherwise the queue shows work that cannot be done and the only way to
+    learn that is the click this saves.
+    """
+    from mailmind.suggest import staleness
+
+    bundle = _bundle(scope, world, ["newsletter"])
+    backend.out_of_band_move("INBOX", world["uids"]["newsletter"], "Archive")
+    sync.sync_container(scope, world["account"], world["containers"]["INBOX"], backend)
+
+    assert staleness.sweep_queue(scope) == 1
+    assert bundle.status is m.BundleStatus.stale
+    assert views.bundle_summaries(scope, [m.BundleStatus.proposed]) == []
+
+
+def test_accepting_a_bundle_that_just_died_says_so_rather_than_refusing_forever(
+    scope, world, backend
+):
+    """The same thing, reached through accept rather than through looking at the page.
+
+    Whoever presses accept has not seen the bundle since it died, so the refusal is the
+    only place they learn what happened. It says the bundle closed, not that the accept
+    was rejected.
+    """
+    bundle = _bundle(scope, world, ["newsletter"])
+    backend.out_of_band_move("INBOX", world["uids"]["newsletter"], "Archive")
+    sync.sync_container(scope, world["account"], world["containers"]["INBOX"], backend)
+
+    with pytest.raises(suggest.ProposalRefused) as refused:
+        suggest.accept(scope, bundle, world["reviewer"], acknowledge_stale=True)
+    assert "nothing left to apply" in str(refused.value)
+    assert "closed rather than rejected" in str(refused.value)
+    assert bundle.status is m.BundleStatus.stale
+
+
+def test_a_reviewer_emptying_a_bundle_is_not_the_world_moving(scope, world, backend):
+    """Excluding every item is a person deciding, so it is not recorded as staleness.
+
+    The bundle stays proposed and stays theirs to reject. Guarding the boundary here
+    because `stale` is a claim about the mailbox, and it should never be made about
+    something a person did.
+    """
+    bundle = _bundle(scope, world, ["newsletter"])
+    for suggestion in list(bundle.suggestions):
+        suggest.exclude(scope, suggestion, world["reviewer"])
+
+    from mailmind.suggest import staleness
+
+    staleness.refresh_bundle(scope, bundle)
+    assert bundle.status is m.BundleStatus.proposed
 
 
 def test_a_recreated_folder_kills_everything_resting_on_it(scope, world, backend):
