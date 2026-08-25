@@ -36,11 +36,30 @@ absolute.
 
 ```
 mailmindctl serve
+```
+
+Then point the client at `http://127.0.0.1:8765/mcp/` and let it log in. A client that
+speaks MCP's OAuth — `opencode mcp auth mailmind`, and most others — discovers the rest from
+the `401`: it registers itself, opens a browser, and you get a page asking what it may do.
+Nothing is copied anywhere.
+
+The page is part of the review UI, so it is behind the same login: follow the link
+`mailmindctl serve` printed, then agree. What the agent gets is what you tick — it does not
+ask for capabilities and cannot ask for too many — and you take it back on the
+review UI's `/agents` page.
+
+Behind a proxy, set `public_url` to the address people actually reach, because that is what
+the client is told to come back to. See [configuration](reference/configuration.md).
+
+### By hand, for a client that cannot log in
+
+```
 mailmindctl grant --producer mail-agent --capability observe --capability suggest
 ```
 
-Then `http://127.0.0.1:8765/mcp/` with `Authorization: Bearer <token>`. The token is printed
-once; only its hash is stored.
+Then the same URL with `Authorization: Bearer <token>`. The token is printed once; only its
+hash is stored. This still works and is not going away — it is how you drive the endpoint
+from `curl`, and the only way in for a client with no OAuth of its own.
 
 Two things that otherwise cost an evening: **the trailing slash** — a POST to `/mcp` is a
 307 that some clients follow and some do not, and the failure looks like a bad token — and
@@ -61,6 +80,9 @@ account outside the grant reads as *absent* rather than forbidden.
 
 There is no fourth. Ask for less than you think you need; `assess` belongs to something
 other than the producer that proposes acting on what it read.
+
+Logging in, the choice is not the agent's at all: it asks for nothing in particular and a
+person ticks the boxes. `--capability` is the same decision made on the command line.
 
 Over stdio, `--producer NAME` reuses that producer's grant if it has one, so minting a
 narrow one first gives you the narrow one. A producer with no grant at all gets a full one,

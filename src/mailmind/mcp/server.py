@@ -22,9 +22,13 @@ from mailmind.db.scope import TenantScope
 from mailmind.service import Service
 from mailmind.suggest import model as suggest
 
-#: The resolved grant for the request being served.  Set by the auth middleware in
-#: :mod:`mailmind.web.app` before any tool runs; there is no other way to set it, and no
-#: tool takes a tenant or an identity as an argument.
+#: The resolved grant for the request being served, when the caller is on a pipe.  Set by
+#: :func:`local_context` for the stdio server, where there is no token to resolve and no
+#: request to hang one off.
+#:
+#: Over HTTP it stays unset and the grant comes from the verified bearer token instead —
+#: see :func:`_grant`.  Either way no tool takes a tenant or an identity as an argument,
+#: which is the property that matters: an agent cannot assert who it is.
 CURRENT_GRANT: contextvars.ContextVar[dict[str, Any] | None] = contextvars.ContextVar(
     "mailmind_grant", default=None
 )
@@ -35,10 +39,24 @@ class NotPermitted(Exception):
 
 
 def _grant() -> dict[str, Any]:
+    """The grant this request carries, from whichever of the two ways it arrived.
+
+    On a pipe it is in the contextvar, put there by whoever started the process.  Over
+    HTTP it rode in on the bearer token, which the SDK has already verified by the time
+    any tool runs — :meth:`mailmind.mcp.oauth.MailmindAuthorizationServer.load_access_token`
+    resolved it to a grant and attached the view, so there is nothing to look up again.
+    """
     grant = CURRENT_GRANT.get()
-    if grant is None:
+    if grant is not None:
+        return grant
+
+    from mcp.server.auth.middleware.auth_context import get_access_token
+
+    token = get_access_token()
+    view = getattr(token, "grant_view", None) if token is not None else None
+    if view is None:
         raise NotPermitted("no grant on this request")
-    return grant
+    return view
 
 
 def _require(capability: m.Capability) -> dict[str, Any]:
@@ -90,16 +108,33 @@ def _bundle(scope: TenantScope, grant: dict[str, Any], bundle_id: int) -> m.Bund
     return bundle
 
 
-def build_server(service: Service, *, review_url: str | None = None) -> MCPServer:
+def build_server(
+    service: Service, *, review_url: str | None = None, public_url: str | None = None
+) -> MCPServer:
     """The agent surface.
 
     ``review_url`` is where the person reviewing is: told to the model at connect time and
     repeated on every proposal, because a suggestion nobody is told about is a suggestion
     nobody reviews.  It is set when this process is also serving the review UI, which is
     what the stdio mode does.
+
+    ``public_url`` turns on OAuth, and is the address a *client* reaches this service at —
+    which behind a proxy is not the address it binds.  With it, ``/mcp`` answers an
+    unauthenticated request with a ``401`` naming where to go, which is the whole of how a
+    client discovers it can log in.  Without it there is no authorization server, which is
+    the stdio case: there is no token on a pipe and nothing to issue one to.
     """
+    auth_settings = None
+    auth_provider = None
+    if public_url is not None:
+        from mailmind.mcp.oauth import settings_and_provider
+
+        auth_settings, auth_provider = settings_and_provider(service, public_url)
+
     server = MCPServer(
         name="mailmind",
+        auth=auth_settings,
+        auth_server_provider=auth_provider,
         instructions=(
             "Browse a mailbox and propose changes to it. You cannot change anything "
             "yourself: every proposal is reviewed by the person who owns the mail before "

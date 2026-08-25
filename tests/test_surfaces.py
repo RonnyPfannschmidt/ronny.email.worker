@@ -7,8 +7,12 @@ is here, and none of it changes a mailbox.
 
 from __future__ import annotations
 
+import base64
 import datetime as dt
+import hashlib
 import json
+import secrets
+from urllib.parse import parse_qs, urlparse
 
 import attrs
 import pytest
@@ -21,10 +25,11 @@ from mailmind.db.migrate import upgrade_to_head
 from mailmind.imap import sync
 from mailmind.imap.backend import TRASH, MailboxUnhealthy
 from mailmind.imap.capabilities import probe_account
+from mailmind.mcp import oauth
 from mailmind.mcp import server as mcp_server
 from mailmind.service import Service, hash_token
 from mailmind.web import app as app_module
-from mailmind.web.app import SESSION_KEY_PARAM, create_app
+from mailmind.web.app import SESSION_KEY_PARAM, create_app, is_machine_path
 from tests.corpus import CORPUS
 from tests.targets.fake import FakeBackend
 
@@ -187,9 +192,7 @@ class Agent:
         result = self._post("prompts/get", {"name": name, "arguments": arguments or {}})
         if "error" in result:
             raise AssertionError(result["error"])
-        return "".join(
-            message["content"]["text"] for message in result["result"]["messages"]
-        )
+        return "".join(message["content"]["text"] for message in result["result"]["messages"])
 
     def read(self, uri: str):  # noqa: ANN201
         import json
@@ -318,21 +321,29 @@ def test_the_mcp_module_does_not_import_the_applier():
     assert not [name for name in imported if "apply" in name], sorted(imported)
 
 
+#: What a refusal for want of a grant looks like from the outside.
+#:
+#: Two wordings because the refusal happens in two places, depending on how the caller
+#: arrived.  Over HTTP the transport rejects an unusable token before a tool runs, and says
+#: ``invalid_token``; on a pipe there is no token to reject and a tool says ``no grant on
+#: this request``.  Both mean the caller got no view, which is the whole of what these
+#: tests are about.
+NO_GRANT = ("grant", "invalid_token")
+
+
 def test_without_a_token_there_is_no_view_at_all(client):
     agent = Agent(client, token=None)
     try:
         agent.call("list_accounts")
     except (ToolRefused, AssertionError) as exc:
-        assert "grant" in str(exc).lower()
+        assert any(wording in str(exc).lower() for wording in NO_GRANT), exc
     else:
         raise AssertionError("an unauthenticated caller got a view")
 
 
 def test_an_agent_sees_only_the_accounts_its_grant_covers(client, service):
     with service.scope() as scope:
-        scope.add(
-            m.Account(name="other", host="h", username="u2", password_url="env://Y")
-        )
+        scope.add(m.Account(name="other", host="h", username="u2", password_url="env://Y"))
         scope.commit()
     accounts = Agent(client).call("list_accounts")
     assert [a["name"] for a in accounts] == ["test"]
@@ -371,17 +382,11 @@ def other_account(service):
             m.Account(name="other", host="h", username="u2", password_url="env://Y")
         )
         scope.flush()
-        containers = {
-            c.name: c for c in sync.discover_containers(scope, account, elsewhere)
-        }
+        containers = {c.name: c for c in sync.discover_containers(scope, account, elsewhere)}
         for container in containers.values():
             sync.sync_container(scope, account, container, elsewhere)
-        message = scope.scalar(
-            sa.select(m.Message).where(m.Message.account_id == account.id)
-        )
-        producer = scope.scalar(
-            sa.select(m.Producer).where(m.Producer.name == "opencode")
-        )
+        message = scope.scalar(sa.select(m.Message).where(m.Message.account_id == account.id))
+        producer = scope.scalar(sa.select(m.Producer).where(m.Producer.name == "opencode"))
         bundle = suggest.propose_bundle(
             scope,
             producer=producer,
@@ -427,7 +432,7 @@ def test_a_grant_expiry_is_honoured_rather_than_taking_the_endpoint_down(client,
     set_expiry(-dt.timedelta(seconds=1))
     with pytest.raises((ToolRefused, AssertionError)) as refused:
         Agent(client).call("list_accounts")
-    assert "grant" in str(refused.value).lower()
+    assert any(wording in str(refused.value).lower() for wording in NO_GRANT), refused.value
 
 
 def test_an_account_outside_the_grant_is_absent_from_every_tool(client, other_account):
@@ -871,12 +876,25 @@ def test_an_unauthenticated_review_ui_refuses_to_listen_to_the_network(service, 
     assert "bearer token" in str(refused.value)
 
     # Somebody else authenticating is the other way to hold up the same bargain, and it
-    # has to be said out loud because nothing here can check it.
-    proxied = Service(
-        attrs.evolve(service.config, bind="0.0.0.0", behind_auth_proxy=True),  # noqa: S104
-        backend_factory=lambda _config: backend,
-    )
-    app = create_app(proxied, session_key=SESSION_KEY)
+    # has to be said out loud because nothing here can check it.  So is where people
+    # actually reach the thing: a wildcard is not an address anybody connects to, and an
+    # agent told to log in there would be told to log in nowhere.
+    def proxied(**extra) -> Service:  # noqa: ANN003
+        return Service(
+            attrs.evolve(
+                service.config,
+                bind="0.0.0.0",  # noqa: S104 — the point of the test
+                behind_auth_proxy=True,
+                **extra,
+            ),
+            backend_factory=lambda _config: backend,
+        )
+
+    with pytest.raises(ConfigError) as unreachable:
+        create_app(proxied())
+    assert "public_url" in str(unreachable.value)
+
+    app = create_app(proxied(public_url="https://mail.example.com"), session_key=SESSION_KEY)
     with opened(app) as client:
         assert client.get("/").status_code == 200
 
@@ -1119,9 +1137,7 @@ NOT_A_GESTURE = {
 
 
 @pytest.mark.parametrize("why", list(NOT_A_GESTURE))
-def test_the_review_ui_refuses_a_change_that_is_not_a_person_at_a_browser(
-    client, backend, why
-):
+def test_the_review_ui_refuses_a_change_that_is_not_a_person_at_a_browser(client, backend, why):
     """One POST to the address the agent is handed used to accept a bundle and move mail.
 
     It is still not a security boundary — anything that can set a header can say all of
@@ -1204,3 +1220,373 @@ def test_the_review_pages_forbid_remote_content(client):
     csp = response.headers["content-security-policy"]
     assert "img-src 'none'" in csp
     assert "default-src 'none'" in csp
+
+
+# =====================================================================================
+# Logging an agent in
+#
+# Not what an agent may do once it holds a grant, but how it comes by one without anybody
+# copying a token out of a terminal.  The flow is the ordinary OAuth one, driven the way a
+# real client drives it.  What is particular to mailmind is the middle: the page where
+# somebody decides is a page in the review UI, guarded by the same key as every other page,
+# and what the agent asked for is not what it gets.
+# =====================================================================================
+
+REDIRECT = "http://127.0.0.1:9999/oauth/callback"
+
+
+def pkce() -> tuple[str, str]:
+    verifier = secrets.token_urlsafe(48)
+    digest = hashlib.sha256(verifier.encode()).digest()
+    return verifier, base64.urlsafe_b64encode(digest).decode().rstrip("=")
+
+
+def register(client, name: str = "OpenCode") -> str:
+    """What a client does when it has never been here before."""
+    response = client.post(
+        "/register",
+        json={
+            "redirect_uris": [REDIRECT],
+            "client_name": name,
+            "grant_types": ["authorization_code", "refresh_token"],
+            "response_types": ["code"],
+            "token_endpoint_auth_method": "none",
+        },
+    )
+    assert response.status_code == 201, response.text
+    return response.json()["client_id"]
+
+
+def ask(client, client_id: str, challenge: str) -> str:
+    """Start the flow, and return the consent request it parks."""
+    response = client.get(
+        "/authorize",
+        params={
+            "client_id": client_id,
+            "response_type": "code",
+            "redirect_uri": REDIRECT,
+            "code_challenge": challenge,
+            "code_challenge_method": "S256",
+            "state": "opaque-to-us",
+        },
+        follow_redirects=False,
+    )
+    assert response.status_code in (302, 303, 307), response.text
+    location = response.headers["location"]
+    assert location.startswith("/consent?"), location
+    return parse_qs(urlparse(location).query)["request"][0]
+
+
+def agree(client, request_id: str, *, capabilities=("observe", "suggest"), accounts=(1,)):
+    """Somebody at the browser ticking boxes and pressing allow."""
+    response = as_a_person(
+        client,
+        "/consent",
+        data={
+            "request_id": request_id,
+            "decision": "allow",
+            "capabilities": list(capabilities),
+            "account_ids": [str(a) for a in accounts],
+        },
+        follow_redirects=False,
+    )
+    assert response.status_code == 303, response.text
+    handed_back = parse_qs(urlparse(response.headers["location"]).query)
+    assert handed_back["state"] == ["opaque-to-us"]
+    return handed_back["code"][0]
+
+
+def redeem(client, client_id: str, code: str, verifier: str) -> dict:
+    response = client.post(
+        "/token",
+        data={
+            "grant_type": "authorization_code",
+            "code": code,
+            "client_id": client_id,
+            "redirect_uri": REDIRECT,
+            "code_verifier": verifier,
+        },
+    )
+    assert response.status_code == 200, response.text
+    return response.json()
+
+
+def log_in(client, **agreed) -> dict:
+    """The whole walk, for tests that are about what happens afterwards."""
+    verifier, challenge = pkce()
+    client_id = register(client)
+    request_id = ask(client, client_id, challenge)
+    code = agree(client, request_id, **agreed)
+    return {"client_id": client_id, **redeem(client, client_id, code, verifier)}
+
+
+# --------------------------------------------------------------- what is behind the key
+
+
+def test_the_page_where_somebody_decides_is_not_a_machine_endpoint():
+    """The one page in this flow a person uses is guarded like every other page.
+
+    Everything else here is a client talking to a service and has no key to offer, which
+    is why the exemption exists at all. Writing it as a list rather than a prefix is what
+    makes this assertable — a future endpoint is exempt by being added, not by accident.
+    """
+    for machine in ("/authorize", "/token", "/register", "/revoke"):
+        assert is_machine_path(machine), machine
+    assert is_machine_path("/.well-known/oauth-authorization-server")
+    assert is_machine_path("/mcp/")
+
+    for guarded in ("/consent", "/agents", "/agents/1/revoke", "/", "/accounts"):
+        assert not is_machine_path(guarded), guarded
+
+
+def test_the_consent_page_says_what_it_is_agreeing_to(client):
+    """The page a person actually reads, actually rendered.
+
+    Worth its own test because every other test here walks straight past it: the flow can
+    be driven to a token without the template ever being built, so a broken page fails
+    only in front of somebody.
+    """
+    _, challenge = pkce()
+    request_id = ask(client, register(client), challenge)
+
+    page = client.get(f"/consent?request={request_id}")
+    assert page.status_code == 200
+
+    # The name it chose for itself, and the fact that it chose it.
+    assert "OpenCode" in page.text
+    assert "Nothing checked it" in page.text
+    # Everything a grant can hold is offered, and the account it would cover is named.
+    for capability in m.Capability:
+        assert f'value="{capability.value}"' in page.text
+    assert "test" in page.text
+    # There is no apply to tick, and the page says why.
+    assert "no <em>apply</em> to tick" in page.text
+
+
+def test_an_agent_that_follows_its_own_link_is_told_to_fetch_a_person(service):
+    """The consent page is not a page an agent can answer for itself."""
+    from fastapi.testclient import TestClient
+
+    from mailmind.web.app import create_app
+
+    # No cookie: this client never followed the link a person was shown.
+    stranger = TestClient(create_app(service, session_key="unused"))
+    refused = stranger.get("/consent?request=whatever")
+    assert refused.status_code == 401
+    assert "not given that key" in refused.text
+
+
+# ------------------------------------------------------------------------- discovery
+
+
+def test_an_unauthenticated_call_says_where_to_log_in(client):
+    """The 401 is the whole of how a client finds out it can log in.
+
+    Before this, an agent with no token got a 200 and a refusal from inside a tool, which
+    tells a client nothing it can act on.
+    """
+    response = client.post(
+        "/mcp/",
+        headers={"Accept": "application/json, text/event-stream"},
+        json={"jsonrpc": "2.0", "id": 1, "method": "tools/list"},
+    )
+    assert response.status_code == 401
+    challenge = response.headers["www-authenticate"]
+    assert "resource_metadata=" in challenge
+
+    metadata = client.get("/.well-known/oauth-protected-resource/mcp").json()
+    assert metadata["resource"].endswith("/mcp")
+    served_by = metadata["authorization_servers"][0].rstrip("/")
+    assert client.get("/.well-known/oauth-authorization-server").status_code == 200
+    assert served_by
+
+
+# ------------------------------------------------------------------------ the walk
+
+
+def test_an_agent_logs_in_and_gets_the_grant_it_was_given(client):
+    issued = log_in(client)
+    assert issued["token_type"] == "Bearer"
+    assert issued["refresh_token"]
+
+    agent = Agent(client, token=issued["access_token"])
+    assert [a["name"] for a in agent.call("list_accounts")] == ["test"]
+
+
+def test_what_the_agent_gets_is_what_the_person_ticked(client):
+    """The agent does not ask for capabilities, so it cannot ask for too many.
+
+    Untick `suggest` and proposing is not a thing that grant can do — and it fails saying
+    so, which is a legible thing for a model to read.
+    """
+    issued = log_in(client, capabilities=("observe",))
+    agent = Agent(client, token=issued["access_token"])
+
+    assert agent.call("list_accounts"), "observing was ticked and did not work"
+    with pytest.raises(ToolRefused) as refused:
+        agent.call(
+            "propose_bundle",
+            account_id=1,
+            operation="delete",
+            message_ids=[1],
+            summary="one message",
+            reason="the capability check should come first",
+        )
+    assert "suggest" in str(refused.value)
+
+
+def test_mail_nobody_ticked_is_not_in_the_grant(client, service):
+    """No accounts ticked means no mail, rather than all of it."""
+    issued = log_in(client, accounts=())
+    agent = Agent(client, token=issued["access_token"])
+    assert agent.call("list_accounts") == []
+
+
+def test_refusing_hands_the_client_an_answer_rather_than_silence(client):
+    verifier, challenge = pkce()
+    client_id = register(client)
+    request_id = ask(client, client_id, challenge)
+
+    response = as_a_person(
+        client,
+        "/consent",
+        data={"request_id": request_id, "decision": "refuse"},
+        follow_redirects=False,
+    )
+    assert response.status_code == 303
+    assert "access_denied" in response.headers["location"]
+
+
+def test_a_code_is_redeemable_once(client):
+    verifier, challenge = pkce()
+    client_id = register(client)
+    request_id = ask(client, client_id, challenge)
+    code = agree(client, request_id)
+
+    assert redeem(client, client_id, code, verifier)["access_token"]
+    again = client.post(
+        "/token",
+        data={
+            "grant_type": "authorization_code",
+            "code": code,
+            "client_id": client_id,
+            "redirect_uri": REDIRECT,
+            "code_verifier": verifier,
+        },
+    )
+    assert again.status_code == 400, again.text
+
+
+# ---------------------------------------------------------------------- afterwards
+
+
+def test_refreshing_rotates_and_the_old_one_stops_working(client):
+    issued = log_in(client)
+    first = issued["refresh_token"]
+
+    rotated = client.post(
+        "/token",
+        data={
+            "grant_type": "refresh_token",
+            "refresh_token": first,
+            "client_id": issued["client_id"],
+        },
+    )
+    assert rotated.status_code == 200, rotated.text
+    second = rotated.json()
+    assert second["refresh_token"] != first
+
+    # The new access token works and the spent refresh token does not.
+    assert Agent(client, token=second["access_token"]).call("list_accounts")
+    replayed = client.post(
+        "/token",
+        data={
+            "grant_type": "refresh_token",
+            "refresh_token": first,
+            "client_id": issued["client_id"],
+        },
+    )
+    assert replayed.status_code == 400, replayed.text
+
+
+def test_refreshing_does_not_multiply_what_a_person_agreed_to(client, service):
+    """Tokens rotate; the decision does not.
+
+    This is the reason a token is not a grant. If it were, an hourly refresh would leave
+    the agents page listing a fresh consent every hour and "what did I agree to" would
+    stop being answerable.
+    """
+    issued = log_in(client)
+    with service.scope() as scope:
+        before = len(scope.scalars(sa.select(m.Grant)).all())
+
+    for _ in range(3):
+        issued = {
+            "client_id": issued["client_id"],
+            **client.post(
+                "/token",
+                data={
+                    "grant_type": "refresh_token",
+                    "refresh_token": issued["refresh_token"],
+                    "client_id": issued["client_id"],
+                },
+            ).json(),
+        }
+
+    with service.scope() as scope:
+        assert len(scope.scalars(sa.select(m.Grant)).all()) == before
+
+
+def test_revoking_on_the_agents_page_stops_a_token_that_was_working(client, service):
+    issued = log_in(client)
+    agent = Agent(client, token=issued["access_token"])
+    assert agent.call("list_accounts"), "the grant did not work before it was revoked"
+
+    listed = client.get("/agents")
+    assert "OpenCode" in listed.text
+
+    with service.scope() as scope:
+        grant = scope.scalar(sa.select(m.Grant).where(m.Grant.client_id.is_not(None)))
+        grant_id = grant.id
+    as_a_person(client, f"/agents/{grant_id}/revoke")
+
+    with pytest.raises((ToolRefused, AssertionError)):
+        Agent(client, token=issued["access_token"]).call("list_accounts")
+
+
+def test_a_token_minted_on_the_command_line_still_works(client):
+    """The regression that would be quietest.
+
+    Turning authentication on hands the SDK the right to refuse anything it does not
+    recognise, and every client configured the old way holds exactly such a token.
+    """
+    assert [a["name"] for a in Agent(client, token=TOKEN).call("list_accounts")] == ["test"]
+
+
+def test_an_expired_access_token_is_refused(client, service):
+    issued = log_in(client)
+    with service.scope() as scope:
+        row = scope.scalar(
+            sa.select(m.OAuthToken).where(m.OAuthToken.kind == m.OAuthTokenKind.access)
+        )
+        row.expires_at = dt.datetime.now(dt.UTC) - dt.timedelta(seconds=1)
+        scope.commit()
+
+    with pytest.raises((ToolRefused, AssertionError)):
+        Agent(client, token=issued["access_token"]).call("list_accounts")
+
+
+def test_a_stale_consent_request_cannot_be_answered(client, service):
+    verifier, challenge = pkce()
+    client_id = register(client)
+    request_id = ask(client, client_id, challenge)
+
+    with service.scope() as scope:
+        row = scope.scalar(
+            sa.select(m.OAuthAuthorization).where(m.OAuthAuthorization.request_id == request_id)
+        )
+        row.expires_at = dt.datetime.now(dt.UTC) - dt.timedelta(seconds=1)
+        scope.commit()
+
+    assert client.get(f"/consent?request={request_id}").status_code == 404
+    assert oauth.REQUEST_TTL > dt.timedelta(0)

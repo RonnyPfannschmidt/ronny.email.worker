@@ -67,6 +67,7 @@ nav:
       - 10 — Running it: design/10-running-it.md
       - 11 — Deployment and identity: design/11-deployment-and-identity.md
       - 12 — An agent of your own: design/12-an-agent-of-your-own.md
+      - 13 — Logging an agent in: design/13-logging-an-agent-in.md
       - History:
           - design/history/index.md
           - Testability & CI plan: design/history/2026-08-12-mailmind-testability-and-ci-plan.md

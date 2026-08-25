@@ -19,6 +19,7 @@ database_url = "sqlite:///mailmind.db"
 bind = "127.0.0.1"
 port = 8765
 # behind_auth_proxy = false
+# public_url = "https://mailmind.example.com"
 ```
 
 | Key | Default | |
@@ -27,9 +28,17 @@ port = 8765
 | `bind` | `127.0.0.1` | Must be loopback unless `behind_auth_proxy`. |
 | `port` | `8765` | Both processes read this, which keeps the advertised address honest. |
 | `behind_auth_proxy` | `false` | Asserts that something in front authenticates. |
+| `public_url` | derived from `bind` and `port` | Where clients reach this, which behind a proxy is not where it binds. |
 
 `behind_auth_proxy` cannot be checked from inside the process, which is why it is asserted
 rather than inferred — [what it commits you to](../security-model.md#loopback).
+
+`public_url` is what an agent is told to come back to when it logs in, so a wrong one sends
+clients somewhere they cannot reach. Derived from `bind` and `port`, which is right on a
+loopback install and wrong the moment anything is in front — a wildcard bind is not an
+address anybody connects to, and an OAuth issuer may not be plain HTTP anywhere but
+loopback. A deployment that leaves it unset is refused at startup rather than coming up
+with no way for an agent to log in.
 
 ```toml
 [limits]

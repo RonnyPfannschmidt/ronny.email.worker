@@ -161,6 +161,11 @@ class Grant(Base, TenantScoped):
     producer_id: Mapped[int] = mapped_column(sa.ForeignKey("producer.id"))
     token_hash: Mapped[str] = mapped_column(sa.String(64), unique=True)
     capabilities: Mapped[list[str]] = mapped_column(default=list)
+    #: Which client this was consented to, when it was consented to rather than minted on
+    #: the command line.  Null for a grant from ``mailmindctl grant``, which is nobody's
+    #: client in particular.  Names a row in ``oauth_client``, whose contents the client
+    #: asserted about itself.
+    client_id: Mapped[str | None] = mapped_column(sa.String(64), default=None)
     created_at: Mapped[dt.datetime] = mapped_column(default=utcnow)
     expires_at: Mapped[dt.datetime | None] = mapped_column(default=None)
     revoked_at: Mapped[dt.datetime | None] = mapped_column(default=None)
@@ -186,6 +191,104 @@ class GrantAccount(Base, TenantScoped):
     grant: Mapped[Grant] = relationship(back_populates="accounts")
 
     __table_args__ = (sa.UniqueConstraint("grant_id", "account_id"),)
+
+
+# ------------------------------------------------------------------------------ oauth
+#
+# How a grant is come by, when nobody is copying a token out of a terminal.  The grant
+# above is still the whole of what an agent may do; everything here is the walk that
+# produces one, and the credentials that point back at it.
+
+
+class OAuthClient(Base, TenantScoped):
+    """A client that registered itself.
+
+    Every field is asserted by the client and checked by nobody — ``client_name`` in
+    particular is a name the agent chose for itself, which is the same trust as
+    ``--producer``.  The consent page says so rather than implying otherwise.
+
+    ``client_secret_hash`` is null for a public client, which is what an MCP client on a
+    desktop is: it holds no secret it could keep, and PKCE carries the proof instead.
+    """
+
+    __tablename__ = "oauth_client"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    client_id: Mapped[str] = mapped_column(sa.String(64), unique=True)
+    client_secret_hash: Mapped[str | None] = mapped_column(sa.String(64), default=None)
+    client_name: Mapped[str] = mapped_column(sa.String(128), default="")
+    redirect_uris: Mapped[list[str]] = mapped_column(default=list)
+    grant_types: Mapped[list[str]] = mapped_column(default=list)
+    response_types: Mapped[list[str]] = mapped_column(default=list)
+    scope: Mapped[str | None] = mapped_column(sa.String(256), default=None)
+    token_endpoint_auth_method: Mapped[str] = mapped_column(sa.String(32), default="none")
+    created_at: Mapped[dt.datetime] = mapped_column(default=utcnow)
+
+
+class OAuthAuthorization(Base, TenantScoped):
+    """One trip from ``/authorize`` to a token, in a single row.
+
+    It starts as a request nobody has agreed to: ``grant_id`` and ``code_hash`` are null
+    and the row is only the parameters the client arrived with.  Consent fills both in —
+    the grant is created there, because consent is the moment a person decides what the
+    agent may do, and there is nothing to point at before that.
+
+    Two expiries, because they protect different things.  ``expires_at`` bounds how long
+    an unanswered consent page stays answerable; ``code_expires_at`` bounds the seconds
+    between a person clicking allow and the client redeeming the code.
+    """
+
+    __tablename__ = "oauth_authorization"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    #: What appears in the consent URL.  Opaque, so the page cannot be reached by guessing.
+    request_id: Mapped[str] = mapped_column(sa.String(64), unique=True)
+    client_id: Mapped[str] = mapped_column(sa.String(64), index=True)
+    redirect_uri: Mapped[str] = mapped_column(sa.String(512))
+    redirect_uri_provided_explicitly: Mapped[bool] = mapped_column(default=False)
+    state: Mapped[str | None] = mapped_column(sa.String(512), default=None)
+    code_challenge: Mapped[str] = mapped_column(sa.String(256), default="")
+    scopes: Mapped[list[str]] = mapped_column(default=list)
+    resource: Mapped[str | None] = mapped_column(sa.String(512), default=None)
+    created_at: Mapped[dt.datetime] = mapped_column(default=utcnow)
+    expires_at: Mapped[dt.datetime | None] = mapped_column(default=None)
+
+    #: Null until somebody agrees.  Both are set together, and neither alone means anything.
+    grant_id: Mapped[int | None] = mapped_column(sa.ForeignKey("grant.id"), default=None)
+    code_hash: Mapped[str | None] = mapped_column(sa.String(64), unique=True, default=None)
+    code_expires_at: Mapped[dt.datetime | None] = mapped_column(default=None)
+    #: An authorization code is redeemable once.  A second attempt is evidence, not traffic.
+    used_at: Mapped[dt.datetime | None] = mapped_column(default=None)
+
+    grant: Mapped[Grant | None] = relationship()
+
+
+class OAuthTokenKind(enum.Enum):
+    access = "access"
+    refresh = "refresh"
+
+
+class OAuthToken(Base, TenantScoped):
+    """A credential pointing at a grant, which is the thing that was actually agreed to.
+
+    Tokens rotate and the grant does not: refreshing issues a new pair against the same
+    grant, so what a person consented to survives, and the ``/agents`` page keeps listing
+    one row per decision rather than one per hour.  Revoking the grant kills every token
+    under it without having to find them.
+    """
+
+    __tablename__ = "oauth_token"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    token_hash: Mapped[str] = mapped_column(sa.String(64), unique=True)
+    kind: Mapped[OAuthTokenKind] = mapped_column(_enum(OAuthTokenKind, "oauth_token_kind"))
+    grant_id: Mapped[int] = mapped_column(sa.ForeignKey("grant.id"), index=True)
+    client_id: Mapped[str] = mapped_column(sa.String(64))
+    created_at: Mapped[dt.datetime] = mapped_column(default=utcnow)
+    expires_at: Mapped[dt.datetime | None] = mapped_column(default=None)
+    revoked_at: Mapped[dt.datetime | None] = mapped_column(default=None)
+
+    grant: Mapped[Grant] = relationship()
 
 
 # --------------------------------------------------------------------- mailbox access

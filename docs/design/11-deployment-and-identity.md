@@ -187,9 +187,11 @@ accounts sticks.
   is definitely untested against somebody using two accounts in anger.
 - Is `behind_auth_proxy` the right shape, or should the escape hatch name what is in front
   of it, so the configuration says something checkable rather than something asserted?
-- A grant token is minted on the command line and printed once. On a shared deployment
+- ~~A grant token is minted on the command line and printed once. On a shared deployment
   that is the wrong place — but "the review UI mints agent tokens" gives the UI a power the
-  rest of the design is careful about.
+  rest of the design is careful about.~~ Answered by
+  [13](13-logging-an-agent-in.md): the UI does not mint, it consents to a request an agent
+  made, which is the narrower power. The command line stays for clients that cannot ask.
 - Does the account form ever hold a password long enough to write it into a secret store,
   or does it only ever accept a URL to one that is already there? The first is much nicer
   to use and puts a password through an HTTP request.

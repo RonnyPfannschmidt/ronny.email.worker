@@ -1,0 +1,63 @@
+{% extends "base.html" %}
+{% block title %}Let an agent in — mailmind{% endblock %}
+{% block content %}
+<h1>Let an agent in?</h1>
+
+{% if error %}<div class="banner error">{{ error }}</div>{% endif %}
+
+<p>Something asking to be called
+  <strong>{{ request_row.client_name or "an agent" }}</strong>
+  wants to work your mail.</p>
+
+<div class="banner">
+  That name is what it called itself. Nothing checked it, and nothing can — anything that
+  can reach this page can claim any name. Agree to this because you just started an agent
+  and are expecting it, not because the name looks right.
+</div>
+
+<form method="post" action="/consent">
+  <input type="hidden" name="request_id" value="{{ request_row.request_id }}">
+
+  <h2>What it may do</h2>
+  <p class="small muted">It did not ask for these. You decide, and it gets what you tick.</p>
+  <table>
+    {% for cap in capabilities %}
+    <tr>
+      <td style="width:1.5rem">
+        <input type="checkbox" id="cap-{{ cap.name }}" name="capabilities" value="{{ cap.name }}" checked>
+      </td>
+      <td><label for="cap-{{ cap.name }}"><strong>{{ cap.name }}</strong> — {{ cap.what }}</label></td>
+    </tr>
+    {% endfor %}
+  </table>
+  <p class="small muted">
+    There is no <em>apply</em> to tick. Nothing an agent holds can change a mailbox; every
+    proposal comes back here for you to accept.
+  </p>
+
+  <h2>Which mail</h2>
+  {% if accounts %}
+  <table>
+    {% for a in accounts %}
+    <tr>
+      <td style="width:1.5rem">
+        <input type="checkbox" id="acct-{{ a.id }}" name="account_ids" value="{{ a.id }}" checked>
+      </td>
+      <td><label for="acct-{{ a.id }}">{{ a.name }}</label></td>
+    </tr>
+    {% endfor %}
+  </table>
+  {% else %}
+  <p class="warn">There are no accounts yet, so there is no mail to give it.</p>
+  {% endif %}
+
+  <div class="actions">
+    <button name="decision" value="allow">allow</button>
+    <button name="decision" value="refuse">refuse</button>
+  </div>
+</form>
+
+<p class="small muted">
+  You can take this back at any time on the <a href="/agents">agents</a> page.
+</p>
+{% endblock %}

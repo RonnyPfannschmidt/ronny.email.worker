@@ -20,16 +20,18 @@ import sqlalchemy as sa
 from fastapi import FastAPI, Form, Request
 from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
+from mcp.server.auth.provider import construct_redirect_uri
 from mcp.server.transport_security import TransportSecuritySettings
 from starlette.concurrency import run_in_threadpool
 from starlette.middleware.base import BaseHTTPMiddleware
 
 from mailmind import views
-from mailmind.config import check_exposure, is_wildcard
+from mailmind.config import check_exposure, is_wildcard, oauth_issuer
 from mailmind.db import models as m
 from mailmind.imap import apply as applier
 from mailmind.imap import sync
 from mailmind.imap.backend import TRASH, MailboxUnhealthy
+from mailmind.mcp import oauth
 from mailmind.mcp import server as mcp_server
 from mailmind.service import Service
 from mailmind.suggest import model as suggest
@@ -42,30 +44,6 @@ CSP = (
     "default-src 'none'; style-src 'self' 'unsafe-inline'; form-action 'self'; "
     "base-uri 'none'; frame-ancestors 'none'; img-src 'none'"
 )
-
-
-class GrantMiddleware(BaseHTTPMiddleware):
-    """Resolve the bearer token before any tool runs.
-
-    This is the only place a caller's identity is established.  Nothing downstream takes
-    a tenant or a producer as an argument, so an agent cannot assert either.
-    """
-
-    def __init__(self, app, service: Service) -> None:  # noqa: ANN001
-        super().__init__(app)
-        self.service = service
-
-    async def dispatch(self, request: Request, call_next):  # noqa: ANN001, ANN201
-        token = None
-        header = request.headers.get("authorization", "")
-        if header.lower().startswith("bearer "):
-            token = header[7:].strip()
-        context = mcp_server.grant_context(self.service, token) if token else None
-        reset = mcp_server.CURRENT_GRANT.set(context)
-        try:
-            return await call_next(request)
-        finally:
-            mcp_server.CURRENT_GRANT.reset(reset)
 
 
 def chosen_account(scope) -> m.Account | None:  # noqa: ANN001
@@ -133,6 +111,38 @@ def not_a_browser_gesture(request: Request) -> str | None:
     return None
 
 
+#: A checkbox group arrives as a repeated form field, which FastAPI reads into a list.
+#: Built once at module level because a call in an argument default is a trap when the
+#: default is mutable — these are the only two multi-valued fields in the UI.
+TICKED_CAPABILITIES = Form(default=[])
+TICKED_ACCOUNTS = Form(default=[])
+
+
+#: The endpoints a machine talks to, which the review UI's key does not guard.
+#:
+#: Every one of them is part of a client logging in, and a client has no key and is not
+#: supposed to: that is the whole point of the flow.  What they are guarded by instead is
+#: the protocol — a registration is only a registration, a code is redeemable once and only
+#: by whoever proved they asked for it.
+#:
+#: ``/consent`` is deliberately *not* here.  It is the one page in the flow where a person
+#: decides something, so it is guarded like every other page a person uses.  The test that
+#: says so is the point of writing this as a list rather than a condition.
+MACHINE_PATHS = frozenset(
+    {
+        "/authorize",
+        "/token",
+        "/register",
+        "/revoke",
+    }
+)
+
+
+def is_machine_path(path: str) -> bool:
+    """Whether this is something a client talks to rather than a person."""
+    return path in MACHINE_PATHS or path.startswith("/mcp") or path.startswith("/.well-known/")
+
+
 #: The cookie the review UI is reached with. Session-scoped, so it goes when the browser
 #: does, and HttpOnly, so a page cannot read it back out — not that any page here runs
 #: script, but a review UI renders mail written by strangers and the habit is cheap.
@@ -187,6 +197,61 @@ def reviewer(scope) -> m.Producer:  # noqa: ANN001
     return person
 
 
+class GrantMiddleware(BaseHTTPMiddleware):
+    """Resolve the bearer token, for a service with no authorization server in front of it.
+
+    Ordinarily the SDK does this: it verifies the token, resolves it to a grant and hands
+    it to the tools, and an unusable one is refused before any tool runs.  That needs an
+    issuer to advertise, and there are loopback addresses the spec's list does not name —
+    see :func:`mailmind.config.oauth_issuer`.  On one of those the endpoint still has to
+    work, and a token from ``mailmindctl grant`` is the only way in, so it is resolved
+    here instead.
+
+    Same rule either way: nothing downstream takes a tenant or a producer as an argument,
+    so an agent cannot assert either.
+    """
+
+    def __init__(self, app, service: Service) -> None:  # noqa: ANN001
+        super().__init__(app)
+        self.service = service
+
+    async def dispatch(self, request: Request, call_next):  # noqa: ANN001, ANN201
+        token = None
+        header = request.headers.get("authorization", "")
+        if header.lower().startswith("bearer "):
+            token = header[7:].strip()
+        context = mcp_server.grant_context(self.service, token) if token else None
+        reset = mcp_server.CURRENT_GRANT.set(context)
+        try:
+            return await call_next(request)
+        finally:
+            mcp_server.CURRENT_GRANT.reset(reset)
+
+
+def _mount_login(app: FastAPI, service: Service, public_url: str) -> None:
+    """Serve the OAuth endpoints from the root of the host, where clients look for them."""
+    from mcp.server.auth.routes import (
+        create_auth_routes,
+        create_protected_resource_routes,
+    )
+
+    from mailmind.mcp.oauth import SCOPE, settings_and_provider
+
+    settings, provider = settings_and_provider(service, public_url)
+    routes = create_auth_routes(
+        provider=provider,
+        issuer_url=settings.issuer_url,
+        client_registration_options=settings.client_registration_options,
+        revocation_options=settings.revocation_options,
+    ) + create_protected_resource_routes(
+        resource_url=settings.resource_server_url,
+        authorization_servers=[settings.issuer_url],
+        scopes_supported=[SCOPE],
+        resource_name="mailmind",
+    )
+    app.router.routes.extend(routes)
+
+
 def create_app(
     service: Service, *, with_mcp: bool = True, session_key: str | None = None
 ) -> FastAPI:
@@ -206,7 +271,8 @@ def create_app(
     if not with_mcp:
         app = FastAPI(title="mailmind")
     else:
-        mcp = mcp_server.build_server(service)
+        public_url = oauth_issuer(service.config)
+        mcp = mcp_server.build_server(service, public_url=public_url)
         # DNS rebinding protection: a browser page on some other site must not be able to
         # drive this endpoint just because it is listening on localhost.
         bind = service.config.bind
@@ -226,7 +292,17 @@ def create_app(
             ),
         )
         app = FastAPI(title="mailmind", lifespan=lambda _app: mcp.session_manager.run())
-        app.mount("/mcp", GrantMiddleware(mcp_app, service))
+        app.mount("/mcp", mcp_app if public_url else GrantMiddleware(mcp_app, service))
+
+        # The SDK builds these routes too, but inside the app just mounted — so they would
+        # answer at `/mcp/.well-known/...`, which is not where any client looks.  RFC 8414
+        # and RFC 9728 both put them at the root of the host, so that is where they go, and
+        # the copies under `/mcp` are left as unadvertised duplicates.
+        #
+        # None of it exists without an issuer to name, which is the loopback address the
+        # spec's list does not happen to cover — see `oauth_issuer`.
+        if public_url is not None:
+            _mount_login(app, service, public_url)
 
     @app.middleware("http")
     async def only_somebody_holding_the_key_gets_in(request: Request, call_next):  # noqa: ANN001, ANN202
@@ -245,7 +321,7 @@ def create_app(
         could resolve the mailbox password and skip mailmind altogether.  That boundary is
         how the agent is run, and it is not one this process can draw.
         """
-        if request.url.path.startswith("/mcp"):
+        if is_machine_path(request.url.path):
             return await call_next(request)
 
         offered = request.query_params.get(SESSION_KEY_PARAM)
@@ -289,7 +365,7 @@ def create_app(
         A middleware rather than a check per route, so that a route added later is covered
         by having been added rather than by somebody remembering.
         """
-        if request.method == "POST" and not request.url.path.startswith("/mcp"):
+        if request.method == "POST" and not is_machine_path(request.url.path):
             problem = not_a_browser_gesture(request)
             if problem is not None:
                 await run_in_threadpool(_record_refusal, service, request, problem)
@@ -306,7 +382,7 @@ def create_app(
     @app.middleware("http")
     async def security_headers(request: Request, call_next):  # noqa: ANN001, ANN202
         response = await call_next(request)
-        if not request.url.path.startswith("/mcp"):
+        if not is_machine_path(request.url.path):
             response.headers["Content-Security-Policy"] = CSP
             # `no-referrer` is the tighter-looking choice and was the wrong one: browsers
             # derive a form POST's Origin from the referrer policy, so it arrived as
@@ -527,6 +603,179 @@ def create_app(
                     note_unhealthy(scope, account, exc)
                 scope.commit()
         return RedirectResponse("/accounts", status_code=303)
+
+    # ------------------------------------------------------------- letting an agent in
+
+    #: What each capability means, said for somebody deciding rather than somebody
+    #: implementing.  There is no entry for applying because there is no such capability.
+    CAPABILITY_MEANS = {
+        m.Capability.observe: "read the mail you tick below",
+        m.Capability.suggest: "propose changes, for you to accept or reject here",
+        m.Capability.assess: "record what it makes of a message",
+    }
+
+    def _pending(scope, request_id: str):  # noqa: ANN001, ANN202
+        """The consent request, if it is still one."""
+        row = scope.scalar(
+            sa.select(m.OAuthAuthorization).where(m.OAuthAuthorization.request_id == request_id)
+        )
+        if row is None or row.grant_id is not None:
+            return None
+        if row.expires_at is not None and row.expires_at <= dt.datetime.now(dt.UTC):
+            return None
+        return row
+
+    @app.get("/consent", response_class=HTMLResponse)
+    def consent_page(request: Request, req: str = "", error: str | None = None):  # noqa: ANN202
+        """Where a person agrees to let an agent in.
+
+        Reached because an agent sent a browser here, and guarded by the same key as every
+        other page: an agent that followed its own link arrives without the cookie and is
+        told to fetch a person, which is the correct outcome.
+        """
+        request_id = request.query_params.get("request", req)
+        with service.scope() as scope:
+            row = _pending(scope, request_id)
+            if row is None:
+                return HTMLResponse(
+                    "<h1>Nothing to agree to</h1><p>That request has been answered "
+                    "already, or it sat here long enough to go stale. Ask the agent to "
+                    "connect again.</p>",
+                    status_code=404,
+                )
+            client = scope.scalar(
+                sa.select(m.OAuthClient).where(m.OAuthClient.client_id == row.client_id)
+            )
+            return render(
+                request,
+                "consent.html",
+                request_row={
+                    "request_id": row.request_id,
+                    "client_name": client.client_name if client else None,
+                },
+                capabilities=[
+                    {"name": cap.value, "what": what} for cap, what in CAPABILITY_MEANS.items()
+                ],
+                # The accounts to tick are the ones in the header chrome — the same list,
+                # so it is passed once rather than twice under two names.
+                error=error,
+                **chrome(scope),
+            )
+
+    @app.post("/consent")
+    def decide_consent(  # noqa: ANN202
+        request_id: str = Form(),
+        decision: str = Form(default="refuse"),
+        capabilities: list[str] = TICKED_CAPABILITIES,
+        account_ids: list[int] = TICKED_ACCOUNTS,
+    ):
+        """Agree, or do not.
+
+        This is the only place a grant is created from a request somebody made.  Refusing
+        hands the client an error rather than leaving it waiting, because a client that is
+        never answered looks to its user like a service that is broken.
+        """
+        with service.scope() as scope:
+            row = _pending(scope, request_id)
+            if row is None:
+                return HTMLResponse(
+                    "<h1>Nothing to agree to</h1><p>That request is already answered or "
+                    "has gone stale.</p>",
+                    status_code=404,
+                )
+            target = row.redirect_uri
+            state = row.state
+
+            if decision != "allow":
+                scope.audit(
+                    "grant_refused",
+                    actor_kind="person",
+                    subject_kind="oauth_client",
+                    payload={"client_id": row.client_id},
+                )
+                scope.commit()
+                return RedirectResponse(
+                    construct_redirect_uri(target, error="access_denied", state=state),
+                    status_code=303,
+                )
+
+            client = scope.scalar(
+                sa.select(m.OAuthClient).where(m.OAuthClient.client_id == row.client_id)
+            )
+            name = (client.client_name if client else "") or "agent"
+            producer = scope.scalar(
+                sa.select(m.Producer).where(
+                    m.Producer.name == name, m.Producer.kind == m.ProducerKind.agent
+                )
+            )
+            if producer is None:
+                producer = m.Producer(kind=m.ProducerKind.agent, name=name)
+                scope.add(producer)
+                scope.flush()
+
+            code = oauth.consent(
+                scope,
+                row,
+                producer=producer,
+                capabilities=list(capabilities),
+                account_ids=list(account_ids),
+            )
+            scope.commit()
+        return RedirectResponse(
+            construct_redirect_uri(target, code=code, state=state), status_code=303
+        )
+
+    @app.get("/agents", response_class=HTMLResponse)
+    def agents_page(request: Request):  # noqa: ANN202
+        """What has been let in, and the button that takes it back."""
+        with service.scope() as scope:
+            names = {a["id"]: a["name"] for a in views.accounts(scope)}
+            clients = {
+                c.client_id: c.client_name for c in scope.scalars(sa.select(m.OAuthClient))
+            }
+            rows = []
+            for grant in scope.scalars(sa.select(m.Grant).order_by(m.Grant.created_at.desc())):
+                producer = scope.get(m.Producer, grant.producer_id)
+                live = mcp_server._live(grant)
+                why_not = "revoked" if grant.revoked_at is not None else "expired"
+                rows.append(
+                    {
+                        "id": grant.id,
+                        "producer": producer.name if producer else "?",
+                        "client_name": clients.get(grant.client_id or ""),
+                        "capabilities": list(grant.capabilities),
+                        "accounts": [
+                            names.get(ga.account_id, str(ga.account_id))
+                            for ga in grant.accounts
+                        ],
+                        "created_at": grant.created_at.isoformat(),
+                        "how": "agreed here" if grant.client_id else "command line",
+                        "live": live,
+                        "why_not": why_not,
+                    }
+                )
+            return render(request, "agents.html", grants=rows, **chrome(scope))
+
+    @app.post("/agents/{grant_id}/revoke")
+    def revoke_grant(grant_id: int):  # noqa: ANN202
+        """Take it back.
+
+        The grant is what is revoked, not a token: every token points at it, so there is
+        nothing to hunt down and nothing that outlives the decision.
+        """
+        with service.scope() as scope:
+            grant = scope.get(m.Grant, grant_id)
+            if grant is not None and grant.revoked_at is None:
+                grant.revoked_at = dt.datetime.now(dt.UTC)
+                scope.audit(
+                    "grant_revoked",
+                    actor_kind="person",
+                    subject_kind="grant",
+                    subject_id=grant.id,
+                    payload={"client_id": grant.client_id},
+                )
+                scope.commit()
+        return RedirectResponse("/agents", status_code=303)
 
     return app
 

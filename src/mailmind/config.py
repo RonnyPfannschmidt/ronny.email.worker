@@ -109,6 +109,17 @@ class Config:
     #: service refuses to listen anywhere but loopback, because the review UI's session
     #: cookie is a bearer token travelling over plain HTTP.
     behind_auth_proxy: bool = False
+    #: The address a *client* reaches this service at, which behind a proxy is not the
+    #: address it binds.  It is what the OAuth metadata advertises and what the tokens are
+    #: issued for, so getting it wrong means a client discovers endpoints it cannot reach.
+    #: Unset, it is derived from ``bind`` and ``port``, which is right on a loopback
+    #: install and wrong the moment anything is in front.
+    public_url: str | None = None
+
+    @property
+    def reachable_at(self) -> str:
+        """Where to tell a client to come back to."""
+        return self.public_url or f"http://{self.bind}:{self.port}"
 
     def account(self, name: str) -> AccountConfig:
         for account in self.accounts:
@@ -168,6 +179,49 @@ def check_exposure(config: Config) -> None:
     )
 
 
+#: Hosts an OAuth issuer may use over plain HTTP.  RFC 8414 wants HTTPS; every
+#: implementation carves out loopback so a service on your own machine can be developed
+#: against, and the MCP SDK carves out exactly these three by name.  It is a shorter list
+#: than "is this loopback" — 127.0.0.2 is loopback and is not on it.
+ISSUER_HTTP_HOSTS = frozenset({"localhost", "127.0.0.1", "[::1]"})
+
+
+def oauth_issuer(config: Config) -> str | None:
+    """Where an agent is told to log in, or ``None`` if there is nowhere to send it.
+
+    An issuer has to be an address a client can reach *and* one the spec allows, and the
+    two fail apart.  A wildcard bind is not an address anybody reaches; a bind that is
+    neither loopback nor HTTPS is one the spec refuses.  Either way there is no
+    authorization server to advertise, and the question is only whether that is worth
+    stopping for.
+
+    It is, on a deployment: something is in front, people are expected to connect to it,
+    and an agent that cannot log in has no other way in.  Coming up quietly without one
+    would be the service deciding for the operator that nobody needs to log in.  So it
+    refuses, and says which setting to write.
+
+    It is not, on a loopback bind the spec's list happens not to name — 127.0.0.2 and the
+    like.  Nothing is exposed, ``mailmindctl grant`` still works, and refusing to start
+    would turn an unusual address into a broken install.
+    """
+    reachable = config.reachable_at
+    host = reachable.split("://", 1)[-1].rsplit(":", 1)[0]
+    if reachable.startswith("https://") or host in ISSUER_HTTP_HOSTS:
+        return reachable
+
+    exposed = (
+        config.behind_auth_proxy or is_wildcard(config.bind) or not is_loopback(config.bind)
+    )
+    if exposed:
+        raise ConfigError(
+            f"cannot tell an agent where to log in: {reachable} is not an address an "
+            "OAuth issuer may use, so nothing can authenticate to the MCP endpoint. Set "
+            "public_url to the HTTPS address people reach this service at — the one the "
+            "proxy in front serves. See docs/design/13-logging-an-agent-in.md."
+        )
+    return None
+
+
 def config_path() -> Path:
     """Where the configuration is, and whether anybody said so.
 
@@ -201,9 +255,7 @@ def load_config(path: Path | None = None) -> Config:
         return Config()
     raw = tomllib.loads(path.read_text())
 
-    accounts = tuple(
-        _account(name, body) for name, body in raw.get("accounts", {}).items()
-    )
+    accounts = tuple(_account(name, body) for name, body in raw.get("accounts", {}).items())
     limits_raw = raw.get("limits", {})
     try:
         limits = Limits(**limits_raw)
@@ -216,15 +268,14 @@ def load_config(path: Path | None = None) -> Config:
         bind=raw.get("bind", "127.0.0.1"),
         port=raw.get("port", 8765),
         behind_auth_proxy=raw.get("behind_auth_proxy", False),
+        public_url=raw.get("public_url"),
     )
 
 
 def _account(name: str, body: dict) -> AccountConfig:
     if "login" not in body:
         stray = sorted({"username", "password", "secret_ref"} & body.keys())
-        hint = (
-            f" — move {', '.join(stray)} into it" if stray else ""
-        )
+        hint = f" — move {', '.join(stray)} into it" if stray else ""
         raise ConfigError(f"account {name!r} has no [accounts.{name}.login] table{hint}")
     login = body["login"]
     for key in ("username", "password"):
@@ -316,9 +367,7 @@ def resolve_password(url: str, *, username: str | None = None) -> str:
         try:
             import keyring  # kept an optional dependency
         except ImportError as exc:
-            raise ConfigError(
-                "secret-storage:// needs the keyring package installed"
-            ) from exc
+            raise ConfigError("secret-storage:// needs the keyring package installed") from exc
 
         value = keyring.get_password(service, user)
         if value is None:

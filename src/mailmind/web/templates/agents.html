@@ -1,0 +1,43 @@
+{% extends "base.html" %}
+{% block title %}Agents — mailmind{% endblock %}
+{% block content %}
+<h1>Agents</h1>
+
+<p class="small muted">
+  What you have let in, and what each one may do. Revoking takes effect on the agent's next
+  call — it does not undo anything already proposed, which is still yours to accept or
+  reject in the queue.
+</p>
+
+{% if not grants %}
+  <p class="muted">Nothing has been let in. An agent asks by connecting; you get a page like
+  this one to agree on.</p>
+{% else %}
+<table>
+  <tr>
+    <th>agent</th><th>may</th><th>mail</th><th>since</th><th>how</th><th></th>
+  </tr>
+  {% for g in grants %}
+  <tr{% if not g.live %} class="muted"{% endif %}>
+    <td>
+      <strong>{{ g.producer }}</strong>
+      {% if g.client_name %}<br><span class="small muted">called itself {{ g.client_name }}</span>{% endif %}
+    </td>
+    <td class="small">{{ g.capabilities|join(", ") or "nothing" }}</td>
+    <td class="small">{{ g.accounts|join(", ") or "none" }}</td>
+    <td class="small muted">{{ g.created_at[:16] }}</td>
+    <td class="small muted">{{ g.how }}</td>
+    <td>
+      {% if g.live %}
+      <form method="post" action="/agents/{{ g.id }}/revoke" class="inline">
+        <button>revoke</button>
+      </form>
+      {% else %}
+      <span class="small muted">{{ g.why_not }}</span>
+      {% endif %}
+    </td>
+  </tr>
+  {% endfor %}
+</table>
+{% endif %}
+{% endblock %}

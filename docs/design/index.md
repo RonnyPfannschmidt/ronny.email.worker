@@ -19,6 +19,7 @@ Numbering is order of introduction, not dependency.
 - [ ] [10 — Running it](10-running-it.md) `#sketch` `#open-questions`
 - [ ] [11 — Deployment and identity](11-deployment-and-identity.md) `#sketch` `#open-questions`
 - [ ] [12 — An agent of your own](12-an-agent-of-your-own.md) `#sketch` `#open-questions`
+- [x] [13 — Logging an agent in](13-logging-an-agent-in.md) `#tried` `#open-questions`
 
 Plus [design history](history/index.md) — starting-point documents, kept verbatim, not
 authoritative.
