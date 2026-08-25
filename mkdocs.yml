@@ -53,6 +53,7 @@ nav:
       - MCP surface: reference/mcp.md
       - mailmindctl: reference/cli.md
       - Configuration: reference/configuration.md
+      - Identifiers: reference/identifiers.md
   - Design notes:
       - design/index.md
       - 01 — Intent: design/01-intent.md

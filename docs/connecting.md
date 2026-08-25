@@ -84,6 +84,10 @@ other than the producer that proposes acting on what it read.
 Logging in, the choice is not the agent's at all: it asks for nothing in particular and a
 person ticks the boxes. `--capability` is the same decision made on the command line.
 
+`message_id` is mailmind's own, and is the only id on this surface: it survives syncs,
+moves and expunges, and an agent never sees an IMAP UID. Which id is which, and what moves
+them, is [Identifiers](reference/identifiers.md).
+
 Over stdio, `--producer NAME` reuses that producer's grant if it has one, so minting a
 narrow one first gives you the narrow one. A producer with no grant at all gets a full one,
 on the reasoning that whoever spawned the process could read the database anyway.
