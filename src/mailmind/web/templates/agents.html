@@ -25,11 +25,12 @@
     </td>
     <td class="small">{{ g.capabilities|join(", ") or "nothing" }}</td>
     <td class="small">{{ g.accounts|join(", ") or "none" }}</td>
-    <td class="small muted">{{ g.created_at[:16] }}</td>
+    <td class="small muted">{{ g.created_at | when }}</td>
     <td class="small muted">{{ g.how }}</td>
     <td>
       {% if g.live %}
       <form method="post" action="/agents/{{ g.id }}/revoke" class="inline">
+  <input type="hidden" name="_csrf" value="{{ csrf }}">
         <button>revoke</button>
       </form>
       {% else %}

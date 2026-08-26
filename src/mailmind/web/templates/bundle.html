@@ -47,7 +47,7 @@
   {% for q in grown_by %}
   <strong>{{ q.added }}</strong> of the {{ "folders" if folders else "messages" }} below
   arrived from a search for <strong>{{ q.text }}</strong> on
-  {{ q.at[:10] }}{{ "; " if not loop.last else ". " }}
+  {{ q.at | day }}{{ "; " if not loop.last else ". " }}
   {%- endfor %}
   They are marked. Accepting this accepts them along with the rest, so read them first.
 </div>
@@ -68,7 +68,7 @@
 {% endif %}
 
 <p class="small muted">
-  Proposed by {{ bundle.producer }} · status {{ bundle.status }} · expires {{ bundle.expires_at[:16] }}
+  Proposed by {{ bundle.producer }} · status {{ bundle.status }} · expires {{ bundle.expires_at | when }}
 </p>
 
 <h2>The effect</h2>
@@ -91,6 +91,7 @@
     <td class="small">
       {% if item.status == "proposed" and bundle.status == "proposed" %}
         <form class="inline" method="post" action="/bundle/{{ bundle.bundle_id }}/exclude/{{ item.suggestion_id }}">
+  <input type="hidden" name="_csrf" value="{{ csrf }}">
           <button>exclude</button>
         </form>
       {% else %}{{ item.status }}{% endif %}
@@ -116,7 +117,7 @@ that still has something below it.</p>
       {% if item.from_display_name %}<br><span class="muted">{{ item.from_display_name }}</span>{% endif %}
     </td>
     <td class="small">{{ item.subject or "(no subject)" }}</td>
-    <td class="small muted">{{ (item.date or "")[:10] }}</td>
+    <td class="small muted">{{ item.date | day }}</td>
     <td class="small">{{ item.currently_in }}</td>
     <td class="arrow">&rarr;</td>
     <td class="small">
@@ -127,6 +128,7 @@ that still has something below it.</p>
     <td class="small">
       {% if item.status == "proposed" and bundle.status == "proposed" %}
         <form class="inline" method="post" action="/bundle/{{ bundle.bundle_id }}/exclude/{{ item.suggestion_id }}">
+  <input type="hidden" name="_csrf" value="{{ csrf }}">
           <button>exclude</button>
         </form>
       {% else %}{{ item.status }}{% endif %}
@@ -158,6 +160,7 @@ that still has something below it.</p>
         are not loaded: loading one tells the sender the mail was read.</p>
       {% else %}
         <form method="post" action="/bundle/{{ bundle.bundle_id }}/body/{{ item.message_id }}">
+  <input type="hidden" name="_csrf" value="{{ csrf }}">
           <button>fetch the body from the server</button>
         </form>
       {% endif %}
@@ -194,6 +197,7 @@ message was untouched between the check and the change — it does not mean it w
 {% if bundle.status == "proposed" %}
 <div class="actions">
   <form method="post" action="/bundle/{{ bundle.bundle_id }}/accept">
+  <input type="hidden" name="_csrf" value="{{ csrf }}">
     {# What this page is showing. Accepting means this list, not whatever the bundle
        holds by the time the form arrives. #}
     <input type="hidden" name="reviewed_through" value="{{ bundle.reviewed_through }}">
@@ -207,6 +211,7 @@ message was untouched between the check and the change — it does not mean it w
     <button>Accept — do this to the mailbox</button>
   </form>
   <form method="post" action="/bundle/{{ bundle.bundle_id }}/reject">
+  <input type="hidden" name="_csrf" value="{{ csrf }}">
     <input name="reason" placeholder="why not (optional)" size="30">
     <button>Reject</button>
   </form>
@@ -220,7 +225,7 @@ message was untouched between the check and the change — it does not mean it w
 {% else %}
 <p class="small muted">
   {{ bundle.status }}{% if bundle.decided_by %} by {{ bundle.decided_by }}{% endif %}
-  {%- if bundle.decided_at %} at {{ bundle.decided_at[:16] }}{% endif %}
+  {%- if bundle.decided_at %} at {{ bundle.decided_at | when }}{% endif %}
   {%- if bundle.decision_reason %} — {{ bundle.decision_reason }}{% endif %}
 </p>
 {% endif %}

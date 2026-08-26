@@ -2,6 +2,18 @@
 {% block content %}
 <h1>Awaiting review</h1>
 
+{% if current_account %}
+  {% set elsewhere = [] %}
+  {% for a in accounts if a.id != current_account.id and waiting.get(a.id) %}
+    {% set _ = elsewhere.append(a) %}
+  {% endfor %}
+  {% if elsewhere %}
+  <p class="small muted">Also waiting:
+    {% for a in elsewhere %}{{ waiting[a.id] }} in {{ a.name }}{{ ", " if not loop.last }}{% endfor %}
+    — bundles expire if nobody reviews them.</p>
+  {% endif %}
+{% endif %}
+
 {% if not bundles %}
   <p class="muted">Nothing to review{% if current_account %} in {{ current_account.name }}{% endif %}.</p>
 {% else %}
@@ -26,6 +38,7 @@
 {% if recent %}
 <h2>Recently decided</h2>
 <table class="small">
+  <tr><th>What</th><th>Messages</th><th>Outcome</th><th></th></tr>
   {% for b in recent %}
   <tr>
     <td class="effect">{{ b.operation }}{% if b.target_container %}

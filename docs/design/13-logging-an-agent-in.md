@@ -52,7 +52,8 @@ The SDK's `/authorize` hands off to a URL of our choosing. That URL is a mailmin
 so it sits behind the middleware that already guards every non-`/mcp` path. Locally that is
 the session key: you followed the link, so you are in; you did not, so you get the existing
 *Not open* page, which already says where the link is and already says it to agents. The
-POST that grants consent goes through `not_a_browser_gesture` like every other change.
+POST that grants consent is session-authenticated and CSRF-checked like every other
+change.
 
 On a deployment, Authelia is in front of the review UI, so it is in front of the consent
 page, and nothing in mailmind knows the difference. `behind_auth_proxy` remains the only

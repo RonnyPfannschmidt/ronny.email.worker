@@ -10,15 +10,18 @@ from __future__ import annotations
 
 import contextlib
 import datetime as dt
+import hashlib
+import hmac
 import os
 import secrets
 import tempfile
 from pathlib import Path
-from urllib.parse import urlencode
+from urllib.parse import quote, urlencode
 
 import sqlalchemy as sa
-from fastapi import FastAPI, Form, Request
+from fastapi import Depends, FastAPI, Form, Request
 from fastapi.responses import HTMLResponse, RedirectResponse
+from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from mcp.server.auth.provider import construct_redirect_uri
 from mcp.server.transport_security import TransportSecuritySettings
@@ -39,10 +42,32 @@ from mailmind.suggest import staleness
 
 TEMPLATES = Jinja2Templates(directory=str(Path(__file__).parent / "templates"))
 
-#: No script, no remote anything.  A remote image would tell a sender their mail was read,
-#: and this page renders mail written by strangers.
+
+def _local(value, fmt: str):  # noqa: ANN001
+    """An ISO timestamp in the machine's own time, or the value untouched if it is not one.
+
+    A loopback tool runs where the person sits, so server-local time is their time."""
+    if not value:
+        return value
+    try:
+        moment = dt.datetime.fromisoformat(str(value))
+    except ValueError:
+        return value
+    if moment.tzinfo is None:
+        moment = moment.replace(tzinfo=dt.UTC)
+    return moment.astimezone().strftime(fmt)
+
+
+TEMPLATES.env.filters["when"] = lambda value: _local(value, "%d %b %Y %H:%M")
+TEMPLATES.env.filters["day"] = lambda value: _local(value, "%d %b %Y")
+
+#: No inline script, no eval, no remote anything.  A remote image would tell a sender
+#: their mail was read, and this page renders mail written by strangers.  The one script
+#: is the vendored Turbo served by this process from /static; connect-src covers its
+#: form submissions and the SSE stream, both to ourselves.
 CSP = (
-    "default-src 'none'; style-src 'self' 'unsafe-inline'; form-action 'self'; "
+    "default-src 'none'; style-src 'self' 'unsafe-inline'; script-src 'self'; "
+    "connect-src 'self'; form-action 'self'; "
     "base-uri 'none'; frame-ancestors 'none'; img-src 'none'"
 )
 
@@ -62,44 +87,35 @@ def chosen_account(scope) -> m.Account | None:  # noqa: ANN001
     return scope.scalar(sa.select(m.Account).order_by(m.Account.name))
 
 
-#: What a browser sends when a person submits a form on a page it is showing. All three
-#: are Fetch Metadata headers, which scripts are forbidden to set — inside a browser these
-#: cannot be forged, and outside one they have to be asserted deliberately.
-#:
-#: `Sec-Fetch-User: ?1` would be the better signal, being "a person did this" rather than
-#: "a document navigated". It is not required because Safari has never sent it, and a
-#: check that locks out a whole browser is a check somebody turns off.
-BROWSER_GESTURE = {
-    "sec-fetch-mode": "navigate",
-    "sec-fetch-dest": "document",
-    "sec-fetch-site": "same-origin",
-}
+def csrf_token(session_key: str) -> str:
+    """The per-session CSRF token, derived from the key so there is nothing new to store."""
+    return hmac.new(session_key.encode(), b"csrf", hashlib.sha256).hexdigest()
 
 
-def not_a_browser_gesture(request: Request) -> str | None:
-    """Why this POST does not look like a person submitting a form, if it does not.
+def not_same_origin(request: Request) -> str | None:
+    """Why this POST is not a same-origin request from a page this service served.
 
-    This is not a security boundary and cannot be one — anything that can set a header can
-    say all of this. What it does is move the review UI out of reach of an agent doing the
-    obvious thing with an address it was given, so that reaching it at all means asserting,
-    in four headers, that a browser is showing a page to somebody. See
-    docs/design/12-an-agent-of-your-own.md for how far that goes and what it does not cover.
+    The session cookie is the authentication; this is the CSRF half of it.
+    ``Sec-Fetch-Site`` is a forbidden header — a browser sets it and script cannot — so
+    ``same-origin`` here means a page this service served made the request, whether by a
+    form submission or by fetch.  A browser too old to send fetch metadata must show a
+    matching ``Origin`` instead.  See docs/security-model.md.
     """
-    for header, expected in BROWSER_GESTURE.items():
-        actual = request.headers.get(header)
-        if actual != expected:
-            return f"{header} was {actual!r}, not {expected!r}"
+    site = request.headers.get("sec-fetch-site")
+    if site is not None:
+        if site != "same-origin":
+            return f"sec-fetch-site was {site!r}, not 'same-origin'"
+        return None
     origin = request.headers.get("origin")
     host = request.headers.get("host", "")
     expected_origin = f"{request.url.scheme}://{host}"
-    # A browser is allowed to withhold the origin of a same-origin form submission, and
-    # does: the value is derived from the referrer policy, so a strict enough one makes
-    # every button in this UI arrive with `Origin: null`.  That is not evidence of
-    # anything, and refusing it refuses the person.  An origin that is present and
-    # *different* is a different matter, and still refused.
-    if origin not in (None, "null", expected_origin):
-        return f"origin was {origin!r}, not {expected_origin!r}"
+    if origin != expected_origin:
+        return f"origin was {origin!r}, not {expected_origin!r}, and no fetch metadata"
     return None
+
+
+class CsrfRefused(Exception):
+    """A change arrived without the form token every page carries."""
 
 
 #: A checkbox group arrives as a repeated form field, which FastAPI reads into a list.
@@ -258,6 +274,14 @@ def create_app(
     """
     check_exposure(service.config)
     session_key = session_key or mint_session_key()
+    form_token = csrf_token(session_key)
+
+    async def csrf_required(offered: str = Form(default="", alias="_csrf")) -> None:
+        """The token every form on these pages carries, checked before the route runs."""
+        if not secrets.compare_digest(offered, form_token):
+            raise CsrfRefused
+
+    changes = [Depends(csrf_required)]
 
     if not with_mcp:
         app = FastAPI(title="mailmind")
@@ -295,6 +319,22 @@ def create_app(
         if public_url is not None:
             _mount_login(app, service, public_url)
 
+    @app.exception_handler(CsrfRefused)
+    async def _csrf_refused(request: Request, exc: CsrfRefused):  # noqa: ANN202
+        await run_in_threadpool(_record_refusal, service, request, "missing or wrong _csrf token")
+        return HTMLResponse(
+            "<h1>Not accepted</h1><p>This arrived without the token the review UI's own "
+            "forms carry, so it did not come from a page this service served.</p>",
+            status_code=403,
+        )
+
+    # Behind the session key on purpose: the pages that use it are, so their script is.
+    app.mount(
+        "/static",
+        StaticFiles(directory=str(Path(__file__).parent / "static")),
+        name="static",
+    )
+
     @app.middleware("http")
     async def require_session_key(request: Request, call_next):  # noqa: ANN001, ANN202
         """The review UI's login: the startup key, traded once for a session cookie.
@@ -322,7 +362,7 @@ def create_app(
                 SESSION_COOKIE,
                 session_key,
                 httponly=True,
-                samesite="lax",
+                samesite="strict",
                 path="/",
             )
             return response
@@ -332,30 +372,32 @@ def create_app(
             return HTMLResponse(
                 "<h1>Not open</h1><p>The review UI is opened with the link printed where "
                 "this was started — it carries a key, and following it once is the whole "
-                "of the login.</p><p>If you are an agent: you were not given that key, on "
-                "purpose. Tell the person you are working for to look at the terminal or "
-                "the log where they started mailmind.</p>",
+                "of the login. If it has scrolled away, <code>mailmindctl review --open"
+                "</code> follows it for you.</p><p>If you are an agent: you were not "
+                "given that key, on purpose. Tell the person you are working for to look "
+                "at the terminal or the log where they started mailmind.</p>",
                 status_code=401,
             )
         return await call_next(request)
 
     @app.middleware("http")
-    async def only_a_person_at_a_browser_changes_anything(request: Request, call_next):  # noqa: ANN001, ANN202
+    async def require_same_origin_change(request: Request, call_next):  # noqa: ANN001, ANN202
         """Every route that changes something goes through here.
 
         A middleware rather than a check per route, so that a route added later is covered
-        by having been added rather than by somebody remembering.
+        by having been added rather than by somebody remembering.  The per-form CSRF token
+        is the other half, checked per route by ``csrf_required``.
         """
         if request.method == "POST" and not is_machine_path(request.url.path):
-            problem = not_a_browser_gesture(request)
+            problem = not_same_origin(request)
             if problem is not None:
                 await run_in_threadpool(_record_refusal, service, request, problem)
                 return HTMLResponse(
-                    "<h1>Not accepted</h1><p>This did not arrive as a person submitting a "
-                    "form in a browser: " + problem + ".</p><p>The review UI is for "
-                    "whoever owns this mail, at this computer. If you are an agent, this "
-                    "is the page you were told to send somebody to, not one to act on — "
-                    "nothing here is yours to accept.</p>",
+                    "<h1>Not accepted</h1><p>This did not arrive from a page this service "
+                    "served: " + problem + ".</p><p>The review UI is for whoever owns "
+                    "this mail, at this computer. If you are an agent, this is the page "
+                    "you were told to send somebody to, not one to act on — nothing here "
+                    "is yours to accept.</p>",
                     status_code=403,
                 )
         return await call_next(request)
@@ -374,6 +416,7 @@ def create_app(
         return response
 
     def render(request: Request, template: str, **context) -> HTMLResponse:  # noqa: ANN003
+        context.setdefault("csrf", form_token)
         return TEMPLATES.TemplateResponse(request, template, context)
 
     def chrome(scope) -> dict:  # noqa: ANN001
@@ -382,6 +425,7 @@ def create_app(
         return {
             "accounts": views.accounts(scope),
             "current_account": {"id": current.id, "name": current.name} if current else None,
+            "waiting": views.proposed_counts(scope),
         }
 
     # -------------------------------------------------------------- the queue
@@ -445,7 +489,7 @@ def create_app(
                 **chrome(scope),
             )
 
-    @app.post("/bundle/{bundle_id}/body/{message_id}")
+    @app.post("/bundle/{bundle_id}/body/{message_id}", dependencies=changes)
     def load_body(bundle_id: int, message_id: int):  # noqa: ANN202
         with service.scope() as scope:
             placement = scope.scalar(
@@ -466,20 +510,25 @@ def create_app(
                 scope.commit()
         return RedirectResponse(f"/bundle/{bundle_id}#m{message_id}", status_code=303)
 
-    @app.post("/bundle/{bundle_id}/exclude/{suggestion_id}")
+    @app.post("/bundle/{bundle_id}/exclude/{suggestion_id}", dependencies=changes)
     def exclude_item(bundle_id: int, suggestion_id: int):  # noqa: ANN202
+        anchor = None
         with service.scope() as scope:
             suggestion = scope.get(m.Suggestion, suggestion_id)
             error = None
             if suggestion is not None and suggestion.bundle_id == bundle_id:
+                # Land back where the reviewer was, not at the top of a long table.
+                anchor = (
+                    f"m{suggestion.message_id}" if suggestion.message_id else f"s{suggestion_id}"
+                )
                 try:
                     suggest.exclude(scope, suggestion, reviewer(scope))
                 except suggest.ProposalRefused as exc:
                     error = str(exc)
                 scope.commit()
-        return _back(bundle_id, error)
+        return _back(bundle_id, error, anchor)
 
-    @app.post("/bundle/{bundle_id}/accept")
+    @app.post("/bundle/{bundle_id}/accept", dependencies=changes)
     def accept_bundle(  # noqa: ANN202
         bundle_id: int,
         reviewed_through: int = Form(default=0),
@@ -524,7 +573,7 @@ def create_app(
             scope.commit()
         return _back(bundle_id, None)
 
-    @app.post("/bundle/{bundle_id}/reject")
+    @app.post("/bundle/{bundle_id}/reject", dependencies=changes)
     def reject_bundle(bundle_id: int, reason: str = Form(default="")):  # noqa: ANN202
         with service.scope() as scope:
             bundle = scope.get(m.Bundle, bundle_id)
@@ -561,7 +610,7 @@ def create_app(
                 )
             return render(request, "accounts.html", rows=rows, **chrome(scope))
 
-    @app.post("/accounts/choose")
+    @app.post("/accounts/choose", dependencies=changes)
     def choose_account(account_id: int = Form()):  # noqa: ANN202
         """Work in a different account.
 
@@ -575,7 +624,7 @@ def create_app(
                 scope.commit()
         return RedirectResponse("/", status_code=303)
 
-    @app.post("/accounts/{account_id}/sync")
+    @app.post("/accounts/{account_id}/sync", dependencies=changes)
     def sync_account(account_id: int):  # noqa: ANN202
         with service.scope() as scope:
             account = scope.get(m.Account, account_id)
@@ -652,7 +701,7 @@ def create_app(
                 **chrome(scope),
             )
 
-    @app.post("/consent")
+    @app.post("/consent", dependencies=changes)
     def decide_consent(  # noqa: ANN202
         request_id: str = Form(),
         decision: str = Form(default="refuse"),
@@ -675,6 +724,15 @@ def create_app(
                 )
             target = row.redirect_uri
             state = row.state
+
+            if decision == "allow" and not account_ids:
+                any_accounts = scope.scalar(sa.select(m.Account.id).limit(1))
+                if any_accounts is not None:
+                    return RedirectResponse(
+                        f"/consent?request={request_id}&error="
+                        + quote("You ticked no mail. Tick an account, or refuse."),
+                        status_code=303,
+                    )
 
             if decision != "allow":
                 scope.audit(
@@ -746,7 +804,7 @@ def create_app(
                 )
             return render(request, "agents.html", grants=rows, **chrome(scope))
 
-    @app.post("/agents/{grant_id}/revoke")
+    @app.post("/agents/{grant_id}/revoke", dependencies=changes)
     def revoke_grant(grant_id: int):  # noqa: ANN202
         """Take it back.
 
@@ -804,10 +862,10 @@ def _record_refusal(service: Service, request: Request, problem: str) -> None:
         scope.commit()
 
 
-def _back(bundle_id: int, error: str | None) -> RedirectResponse:
-    from urllib.parse import quote
-
+def _back(bundle_id: int, error: str | None, anchor: str | None = None) -> RedirectResponse:
     target = f"/bundle/{bundle_id}"
     if error:
         target += f"?error={quote(error)}"
+    if anchor:
+        target += f"#{anchor}"
     return RedirectResponse(target, status_code=303)

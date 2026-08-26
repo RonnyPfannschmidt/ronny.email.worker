@@ -366,6 +366,17 @@ def bundle_summaries(
     ]
 
 
+def proposed_counts(scope: TenantScope) -> dict[int, int]:
+    """How many bundles await review, per account — for the header, so waiting work in
+    an account nobody is looking at is not invisible until it expires."""
+    rows = scope.session.execute(
+        sa.select(m.Bundle.account_id, sa.func.count())
+        .where(m.Bundle.status == m.BundleStatus.proposed)
+        .group_by(m.Bundle.account_id)
+    ).all()
+    return dict(rows)
+
+
 def _folder_item(scope: TenantScope, suggestion: m.Suggestion) -> dict:
     """An item that names a folder instead of a message.
 

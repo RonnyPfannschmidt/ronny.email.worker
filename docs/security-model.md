@@ -25,12 +25,16 @@ the stderr an MCP client collects. The test suite asserts it is absent from all 
 `serve` prints the link, because a terminal is not an agent log; `mcp --serve` writes it to
 a file opened `O_CREAT` with mode `0600` and gives stderr the path.
 
-**Changes have to look like a person made them.** Every state-changing route requires the
-[Fetch Metadata](https://developer.mozilla.org/en-US/docs/Glossary/Fetch_metadata_request_header)
-headers a browser sends for a form submitted on a page it is showing. Scripts cannot set
-them, so inside a browser they cannot be forged; outside one they are a line of code, which
-is why this only counts sitting behind the login. A refusal writes a `ui_change_refused`
-event.
+**Changes are session-authenticated and CSRF-checked.** The cookie is the
+authentication; every state-changing route additionally requires that the request came
+from a page this service served —
+[`Sec-Fetch-Site: same-origin`](https://developer.mozilla.org/en-US/docs/Glossary/Fetch_metadata_request_header),
+a header a browser sets and script cannot, with a matching `Origin` as the fallback for
+browsers that send no fetch metadata — and a per-session token carried by every form.
+That admits a form submission and a same-origin fetch alike, which is what lets the UI's
+own script submit forms. A refusal writes a `ui_change_refused` event. (An earlier
+navigation-only check lives in
+[design history](design/history/2026-08-26-how-the-review-ui-got-a-login.md).)
 
 **Nothing is applied on a stale premise.** Freshness is checked before a bundle is shown and
 again per item before it is applied.

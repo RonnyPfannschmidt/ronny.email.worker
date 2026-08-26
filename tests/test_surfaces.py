@@ -30,7 +30,7 @@ from mailmind.mcp import oauth
 from mailmind.mcp import server as mcp_server
 from mailmind.service import Service, hash_token
 from mailmind.web import app as app_module
-from mailmind.web.app import SESSION_KEY_PARAM, create_app, is_machine_path
+from mailmind.web.app import SESSION_KEY_PARAM, create_app, csrf_token, is_machine_path
 from tests.corpus import CORPUS
 from tests.targets.fake import FakeBackend
 
@@ -95,6 +95,9 @@ def service(tmp_path, backend):
 #: The key `mailmindctl serve` would mint and print. Fixed here so a test can follow the
 #: link the way a person does.
 SESSION_KEY = "test-session-key-for-the-reviewer"
+
+#: The form token every page derived from that key carries.
+CSRF = csrf_token(SESSION_KEY)
 
 
 def opened(app, base_url: str = "http://127.0.0.1:8765") -> TestClient:
@@ -209,21 +212,19 @@ class ToolRefused(Exception):
 
 
 def as_a_person(client: TestClient, path: str, **kwargs):  # noqa: ANN201
-    """POST the way a browser does when somebody submits a form on a page it is showing.
+    """POST the way a page this service served does: same-origin, carrying the form token.
 
-    The review UI refuses anything else, so a test that changes something has to arrive the
-    way a change really arrives. Sec-Fetch-User is included because a real submit carries
-    it — the service does not require it, since Safari has never sent it.
+    The review UI refuses anything else — the session cookie authenticates, and these are
+    the CSRF half. Works for a form submission and for a framework's fetch alike.
     """
     headers = {
-        "Sec-Fetch-Mode": "navigate",
-        "Sec-Fetch-Dest": "document",
         "Sec-Fetch-Site": "same-origin",
-        "Sec-Fetch-User": "?1",
         "Origin": str(client.base_url).rstrip("/"),
     }
     headers.update(kwargs.pop("headers", {}))
-    return client.post(path, headers=headers, **kwargs)
+    data = {"_csrf": CSRF}
+    data.update(kwargs.pop("data", {}) or {})
+    return client.post(path, headers=headers, data=data, **kwargs)
 
 
 def accepting(client: TestClient, bundle_id: int, **kwargs):  # noqa: ANN201
@@ -1430,7 +1431,7 @@ def test_following_the_link_leaves_the_key_out_of_the_address(service):
         assert SESSION_KEY not in landed.headers["location"]
 
         cookie = landed.headers["set-cookie"]
-        assert "HttpOnly" in cookie and "samesite=lax" in cookie.lower()
+        assert "HttpOnly" in cookie and "samesite=strict" in cookie.lower()
 
         # Other query parameters survive the trade, since links carry them.
         landed = person.get(
@@ -1468,38 +1469,75 @@ def test_the_key_is_never_told_to_the_agent(client, service):
 #: this: an agent doing the obvious thing with an address it was handed.
 NOT_A_GESTURE = {
     "nothing at all": None,
-    "a fetch rather than a navigation": {"Sec-Fetch-Mode": "cors"},
-    "not a document being loaded": {"Sec-Fetch-Dest": "empty"},
-    "arriving from somewhere else": {"Sec-Fetch-Site": "cross-site"},
-    "an origin that is not this one": {"Origin": "http://evil.example"},
+    "arriving from another site": {"Sec-Fetch-Site": "cross-site"},
+    "arriving from a subframe of elsewhere": {"Sec-Fetch-Site": "same-site"},
+    "no fetch metadata and a foreign origin": {"Origin": "http://evil.example"},
 }
 
 
 @pytest.mark.parametrize("why", list(NOT_A_GESTURE))
-def test_the_review_ui_refuses_a_change_that_is_not_a_person_at_a_browser(client, backend, why):
+def test_the_review_ui_refuses_a_change_that_is_not_same_origin(client, backend, why):
     """One POST to the address the agent is handed used to accept a bundle and move mail.
 
-    It is still not a security boundary — anything that can set a header can say all of
-    this. What it buys is that an agent doing the obvious thing with an address it was
-    given no longer reaches it, and one that does reach it has asserted in four headers
-    that a browser is showing a page to somebody. See docs/design/12.
+    The session cookie authenticates; this is the CSRF half — a change must come from a
+    page this service served, said by fetch metadata a script cannot forge (or a matching
+    Origin where a browser is too old to send any). See docs/security-model.md.
     """
     proposed = _propose(Agent(client))
     spoiled = NOT_A_GESTURE[why]
     headers = {}
     if spoiled is not None:
         headers = {
-            "Sec-Fetch-Mode": "navigate",
-            "Sec-Fetch-Dest": "document",
             "Sec-Fetch-Site": "same-origin",
             "Origin": str(client.base_url).rstrip("/"),
             **spoiled,
         }
+        if "Origin" in spoiled:
+            # Exercise the no-fetch-metadata fallback: the Origin alone must match.
+            headers.pop("Sec-Fetch-Site")
 
-    refused = client.post(f"/bundle/{proposed['bundle_id']}/accept", headers=headers)
+    refused = client.post(
+        f"/bundle/{proposed['bundle_id']}/accept",
+        headers=headers,
+        data={"_csrf": CSRF},
+    )
     assert refused.status_code == 403, why
     assert "nothing here is yours to accept" in refused.text
     assert len(backend.folders["Archive"].messages) == 0, "it applied anyway"
+
+
+def test_the_review_ui_refuses_a_change_without_the_form_token(client, backend):
+    """Same-origin is necessary and not sufficient: the form token is the other half."""
+    proposed = _propose(Agent(client))
+    refused = client.post(
+        f"/bundle/{proposed['bundle_id']}/accept",
+        headers={
+            "Sec-Fetch-Site": "same-origin",
+            "Origin": str(client.base_url).rstrip("/"),
+        },
+    )
+    assert refused.status_code == 403
+    assert "token" in refused.text
+    assert len(backend.folders["Archive"].messages) == 0, "it applied anyway"
+
+
+def test_a_framework_fetch_from_our_own_page_gets_through(client, backend):
+    """A same-origin fetch (Turbo's form submission) is a person's action, not an agent's.
+
+    ``sec-fetch-mode: cors`` with ``sec-fetch-site: same-origin`` is exactly what a
+    framework submitting a form with fetch sends; refusing it was the old gesture check,
+    replaced on purpose.
+    """
+    proposed = _propose(Agent(client))
+    page = client.get(f"/bundle/{proposed['bundle_id']}").text
+    shown = re.search(r'name="reviewed_through" value="(\d+)"', page)
+    response = client.post(
+        f"/bundle/{proposed['bundle_id']}/accept",
+        headers={"Sec-Fetch-Site": "same-origin", "Sec-Fetch-Mode": "cors"},
+        data={"_csrf": CSRF, "reviewed_through": shown.group(1) if shown else "0"},
+    )
+    assert response.status_code < 400
+    assert len(backend.folders["Archive"].messages) == 1
 
 
 def test_a_browser_that_withholds_the_origin_is_still_a_person(client, backend):
@@ -1539,7 +1577,7 @@ def test_a_refused_change_leaves_a_mark(client, service):
         )
     assert event is not None, "a refused change should be findable afterwards"
     assert event.payload["path"].endswith("/accept")
-    assert "sec-fetch-mode" in event.payload["problem"]
+    assert "origin" in event.payload["problem"]
 
 
 def test_a_person_at_a_browser_still_gets_through(client, backend):
@@ -1555,6 +1593,21 @@ def test_the_review_pages_forbid_remote_content(client):
     csp = response.headers["content-security-policy"]
     assert "img-src 'none'" in csp
     assert "default-src 'none'" in csp
+    # The one script is our own vendored file; nothing inline, nothing remote.
+    assert "script-src 'self'" in csp
+    assert "connect-src 'self'" in csp
+    assert "unsafe-inline" not in csp.replace("style-src 'self' 'unsafe-inline'", "")
+
+
+def test_the_script_is_served_and_stays_behind_the_key(client, service):
+    """/static is a page asset, not a machine path — no session, no script."""
+    served = client.get("/static/turbo.js")
+    assert served.status_code == 200
+    assert "javascript" in served.headers["content-type"]
+
+    app = create_app(service, session_key=SESSION_KEY)
+    with TestClient(app, base_url="http://127.0.0.1:8765") as stranger:
+        assert stranger.get("/static/turbo.js").status_code == 401
 
 
 # =====================================================================================
@@ -1696,6 +1749,37 @@ def test_the_consent_page_says_what_it_is_agreeing_to(client):
     assert "test" in page.text
     # There is no apply to tick, and the page says why.
     assert "no <em>apply</em> to tick" in page.text
+    # Capabilities are pre-ticked; the mail itself is not — start narrow.
+    import re as _re
+
+    for box in _re.findall(r'<input type="checkbox"[^>]*name="capabilities"[^>]*>', page.text):
+        assert "checked" in box
+    for box in _re.findall(r'<input type="checkbox"[^>]*name="account_ids"[^>]*>', page.text):
+        assert "checked" not in box
+
+
+def test_the_shut_page_names_the_command_that_reopens_it(service):
+    """Locked out (a restart, a strict cookie) the person is told the way back in."""
+    app = create_app(service, session_key=SESSION_KEY)
+    with TestClient(app, base_url="http://127.0.0.1:8765") as stranger:
+        shut = stranger.get("/")
+    assert shut.status_code == 401
+    assert "mailmindctl review --open" in shut.text
+
+
+def test_excluding_lands_back_at_the_row_it_removed(client):
+    """A long table reviewed item by item must not snap to the top per click."""
+    proposed = _propose(Agent(client))
+    page = client.get(f"/bundle/{proposed['bundle_id']}").text
+    form = re.search(r"/bundle/\d+/exclude/(\d+)", page)
+    suggestion_id = form.group(1)
+    response = as_a_person(
+        client,
+        f"/bundle/{proposed['bundle_id']}/exclude/{suggestion_id}",
+        follow_redirects=False,
+    )
+    assert response.status_code == 303
+    assert "#m" in response.headers["location"] or "#s" in response.headers["location"]
 
 
 def test_an_agent_that_follows_its_own_link_is_told_to_fetch_a_person(service):
@@ -1770,11 +1854,34 @@ def test_what_the_agent_gets_is_what_the_person_ticked(client):
     assert "suggest" in str(refused.value)
 
 
-def test_mail_nobody_ticked_is_not_in_the_grant(client, service):
-    """No accounts ticked means no mail, rather than all of it."""
-    issued = log_in(client, accounts=())
-    agent = Agent(client, token=issued["access_token"])
-    assert agent.call("list_accounts") == []
+def test_allowing_with_no_mail_ticked_bounces_back_to_the_page(client, service):
+    """Allow with nothing ticked is almost always a mistake, so the page asks again.
+
+    No accounts on a grant still means no mail rather than all of it — the command line
+    can mint such a grant — but the consent page will not create one silently.
+    """
+    verifier, challenge = pkce()
+    client_id = register(client)
+    request_id = ask(client, client_id, challenge)
+
+    response = as_a_person(
+        client,
+        "/consent",
+        data={
+            "request_id": request_id,
+            "decision": "allow",
+            "capabilities": ["observe", "suggest"],
+        },
+        follow_redirects=False,
+    )
+    assert response.status_code == 303
+    bounced = urlparse(response.headers["location"])
+    assert bounced.path == "/consent", "no grant, back to the page"
+    assert "You ticked no mail" in parse_qs(bounced.query)["error"][0]
+
+    # The request is still answerable — ticking an account now completes the login.
+    code = agree(client, request_id, accounts=(1,))
+    assert redeem(client, client_id, code, verifier)["access_token"]
 
 
 def test_refusing_hands_the_client_an_answer_rather_than_silence(client):

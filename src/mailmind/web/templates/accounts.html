@@ -23,11 +23,12 @@
     <tr>
       <td>{{ c.name }}</td><td>{{ c.cached_messages }}</td>
       <td class="muted">{{ c.server_message_count }}</td>
-      <td class="muted">{{ (c.last_synced or "never")[:16] }}</td>
+      <td class="muted">{{ (c.last_synced or "never") | when }}</td>
     </tr>
     {% endfor %}
   </table>
   <form method="post" action="/accounts/{{ row.account.id }}/sync">
+  <input type="hidden" name="_csrf" value="{{ csrf }}">
     <button>sync now</button>
   </form>
 {% endfor %}

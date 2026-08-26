@@ -15,6 +15,7 @@
 </div>
 
 <form method="post" action="/consent">
+  <input type="hidden" name="_csrf" value="{{ csrf }}">
   <input type="hidden" name="request_id" value="{{ request_row.request_id }}">
 
   <h2>What it may do</h2>
@@ -39,12 +40,14 @@
     {% for a in accounts %}
     <tr>
       <td style="width:1.5rem">
-        <input type="checkbox" id="acct-{{ a.id }}" name="account_ids" value="{{ a.id }}" checked>
+        <input type="checkbox" id="acct-{{ a.id }}" name="account_ids" value="{{ a.id }}">
       </td>
       <td><label for="acct-{{ a.id }}">{{ a.name }}</label></td>
     </tr>
     {% endfor %}
   </table>
+  <p class="small muted">Nothing ticked here means the agent is let in but can see no
+  mail — tick what it is for.</p>
   {% else %}
   <p class="warn">There are no accounts yet, so there is no mail to give it.</p>
   {% endif %}

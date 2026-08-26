@@ -4,6 +4,8 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>{% block title %}mailmind{% endblock %}</title>
+<script src="/static/turbo.js" defer></script>
+{% block head %}{% endblock %}
 <style>
 :root { color-scheme: light dark; --line:#0002; --warn:#b45309; --bad:#b91c1c; --ok:#15803d; }
 body { font: 15px/1.5 system-ui, sans-serif; margin: 0 auto; max-width: 62rem; padding: 1.5rem; }
@@ -23,8 +25,8 @@ th { font-weight: 600; font-size: .85rem; text-transform: uppercase; letter-spac
 .banner { padding: .7rem .9rem; border: 1px solid var(--line); border-left: 4px solid var(--warn); margin: 1rem 0; }
 .banner.error { border-left-color: var(--bad); }
 .finding { display:block; font-size:.85rem; }
-.finding.mechanical::before { content: "fact "; font-weight:600; opacity:.6; }
-.finding.interpretation::before { content: "read "; font-weight:600; opacity:.6; }
+.finding.mechanical::before { content: "service: "; font-weight:600; opacity:.6; }
+.finding.interpretation::before { content: "agent: "; font-weight:600; opacity:.6; }
 .body { white-space: pre-wrap; border: 1px solid var(--line); padding: .6rem; margin: .4rem 0; font-size: .9rem; max-height: 22rem; overflow: auto; }
 .links td { font-size: .82rem; }
 form.inline { display: inline; }
@@ -42,10 +44,11 @@ details summary { cursor: pointer; }
       {# No script anywhere: the CSP forbids it, so switching is a submit rather than an
          onchange. #}
       <form method="post" action="/accounts/choose">
+  <input type="hidden" name="_csrf" value="{{ csrf }}">
         <label>working in
           <select name="account_id">
             {% for a in accounts %}
-            <option value="{{ a.id }}"{% if a.id == current_account.id %} selected{% endif %}>{{ a.name }}</option>
+            <option value="{{ a.id }}"{% if a.id == current_account.id %} selected{% endif %}>{{ a.name }}{% if waiting.get(a.id) and a.id != current_account.id %} ({{ waiting[a.id] }} waiting){% endif %}</option>
             {% endfor %}
           </select>
         </label>
