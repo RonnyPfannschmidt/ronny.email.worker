@@ -53,7 +53,19 @@ async def apply_bundle(
     backend: MailBackend,
     *,
     trash_container: m.Container | None = None,
+    checkpoint=None,  # noqa: ANN001 - async () -> None, usually scope.commit
+    should_stop=None,  # noqa: ANN001 - () -> bool
+    on_item=None,  # noqa: ANN001 - (done: int, total: int) -> None
 ) -> list[m.ApplyAttempt]:
+    """Apply what is still accepted, one committed item at a time.
+
+    ``checkpoint`` (usually ``scope.commit``) runs after the target folder is ensured
+    and after every item, so the write lock is held per item and a run cut short —
+    crash, shutdown via ``should_stop``, an unreachable mailbox — leaves every finished
+    item durable.  The bundle stays ``accepted`` until the final rollup, and the rollup
+    counts item *statuses* rather than this run's attempts, so a resumed run reports the
+    whole truth rather than its own half.
+    """
     if bundle.status is not m.BundleStatus.accepted:
         raise NotApplicable(f"a {bundle.status.value} bundle is not applied")
 
@@ -70,37 +82,67 @@ async def apply_bundle(
         # between acceptance and here should leave no trace, and a folder nothing was
         # ever moved into is a trace.
         await _ensure_target_exists(scope, bundle, backend)
+        if checkpoint is not None:
+            await checkpoint()
 
     attempts = []
-    for suggestion in ordered:
+    for done, suggestion in enumerate(ordered):
+        if should_stop is not None and should_stop():
+            # Interrupted, not finished: everything checkpointed stays, the bundle
+            # stays accepted, and the caller decides what "interrupted" means.
+            return attempts
         attempts.append(
             await _apply_one(
                 scope, bundle, suggestion, backend, trash_container=trash_container
             )
         )
+        if checkpoint is not None:
+            await checkpoint()
+        if on_item is not None:
+            on_item(done + 1, len(ordered))
 
-    if not attempts:
-        # Every item died between being accepted and getting here.  Nothing was done to
-        # the mailbox, so the bundle does not get to say it was: `applied == len(attempts)`
-        # holds trivially of zero attempts, and the queue then showed a change that never
-        # happened.  The bundle stays accepted with its items marked, which is the truth.
+    counts = _rollup(bundle)
+    if not attempts and counts["applied"] == 0:
+        # Every item died between being accepted and getting here, and no earlier run
+        # applied any.  Nothing was ever done to the mailbox, so the bundle does not
+        # get to say it was — it closes as stale, which is what became of it.
+        bundle.status = m.BundleStatus.stale
+        await scope.audit(
+            "bundle_stale",
+            actor_kind="service",
+            subject_kind="bundle",
+            subject_id=bundle.id,
+            payload={"reason": "every accepted item moved on before it was applied"},
+        )
         raise NotApplicable(
             "no item of this bundle is still accepted; every one of them went stale "
             "before it could be applied, and nothing was done to the mailbox"
         )
 
-    applied = sum(1 for a in attempts if a.outcome is m.ApplyOutcome.applied)
     bundle.status = (
-        m.BundleStatus.applied if applied == len(attempts) else m.BundleStatus.partially_applied
+        m.BundleStatus.applied
+        if counts["applied"] == counts["decided"]
+        else m.BundleStatus.partially_applied
     )
     await scope.audit(
         "bundle_applied",
         actor_kind="service",
         subject_kind="bundle",
         subject_id=bundle.id,
-        payload={"applied": applied, "attempted": len(attempts)},
+        payload={"applied": counts["applied"], "attempted": counts["decided"]},
     )
     return attempts
+
+
+def _rollup(bundle: m.Bundle) -> dict[str, int]:
+    """What became of the accepted items, across every run rather than this one."""
+    applied = sum(1 for s in bundle.suggestions if s.status is m.SuggestionStatus.applied)
+    dead = sum(
+        1
+        for s in bundle.suggestions
+        if s.status in (m.SuggestionStatus.stale, m.SuggestionStatus.failed)
+    )
+    return {"applied": applied, "decided": applied + dead}
 
 
 def _in_order(bundle: m.Bundle) -> list[m.Suggestion]:

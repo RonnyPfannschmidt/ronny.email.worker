@@ -838,6 +838,58 @@ class ApplyAttempt(Base, TenantScoped):
     suggestion: Mapped[Suggestion] = relationship(lazy="selectin")
 
 
+class TaskKind(enum.Enum):
+    apply_bundle = "apply_bundle"  # subject_id = bundle.id
+    sync_account = "sync_account"  # subject_id = account.id
+    sync_container = "sync_container"  # subject_id = container.id
+    fetch_body = "fetch_body"  # subject_id = message.id
+
+
+class TaskStatus(enum.Enum):
+    queued = "queued"
+    running = "running"
+    done = "done"
+    failed = "failed"
+
+
+class Task(Base, TenantScoped):
+    """Work the service owes somebody, durable so a restart cannot lose it.
+
+    A bundle a person accepted, a sync a person or an agent asked for, a body a page
+    wants — each is a row here, worked through by the in-process runner one account at a
+    time.  ``account_id`` is the lane: it is resolved at enqueue time for every kind, so
+    the runner never has to ask what a subject belongs to.
+    """
+
+    __tablename__ = "task"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    kind: Mapped[TaskKind] = mapped_column(_enum(TaskKind, "task_kind"))
+    status: Mapped[TaskStatus] = mapped_column(
+        _enum(TaskStatus, "task_status"), default=TaskStatus.queued
+    )
+    account_id: Mapped[int] = mapped_column(sa.ForeignKey("account.id"))
+    subject_id: Mapped[int] = mapped_column()
+    payload: Mapped[dict[str, Any]] = mapped_column(default=dict)
+    progress_done: Mapped[int] = mapped_column(default=0)
+    progress_total: Mapped[int | None] = mapped_column(default=None)
+    progress_note: Mapped[str | None] = mapped_column(sa.String(255), default=None)
+    result: Mapped[dict[str, Any]] = mapped_column(default=dict)
+    error: Mapped[str | None] = mapped_column(sa.Text, default=None)
+    attempts: Mapped[int] = mapped_column(default=0)
+    requested_by: Mapped[int | None] = mapped_column(
+        sa.ForeignKey("producer.id"), default=None
+    )
+    created_at: Mapped[dt.datetime] = mapped_column(default=utcnow)
+    started_at: Mapped[dt.datetime | None] = mapped_column(default=None)
+    finished_at: Mapped[dt.datetime | None] = mapped_column(default=None)
+
+    __table_args__ = (
+        sa.Index("ix_task_open", "tenant_id", "status", "account_id", "id"),
+        sa.Index("ix_task_subject", "tenant_id", "kind", "subject_id"),
+    )
+
+
 class AuditEvent(Base, TenantScoped):
     """The record: what happened, in order, kept rather than overwritten.
 

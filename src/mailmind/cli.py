@@ -220,22 +220,6 @@ def probe(ctx: click.Context) -> None:
     raise SystemExit(1 if asyncio.run(go()) else 0)
 
 
-def messages_to_read(folders, backend, *, force_full: bool) -> int | None:  # noqa: ANN001
-    """How many messages this sync will read, if that is knowable before it starts.
-
-    A folder being read end to end — one that has never had a full sync, or all of them
-    when `--full` says so — can be counted first: STATUS answers without opening it. A
-    folder being asked what changed cannot, because the answer is the question.
-
-    So the total is real or it is absent. It used to be neither: it grew as folders
-    reported in, which reads as progress against a moving target.
-    """
-    whole = [c.name for c in folders if force_full or c.last_full_sync_at is None]
-    if not whole:
-        return None
-    return sum(backend.message_counts(whole).values())
-
-
 @contextlib.contextmanager
 def sync_display(folders: int, messages: int | None):  # noqa: ANN201
     """Show where a sync has got to, if there is anybody watching.
@@ -380,26 +364,16 @@ def sync(ctx: click.Context, account_name: str | None, force_full: bool) -> None
                         if c.selectable
                     ]
                     expected = await asyncio.to_thread(
-                        messages_to_read, folders, backend, force_full=force_full
+                        sync_module.messages_to_read, folders, backend, force_full=force_full
                     )
                     with sync_display(len(folders), expected) as display:
-                        for container in folders:
-                            report = await sync_module.sync_container(
-                                scope,
-                                account,
-                                container,
-                                backend,
-                                force_full=force_full,
-                                progress=display,
-                            )
-                            display.folder_finished(report)
-                            # Per folder, not per account.  A first sync of a real
-                            # mailbox is long, and one transaction around the whole of it
-                            # holds SQLite's write lock for the duration — which every
-                            # other request then waits on and gives up.  It also made the
-                            # whole sync all-or-nothing, so interrupting an hour of
-                            # fetching threw the hour away.
-                            await scope.commit()
+                        await sync_module.sync_account(
+                            scope,
+                            account,
+                            backend,
+                            force_full=force_full,
+                            progress=display,
+                        )
 
     asyncio.run(go())
     service.close()

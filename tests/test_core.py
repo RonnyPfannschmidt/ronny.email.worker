@@ -329,7 +329,7 @@ async def test_what_a_sync_will_read_is_countable_before_it_reads_it(scope, worl
     """The progress total. A folder about to be read whole can be counted with STATUS; a
     folder about to be asked what changed cannot, and saying a number anyway is worse than
     saying none — which is what a total that grew as folders reported in amounted to."""
-    from mailmind.cli import messages_to_read
+    from mailmind.imap.sync import messages_to_read
 
     folders = list(world["containers"].values())
     first_time = [c for c in folders if c.name != "INBOX"]  # never fully synced
@@ -514,7 +514,9 @@ async def test_a_bundle_that_lost_every_item_is_not_reported_as_applied(scope, w
     with pytest.raises(applier.NotApplicable) as refused:
         await applier.apply_bundle(scope, bundle, backend)
     assert "nothing was done to the mailbox" in str(refused.value)
-    assert bundle.status is m.BundleStatus.accepted
+    # And it does not stay accepted either: an accepted bundle with nothing left to do
+    # used to sit invisible forever — it closes as what became of it.
+    assert bundle.status is m.BundleStatus.stale
 
 
 async def test_a_bundle_nobody_decided_and_nothing_survived_closes_itself(

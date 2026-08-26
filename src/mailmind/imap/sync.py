@@ -102,6 +102,8 @@ class SyncProgress(Protocol):
 
     def messages_absorbed(self, count: int) -> None: ...
 
+    def folder_finished(self, report: SyncReport) -> None: ...
+
 
 async def sync_container(
     scope: TenantScope,
@@ -346,3 +348,57 @@ async def fetch_and_cache_body(
         await scope.flush()
         await cache.evict_bodies(scope, budget_bytes)
     return parsed.body_text
+
+
+def messages_to_read(folders, backend, *, force_full: bool) -> int | None:  # noqa: ANN001
+    """How many messages this sync will read, if that is knowable before it starts.
+
+    A folder being read end to end — one that has never had a full sync, or all of them
+    when `--full` says so — can be counted first: STATUS answers without opening it. A
+    folder being asked what changed cannot, because the answer is the question.
+
+    So the total is real or it is absent. It used to be neither: it grew as folders
+    reported in, which reads as progress against a moving target.
+
+    Blocking — call it inside a dip.
+    """
+    whole = [c.name for c in folders if force_full or c.last_full_sync_at is None]
+    if not whole:
+        return None
+    return sum(backend.message_counts(whole).values())
+
+
+async def sync_account(
+    scope: TenantScope,
+    account: m.Account,
+    backend: MailBackend,
+    *,
+    force_full: bool = False,
+    progress: SyncProgress | None = None,
+    should_stop=None,  # noqa: ANN001 - () -> bool
+) -> list[SyncReport]:
+    """Every selectable folder of one account, committed per folder.
+
+    Per folder, not per account: a first sync of a real mailbox is long, and one
+    transaction around the whole of it holds SQLite's write lock for the duration —
+    which every other request then waits on and gives up.  It also made the whole sync
+    all-or-nothing, so interrupting an hour of fetching threw the hour away.
+
+    ``should_stop`` is checked between folders; a stopped sync keeps everything it
+    committed.
+    """
+    folders = [
+        c for c in await discover_containers(scope, account, backend) if c.selectable
+    ]
+    reports: list[SyncReport] = []
+    for container in folders:
+        if should_stop is not None and should_stop():
+            break
+        report = await sync_container(
+            scope, account, container, backend, force_full=force_full, progress=progress
+        )
+        if progress is not None:
+            progress.folder_finished(report)
+        reports.append(report)
+        await scope.commit()
+    return reports

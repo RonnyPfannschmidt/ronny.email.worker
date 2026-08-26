@@ -570,7 +570,9 @@ def create_app(
             )
             try:
                 async with service.backend(account) as backend:
-                    await applier.apply_bundle(scope, bundle, backend, trash_container=trash)
+                    await applier.apply_bundle(
+                        scope, bundle, backend, trash_container=trash, checkpoint=scope.commit
+                    )
             except applier.NotApplicable as exc:
                 await scope.commit()
                 return _back(bundle_id, str(exc))
