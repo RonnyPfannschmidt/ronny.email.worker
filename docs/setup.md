@@ -39,7 +39,7 @@ after adding an account to the file — and it reports where a row and the file 
 since the row is what a connection is built from. `--update` resolves that in the file's
 favour. `probe` exits
 non-zero when the server does not offer something the account declares, which is the
-direction that would otherwise fail at three in the morning.
+direction that would otherwise only fail once a sync needs it.
 
 ## Then
 

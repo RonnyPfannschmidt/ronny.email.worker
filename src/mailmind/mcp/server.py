@@ -67,11 +67,7 @@ def _require(capability: m.Capability) -> dict[str, Any]:
 
 
 def _account(scope: TenantScope, grant: dict[str, Any], account_id: int) -> m.Account:
-    """The view is given, not chosen.
-
-    An account outside the grant does not read as forbidden; it reads as absent, because
-    that is what it is from where the agent stands.
-    """
+    """An account outside the grant reads as absent, not forbidden — see docs/design/05."""
     if account_id not in grant["account_ids"]:
         raise NotPermitted(f"no account {account_id}")
     account = scope.get(m.Account, account_id)

@@ -19,6 +19,7 @@ stays here unchanged.
 |---|---|---|
 | 2026-08-12 | [mailmind — Testability & CI Plan](2026-08-12-mailmind-testability-and-ci-plan.md) | not yet folded into specs |
 | 2026-08-24 | [Would `aioimaplib` do instead of the synchronous client?](2026-08-24-aioimaplib-evaluation.md) | measurements, not a spec |
+| 2026-08-26 | [How the review UI got a login](2026-08-26-how-the-review-ui-got-a-login.md) | folded into [12](../12-an-agent-of-your-own.md) |
 
 ### 2026-08-12 — mailmind — Testability & CI Plan
 
@@ -34,3 +35,10 @@ An evaluation rather than a design: what the async IMAP client does when driven 
 surface `mailmind.imap.client` needs, measured against the container tier's Dovecot. The
 answer was no, and the reasons are dated — two of the three blockers are upstream bugs, so
 the question survives its answer.
+
+### 2026-08-26 — How the review UI got a login
+
+The three attempts at keeping an agent out of the review UI, kept when
+[12](../12-an-agent-of-your-own.md) was trimmed to the current state: no login, then
+fetch-metadata gesture checks, then the session key. The middle attempt's mechanism has
+since been replaced; the chronology stays as recorded.

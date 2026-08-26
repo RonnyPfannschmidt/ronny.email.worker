@@ -48,18 +48,8 @@ CSP = (
 
 
 def chosen_account(scope) -> m.Account | None:  # noqa: ANN001
-    """Which account the review UI is working in.
-
-    The review UI's login is a key, not an identity: it says somebody may come in, not
-    which somebody.  So there is still nobody to look up, the reviewer is still implicit,
-    and what a person picks is which account they are looking at.  Authentication that
-    says *who* only enters on a deployment, and when it does it replaces :func:`reviewer`
-    rather than this.
-
-    This is a view and not a boundary.  Nothing is being kept from anybody — the person
-    at the keyboard owns all of it — so a link to a bundle in another account still
-    works.  The account scoping that *is* a boundary is the grant's, on the agent
-    surface, and it is enforced somewhere else entirely.
+    """Which account the review UI is working in — a view, not a boundary
+    (docs/design/11 has the argument).
 
     Nothing chosen falls back to the first account by name, so a fresh install has one
     without anybody having to pick.
@@ -306,21 +296,11 @@ def create_app(
             _mount_login(app, service, public_url)
 
     @app.middleware("http")
-    async def only_somebody_holding_the_key_gets_in(request: Request, call_next):  # noqa: ANN001, ANN202
-        """The review UI has a login, and this is it.
+    async def require_session_key(request: Request, call_next):  # noqa: ANN001, ANN202
+        """The review UI's login: the startup key, traded once for a session cookie.
 
-        Not a password — there is nobody to have an account, and a passphrase for a service
-        on your own machine is friction protecting the wrong thing.  What there is instead
-        is a key minted when the process starts and shown to whoever started it.  The point
-        is not that it is hard to guess; it is that it is never given to the agent.  The
-        model is told the address so it can send a person there, and told nothing that lets
-        it go itself.
-
-        This is the only check here that an agent with a network tool cannot simply talk
-        its way past.  It stops being enough the moment the agent can read the terminal
-        that printed the key or the files of the person who ran it — at which point it
-        could resolve the mailbox password and skip mailmind altogether.  That boundary is
-        how the agent is run, and it is not one this process can draw.
+        The key is never given to the agent — that is the whole design; see
+        docs/security-model.md and docs/design/12 for what it buys and where it stops.
         """
         if is_machine_path(request.url.path):
             return await call_next(request)

@@ -149,18 +149,12 @@ thing rather than a broken one.
 
 The form itself is not built. What it has to do beyond the obvious: choose *where* the
 password lives rather than take a password, and probe the server before saving, so a typo
-is caught at the form and not at three in the morning.
+is caught at the form rather than at the first sync after it.
 
-## Bundles are large when the action is one action
+## Bundle limits belong to the deployment
 
-[03](03-review.md) asked what "see the effect" means for a suggestion touching two hundred
-messages. The answer is that the number was never the thing — homogeneity is. One
-operation and one target over an enumerated list is reviewable at a size that the same
-list would not be if each item could do something different. A hundred messages moving to
-Archive is one decision shown a hundred times; a hundred messages each doing their own
-thing is a hundred decisions dressed as one.
-
-So the limits are a guard against a bundle nobody can *render*, not against one nobody can
+Homogeneity, not size, is what keeps a large bundle reviewable — the argument is
+[03](03-review.md)'s. What follows for deployment: the limits are a guard against a bundle nobody can *render*, not against one nobody can
 *understand*, and they belong to the deployment rather than to the design. They are
 configurable under `[limits]` today. Whether they should also be per-tenant rows editable
 in the UI is the same question as accounts, and gets the same answer if the answer to

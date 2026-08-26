@@ -36,10 +36,8 @@ from pydantic import AnyUrl
 from mailmind.db import models as m
 from mailmind.service import Service, hash_token, mint_token
 
-#: The one scope.  A scope would ordinarily say what the token may do; here the grant says
-#: that, and the person chose it at the consent page rather than the agent asking for it —
-#: which is the same rule as everywhere else in this design, that the view is given and not
-#: chosen.  So there is one scope, every token has it, and nothing branches on it.
+#: The one scope, carried by every token.  The grant says what the token may do, and the
+#: person chose that at the consent page (docs/design/05: the view is given, not chosen).
 SCOPE = "mailmind"
 
 #: An access token is short because it can be: the client registered for `refresh_token`

@@ -31,7 +31,8 @@ change `port` and both follow.
 
 ## The grant is the whole of what you get
 
-Whichever transport, the view is given and not chosen. An agent cannot name a tenant, widen
+Whichever transport, the view is given, not chosen ([05](05-agent-surface.md)) —
+an agent cannot name a tenant, widen
 its own scope, or assert who it is. `--capability` narrows what it may do and `--account`
 narrows what it may see, and an account outside the grant reads as absent rather than
 forbidden — because that is what it is, from where the agent stands.
@@ -52,8 +53,8 @@ Twelve tools, nine that look and three that say, plus six resources and three pr
 [the reference](../reference/mcp.md) is the list, and [Connecting an agent](../connecting.md)
 has what to build into an agent from the start.
 
-There is no tool that applies anything. Not a permission your agent lacks — a capability
-value the enum cannot hold, and a module nothing on the agent side imports.
+There is no tool that applies anything —
+[the security model](../security-model.md) has what makes that structural.
 
 The prompts are this iteration's guess at [05](05-agent-surface.md)'s question — what an
 agent needs in order to be useful here — offered rather than imposed, because a client that
@@ -70,85 +71,26 @@ act on, are properties of the agent — neither is something mailmind can check 
 ## The port the agent is told about and cannot open
 
 The review UI is served for the person at this computer. The agent is told the address so
-it can pass it on, and is not given the key that opens it. That asymmetry is the design,
-and this section is the history of getting there, because two of the three attempts were
-not enough and it is worth knowing why.
+it can pass it on, and is not given the key that opens it. That asymmetry is the design;
+how it was arrived at — three attempts, two of which were not enough — is
+[history](history/2026-08-26-how-the-review-ui-got-a-login.md).
 
 ### Why it carries so much
 
-In the `--serve` shape it is the whole boundary. The agent surface has no apply — not a
-permission withheld but a capability value the enum cannot hold — and the session's UI
+In the `--serve` shape it is the whole boundary. The agent surface has no apply
+([the security model](../security-model.md) has what holds that up), and the session's UI
 mounts no MCP endpoint, so there is no second way in through the port either. The only
 path from a proposal to a mailbox runs through the review UI.
 
-### First: nothing at all
+### What it holds today
 
-The review UI had no login. Accepting was an ordinary form POST, and holding the URL the
-model had just been handed was enough:
-
-```
-POST http://127.0.0.1:35607/bundle/1/accept  ->  200
-  INBOX: 5 (was 6)    Archive: 1 (was 0)
-```
-
-No token, no browser, no form fields. One request, and mail moved.
-
-### Second: it has to look like a person did it
-
-Every route that changes something requires the headers a browser sends when somebody
-submits a form on a page it is showing — `sec-fetch-mode: navigate`, `sec-fetch-dest:
-document`, `sec-fetch-site: same-origin`, and a matching `origin`. These are
-[Fetch Metadata](https://developer.mozilla.org/en-US/docs/Glossary/Fetch_metadata_request_header)
-headers, which scripts are forbidden to set, so inside a browser they cannot be forged.
-A refusal writes a `ui_change_refused` event, because nothing changed but something tried,
-and whoever owns the mail should be able to find that out.
-
-The origin is checked alongside those headers, and that check spent a while refusing the
-person it was written for: browsers derive a form POST's `Origin` from the referrer policy,
-and this service was sending `Referrer-Policy: no-referrer`, so every button in the review
-UI arrived as `Origin: null`. The policy is `same-origin` now, and a missing or opaque
-origin is no longer held against a request whose fetch metadata already says same-origin —
-a browser is allowed to withhold it, and the metadata is the part doing the work.
-
-`Sec-Fetch-User: ?1` would be the better signal — "a person did this" rather than "a
-document navigated" — and is deliberately not required, because Safari has never sent it
-and a check that locks out a whole browser is a check somebody turns off.
-
-This was never a boundary and was not meant as one. It changed the character of the act:
-before, an agent reached the review UI by doing the obvious thing with an address it had
-been given; after, by stating in four headers that a browser was showing a page to a
-person. An accident became a lie. But a lie is one line of code:
-
-```
-POST with the four headers  ->  200, and the mail moves
-```
-
-### Third: a login, for local too
-
-So there is one. Not a password — there is nobody here to have an account, and a
-passphrase for a service on your own machine is friction protecting the wrong thing.
-Instead a **key**, minted when the process starts and printed where the person is:
-
-```
-review UI  http://127.0.0.1:45911/  (this session only)
-           the link that opens it is in /run/user/1000/mailmind/review-45911.link
-           `mailmindctl review --open` follows it for you
-```
-
-Note what is *not* there. An MCP client collects the stderr of everything it spawns into a
-log, and some put that log in front of the model — so the key goes to a file with a mode
-on it, and stderr gets the path. `mailmindctl serve` prints the link outright, because that
-is a command a person runs in their own terminal and its output is nobody's agent log.
-
-Following the link once trades the key for an HttpOnly session cookie and drops it back out
-of the address. The model is told `http://127.0.0.1:45911/` and nothing else. The same forged
-request as above now gets a 401 that says, in as many words, that an agent reading it was
-not given the key on purpose and should tell the person to look at their terminal.
-
-The key is not hard to guess and does not need to be. Everything rests on it not being
-told to the agent, which is a property of every channel that reaches one — the
-instructions, tool results, resources, prompts, and the stderr an MCP client collects. The
-test suite asserts all five.
+A key is minted when the process starts and left where the person is: `serve` prints the
+link outright, because a terminal is nobody's agent log; `mcp --serve` writes it to a
+file only you can read and gives stderr the path, because an MCP client's log can end up
+in front of the model. Following the link once trades the key for an HttpOnly session
+cookie and drops it out of the address bar; `mailmindctl review --open` follows it for
+you. The model is told the address and nothing else, and the test suite asserts the key
+is absent from every channel that reaches an agent.
 
 ### What it actually buys, and where it stops
 

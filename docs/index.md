@@ -7,10 +7,6 @@ It cannot make any of it happen. A person reviews the proposed effect — every 
 where it is, where it would go — and accepts or rejects. Only then does the service touch
 the mailbox, and only if nothing has moved since.
 
-There is no tool on the surface that applies a change: `apply` is not a value the
-capability enum can hold, and the module that writes to a mailbox is not imported by
-anything on the agent side.
-
 > Nothing reaches a mailbox through mailmind except an accept made by something holding
 > the review key, and every accept is recorded against a producer.
 
@@ -29,5 +25,5 @@ Not "a person accepted it". [The security model](security-model.md) has the diff
 | [Reference](reference/mcp.md) | The MCP surface, `mailmindctl`, the configuration file |
 | [Design notes](design/index.md) | Why it is shaped this way |
 
-Iteration one: IMAP, one tenant, no release — you run it from a checkout. No model has been
-pointed at it yet, so anything here about what an agent will reach for is a guess.
+Iteration one: IMAP, one tenant, no release — you run it from a checkout. No model has
+been pointed at it yet ([09](design/09-iteration-one.md) has what that leaves open).

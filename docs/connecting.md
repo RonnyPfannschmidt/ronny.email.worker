@@ -68,7 +68,8 @@ nothing else.
 
 ## What the connection gets
 
-The view is given, not chosen: an agent cannot name a tenant, widen its scope, or assert
+The view is given, not chosen ([05](design/05-agent-surface.md)): an agent cannot name a
+tenant, widen its scope, or assert
 who it is. `--capability` narrows what it may do, `--account` what it may see, and an
 account outside the grant reads as *absent* rather than forbidden.
 

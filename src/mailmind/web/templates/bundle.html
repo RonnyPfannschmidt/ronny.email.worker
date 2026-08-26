@@ -23,9 +23,9 @@
 
 {% if folders %}
 <div class="banner">
-  A folder is only offered here while it holds nothing, which is what makes removing it the
-  one deletion that cannot lose mail. Each one is looked at again on the server immediately
-  before it goes; anything that has since had mail arrive in it is left alone.
+  Only empty folders are offered — the one removal that cannot lose mail — and each is
+  checked again on the server just before it goes; one that has since received mail is
+  left alone.
 </div>
 {% endif %}
 
@@ -36,10 +36,8 @@
 
 {% if named_by %}
 <div class="banner">
-  This bundle was found by searching for
-  <strong>{{ named_by[0].text }}</strong>, once, when it was proposed. What is below is the
-  whole of it — the search is not run again, and accepting this accepts these
-  {{ "folders" if folders else "messages" }} and no others.
+  This bundle was found by searching for <strong>{{ named_by[0].text }}</strong>, once,
+  at proposal — the list below is the whole of it, and the search is not run again.
 </div>
 {% endif %}
 
@@ -58,9 +56,7 @@
 {% if bundle.self_assessed_by %}
 <div class="banner">
   Assessed by <strong>{{ bundle.self_assessed_by | join(", ") }}</strong> — the same
-  producer that proposed this. An assessment is meant to come from somewhere else, because
-  whatever can be talked into a suggestion can be talked into vouching for it. Weigh it
-  accordingly.
+  producer that proposed this; weigh it accordingly.
 </div>
 {% endif %}
 
@@ -174,9 +170,8 @@ that still has something below it.</p>
 <h2>What the producer says</h2>
 <p>{{ bundle.summary }}</p>
 <p class="muted">{{ bundle.reason }}</p>
-<p class="small muted">This is what it says it is doing. The table above is what it would
-actually do. Accepting from this paragraph rather than that table would make the review
-theatre.</p>
+<p class="small muted">The table above is what it would actually do — decide from that,
+not from this.</p>
 
 {% if bundle.attempts %}
 <h2>What happened</h2>

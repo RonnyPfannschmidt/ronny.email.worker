@@ -4,11 +4,11 @@
 without letting them change anything a person has not agreed to.
 
 An agent connects over MCP, browses the mail its grant covers, and says what should happen
-to it. It cannot make any of it happen: there is no tool that applies a change, no `apply`
-value in the capability enum, and nothing on the agent side imports the code that writes to
-a mailbox. A person reviews the proposed effect — every message, where it is, where it
-would go — and accepts or rejects. Only then does the service touch the mailbox, and only
-if nothing has moved in the meantime.
+to it. It cannot make any of it happen — there is no apply capability, and
+[the security model](docs/security-model.md) has what makes that structural. A person
+reviews the proposed effect — every message, where it is, where it would go — and accepts
+or rejects. Only then does the service touch the mailbox, and only if nothing has moved in
+the meantime.
 
 The first iteration is built: IMAP, one tenant, and enough to sort a long untended mailbox.
 See [09 — Iteration one](docs/design/09-iteration-one.md) for what it does.

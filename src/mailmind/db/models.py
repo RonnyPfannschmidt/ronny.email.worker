@@ -150,9 +150,8 @@ class Capability(enum.Enum):
 class Grant(Base, TenantScoped):
     """What a producer connected over MCP may see and say.
 
-    The view is given, not chosen: a request carries a bearer token, the token resolves
-    to a grant, and the grant supplies the tenant and the accounts.  Nothing a caller
-    says can widen it.
+    The token resolves to the grant, and the grant supplies the tenant and the accounts;
+    nothing a caller says can widen it — see docs/design/05.
     """
 
     __tablename__ = "grant"

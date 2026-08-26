@@ -49,9 +49,8 @@ and says why. A whole branch can go in one bundle as long as the bundle holds ev
 in it; they are removed deepest first. INBOX and the special folders — Sent, Drafts, Trash,
 Junk, Archive — are refused.
 
-Size is not what makes a bundle unreviewable — homogeneity is. A hundred messages moving to
-Archive is one decision shown a hundred times; a hundred messages each doing their own thing
-is a hundred decisions dressed as one. The `[limits]` are there so a bundle can be
+Homogeneity, not size, is what keeps a large bundle reviewable
+([03](design/03-review.md) has the argument); the `[limits]` are there so a bundle can be
 *rendered*, not so it can be understood.
 
 ## What "partial" means on a message

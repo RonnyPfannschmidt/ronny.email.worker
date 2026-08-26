@@ -133,7 +133,7 @@ SEEDED_FIELDS = (
     multiple=True,
     default=("observe", "suggest", "assess"),
     type=click.Choice([c.value for c in m.Capability]),
-    help="there is no apply; it is not a capability this service has",
+    help="there is no apply capability",
 )
 @click.option(
     "--account", "account_names", multiple=True, default=(), help="default: all accounts"
