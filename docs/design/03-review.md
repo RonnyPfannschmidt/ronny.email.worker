@@ -26,6 +26,24 @@ expire rather than accumulate forever.
 A suggestion whose premise has moved on cannot be accepted at all — the reviewer is told what
 changed instead.
 
+## The premise of a review
+
+A suggestion records what it was computed against, and refuses to be applied if that moved.
+An acceptance needs the same thing one level up: what the person was *shown*. Without it,
+accepting means "this bundle as it stands when the form arrives" rather than "the bundle I
+read", and the difference is invisible exactly when it matters.
+
+It matters because a bundle can now grow. Everything else that touches a waiting bundle
+takes away — excluding is the reviewer narrowing it, going stale is the service killing what
+moved — and that is why one click can carry the whole of it. Adding is the one direction
+that puts something in front of a person after they may already have read past it.
+
+So the review page says which items it drew, the accept carries that back, and a bundle that
+grew in between cannot be accepted from the old page. The two premises are answered
+differently on purpose: staleness only ever subtracts, so a checkbox saying "I have read what
+changed" is an honest answer to it. Growth adds, and nothing added may be waved through by a
+checkbox. The answer to growth is reading the page again.
+
 ## A bundle is large when the action is one action
 
 Homogeneity is what makes a bundle reviewable, not its length. One operation and one

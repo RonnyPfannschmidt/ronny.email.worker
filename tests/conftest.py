@@ -91,3 +91,17 @@ def world(scope, backend):
         "seed": seed,
         "uids": uids,
     }
+
+
+def accept_as_shown(scope, bundle, reviewer, **kw):
+    """Accept the way a person does: from the page they were shown.
+
+    ``reviewed_through`` is required rather than defaulted, so that a review surface
+    cannot forget to say what it rendered.  A test is not a review surface, and every
+    test that is not *about* the review premise means "the page showed everything".
+    """
+    from mailmind.suggest import model as suggest
+
+    return suggest.accept(
+        scope, bundle, reviewer, reviewed_through=suggest.shown_through(bundle), **kw
+    )

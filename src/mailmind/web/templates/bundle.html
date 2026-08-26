@@ -31,6 +31,30 @@
 
 {% if error %}<div class="banner error">{{ error }}</div>{% endif %}
 
+{% set named_by = bundle["queries"] | rejectattr("grew") | list %}
+{% set grown_by = bundle["queries"] | selectattr("grew") | list %}
+
+{% if named_by %}
+<div class="banner">
+  This bundle was found by searching for
+  <strong>{{ named_by[0].text }}</strong>, once, when it was proposed. What is below is the
+  whole of it — the search is not run again, and accepting this accepts these
+  {{ "folders" if folders else "messages" }} and no others.
+</div>
+{% endif %}
+
+{% if grown_by %}
+<div class="banner">
+  This bundle has been added to since it was proposed.
+  {% for q in grown_by %}
+  <strong>{{ q.added }}</strong> of the {{ "folders" if folders else "messages" }} below
+  arrived from a search for <strong>{{ q.text }}</strong> on
+  {{ q.at[:10] }}{{ "; " if not loop.last else ". " }}
+  {%- endfor %}
+  They are marked. Accepting this accepts them along with the rest, so read them first.
+</div>
+{% endif %}
+
 {% if bundle.self_assessed_by %}
 <div class="banner">
   Assessed by <strong>{{ bundle.self_assessed_by | join(", ") }}</strong> — the same
@@ -91,6 +115,7 @@ that still has something below it.</p>
   {% for item in bundle["items"] %}
   <tr id="m{{ item.message_id }}" class="{{ 'stale' if item.status == 'stale' }}">
     <td class="small">
+      {% if item.arrived_late %}<span class="muted small">added later</span><br>{% endif %}
       {{ item.from_address or "—" }}
       {% if item.from_display_name %}<br><span class="muted">{{ item.from_display_name }}</span>{% endif %}
     </td>
@@ -174,6 +199,9 @@ message was untouched between the check and the change — it does not mean it w
 {% if bundle.status == "proposed" %}
 <div class="actions">
   <form method="post" action="/bundle/{{ bundle.bundle_id }}/accept">
+    {# What this page is showing. Accepting means this list, not whatever the bundle
+       holds by the time the form arrives. #}
+    <input type="hidden" name="reviewed_through" value="{{ bundle.reviewed_through }}">
     {% if stale_items %}
     <p class="small">
       <label><input type="checkbox" name="acknowledge_stale" value="1" required>

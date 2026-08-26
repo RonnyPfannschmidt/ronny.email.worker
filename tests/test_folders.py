@@ -17,6 +17,7 @@ from mailmind.db import models as m
 from mailmind.imap import apply as applier
 from mailmind.imap import sync
 from mailmind.suggest import model as suggest
+from tests.conftest import accept_as_shown
 
 
 def _move_to_new(scope, world, names, name="Receipts/2026"):
@@ -68,7 +69,7 @@ def test_the_folder_is_made_when_the_move_is_accepted_and_not_before(scope, worl
     bundle = _move_to_new(scope, world, ["newsletter"])
     assert "Receipts/2026" not in backend.folders
 
-    suggest.accept(scope, bundle, world["reviewer"])
+    accept_as_shown(scope, bundle, world["reviewer"])
     attempts = applier.apply_bundle(scope, bundle, backend)
     scope.commit()
 
@@ -85,9 +86,9 @@ def test_two_bundles_naming_the_same_new_folder_get_the_same_one(scope, world, b
 
     assert first.target_container_id == second.target_container_id
 
-    suggest.accept(scope, first, world["reviewer"])
+    accept_as_shown(scope, first, world["reviewer"])
     applier.apply_bundle(scope, first, backend)
-    suggest.accept(scope, second, world["reviewer"])
+    accept_as_shown(scope, second, world["reviewer"])
     applier.apply_bundle(scope, second, backend)
     scope.commit()
 
@@ -101,7 +102,7 @@ def test_a_folder_somebody_made_by_hand_first_is_adopted_not_duplicated(scope, w
     # The person got there first, in their own mail client.
     backend.out_of_band_create("Receipts/2026")
 
-    suggest.accept(scope, bundle, world["reviewer"])
+    accept_as_shown(scope, bundle, world["reviewer"])
     attempts = applier.apply_bundle(scope, bundle, backend)
     scope.commit()
 
@@ -132,7 +133,7 @@ def test_a_folder_the_server_refuses_stops_the_bundle_and_moves_nothing(scope, w
     bundle = _move_to_new(scope, world, ["newsletter", "ordinary"])
     backend.refuse_create.add("Receipts/2026")
 
-    suggest.accept(scope, bundle, world["reviewer"])
+    accept_as_shown(scope, bundle, world["reviewer"])
     with pytest.raises(applier.NotApplicable, match="could not be created"):
         applier.apply_bundle(scope, bundle, backend)
     scope.commit()
@@ -155,7 +156,7 @@ def test_naming_a_folder_that_already_exists_is_an_ordinary_move(scope, world, b
     assert bundle.target_container_id == world["containers"]["Archive"].id
     assert bundle.target_container.exists_on_server is True
 
-    suggest.accept(scope, bundle, world["reviewer"])
+    accept_as_shown(scope, bundle, world["reviewer"])
     applier.apply_bundle(scope, bundle, backend)
     scope.commit()
     # Nothing was created; it was already there.
@@ -214,7 +215,7 @@ def test_accepting_a_discard_removes_the_folder(scope, world, backend):
     old = _empty_folder(scope, world, backend, "Old")
     bundle = _discard(scope, world, [old])
 
-    suggest.accept(scope, bundle, world["reviewer"])
+    accept_as_shown(scope, bundle, world["reviewer"])
     attempts = applier.apply_bundle(scope, bundle, backend)
     scope.commit()
 
@@ -232,7 +233,7 @@ def test_a_whole_branch_goes_deepest_first(scope, world, backend):
 
     # Proposed shallowest-first on purpose: the applier is what has to sort it out.
     bundle = _discard(scope, world, [parent, child, grandchild])
-    suggest.accept(scope, bundle, world["reviewer"])
+    accept_as_shown(scope, bundle, world["reviewer"])
     attempts = applier.apply_bundle(scope, bundle, backend)
     scope.commit()
 
@@ -260,7 +261,7 @@ def test_an_underscore_in_a_folder_name_is_not_a_wildcard(scope, world, backend)
 
     # Refused only if something is genuinely under Q1_2026, which nothing is.
     bundle = _discard(scope, world, [target])
-    suggest.accept(scope, bundle, world["reviewer"])
+    accept_as_shown(scope, bundle, world["reviewer"])
     applier.apply_bundle(scope, bundle, backend)
     scope.commit()
 
@@ -295,7 +296,7 @@ def test_mail_arriving_before_review_kills_the_item(scope, world, backend):
     sync.sync_container(scope, world["account"], old, backend)
 
     with pytest.raises(suggest.ProposalRefused, match="filled up"):
-        suggest.accept(scope, bundle, world["reviewer"])
+        accept_as_shown(scope, bundle, world["reviewer"])
     assert bundle.suggestions[0].status is m.SuggestionStatus.stale
     assert "no longer empty" in bundle.suggestions[0].stale_detail
     assert "Old" in backend.folders
@@ -305,7 +306,7 @@ def test_mail_arriving_after_acceptance_is_caught_by_the_server_check(scope, wor
     """The second check, which is the one that matters: a person has already said yes."""
     old = _empty_folder(scope, world, backend, "Old")
     bundle = _discard(scope, world, [old])
-    suggest.accept(scope, bundle, world["reviewer"])
+    accept_as_shown(scope, bundle, world["reviewer"])
 
     # Between accepting and applying, and the cache never hears about it.
     backend.add_message("Old", b"Subject: late\r\nFrom: a@b.invalid\r\n\r\nhello\r\n")
@@ -322,7 +323,7 @@ def test_mail_arriving_after_acceptance_is_caught_by_the_server_check(scope, wor
 def test_a_folder_somebody_else_already_deleted_is_reported_not_claimed(scope, world, backend):
     old = _empty_folder(scope, world, backend, "Old")
     bundle = _discard(scope, world, [old])
-    suggest.accept(scope, bundle, world["reviewer"])
+    accept_as_shown(scope, bundle, world["reviewer"])
 
     backend.out_of_band_delete("Old")
 
@@ -342,7 +343,7 @@ def test_discarding_a_folder_that_was_never_made_asks_the_server_for_nothing(
     suggest.reject(scope, move, world["reviewer"], "on reflection, no")
 
     bundle = _discard(scope, world, [target])
-    suggest.accept(scope, bundle, world["reviewer"])
+    accept_as_shown(scope, bundle, world["reviewer"])
     attempts = applier.apply_bundle(scope, bundle, backend)
     scope.commit()
 
@@ -354,7 +355,7 @@ def test_discarding_a_folder_that_was_never_made_asks_the_server_for_nothing(
 def test_a_discarded_folder_leaves_the_container_list(scope, world, backend):
     old = _empty_folder(scope, world, backend, "Old")
     bundle = _discard(scope, world, [old])
-    suggest.accept(scope, bundle, world["reviewer"])
+    accept_as_shown(scope, bundle, world["reviewer"])
     applier.apply_bundle(scope, bundle, backend)
     scope.commit()
 
@@ -367,7 +368,7 @@ def test_a_discarded_folder_made_again_is_revived_rather_than_collided_with(
 ):
     old = _empty_folder(scope, world, backend, "Old")
     bundle = _discard(scope, world, [old])
-    suggest.accept(scope, bundle, world["reviewer"])
+    accept_as_shown(scope, bundle, world["reviewer"])
     applier.apply_bundle(scope, bundle, backend)
     scope.commit()
 
@@ -376,7 +377,7 @@ def test_a_discarded_folder_made_again_is_revived_rather_than_collided_with(
     assert revived.target_container.discarded_at is None
     assert revived.target_container.exists_on_server is False
 
-    suggest.accept(scope, revived, world["reviewer"])
+    accept_as_shown(scope, revived, world["reviewer"])
     applier.apply_bundle(scope, revived, backend)
     scope.commit()
     assert len(backend.folders["Old"].messages) == 1
@@ -404,7 +405,7 @@ def test_an_item_can_be_excluded_from_a_discard_like_any_other(scope, world, bac
 
     excluded = next(s for s in bundle.suggestions if s.source_container_id == keep.id)
     suggest.exclude(scope, excluded, world["reviewer"])
-    suggest.accept(scope, bundle, world["reviewer"])
+    accept_as_shown(scope, bundle, world["reviewer"])
     applier.apply_bundle(scope, bundle, backend)
     scope.commit()
 
@@ -415,7 +416,7 @@ def test_an_item_can_be_excluded_from_a_discard_like_any_other(scope, world, bac
 def test_a_discard_reports_the_best_effort_it_actually_got(scope, world, backend):
     old = _empty_folder(scope, world, backend, "Old")
     bundle = _discard(scope, world, [old])
-    suggest.accept(scope, bundle, world["reviewer"])
+    accept_as_shown(scope, bundle, world["reviewer"])
     attempt = applier.apply_bundle(scope, bundle, backend)[0]
 
     # DELETE has no UNCHANGEDSINCE.  Looking immediately before is a narrower window and

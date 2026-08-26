@@ -11,6 +11,7 @@ import base64
 import datetime as dt
 import hashlib
 import json
+import re
 import secrets
 from urllib.parse import parse_qs, urlparse
 
@@ -225,6 +226,22 @@ def as_a_person(client: TestClient, path: str, **kwargs):  # noqa: ANN201
     return client.post(path, headers=headers, **kwargs)
 
 
+def accepting(client: TestClient, bundle_id: int, **kwargs):  # noqa: ANN201
+    """Accept the way a person does: from the page, carrying what the page showed.
+
+    The accept form sends ``reviewed_through`` so that accepting means the list that was
+    read rather than whatever the bundle holds when the form arrives.  A test that posts
+    without it is a test of the refusal, not of accepting.
+    """
+    page = client.get(f"/bundle/{bundle_id}").text
+    shown = re.search(r'name="reviewed_through" value="(\d+)"', page)
+    data = {"reviewed_through": shown.group(1) if shown else "0"}
+    data.update(kwargs.pop("data", {}))
+    return as_a_person(
+        client, f"/bundle/{bundle_id}/accept", data=data, follow_redirects=True, **kwargs
+    )
+
+
 # ------------------------------------------------------------------ the surface
 
 
@@ -242,6 +259,7 @@ AGENT_TOOLS = {
     "summarize_lists",
     "request_sync",
     "propose_bundle",
+    "add_to_bundle",
     "propose_discard",
     "add_assessment",
     "withdraw_bundle",
@@ -608,6 +626,148 @@ def test_search_is_served_from_the_local_cache(client):
 # -------------------------------------------------------- proposing and review
 
 
+def test_an_agent_can_propose_from_a_search_without_listing_the_messages_first(client):
+    """The point of the whole thing: no paging a mailing list into a list of ids."""
+    agent = Agent(client)
+    account = agent.call("list_accounts")[0]
+    containers = {c["name"]: c for c in agent.call("list_containers", account_id=account["id"])}
+    proposed = agent.call(
+        "propose_bundle",
+        account_id=account["id"],
+        operation="move",
+        query="news@list.example",
+        target_container_id=containers["Archive"]["id"],
+        summary="Newsletter issues, never replied to",
+        reason="Bulk mail with a List-Id and an unsubscribe header",
+    )
+    assert proposed["items"] == 1
+    assert proposed["query"]["text"] == "news@list.example"
+    assert proposed["query"]["matched"] == 1
+    assert "Nothing has changed in the mailbox" in proposed["note"]
+
+
+def test_naming_the_messages_and_a_query_at_once_is_refused_on_the_agent_surface(client):
+    agent = Agent(client)
+    account = agent.call("list_accounts")[0]
+    containers = {c["name"]: c for c in agent.call("list_containers", account_id=account["id"])}
+    with pytest.raises(ToolRefused, match="not both"):
+        agent.call(
+            "propose_bundle",
+            account_id=account["id"],
+            operation="move",
+            message_ids=[1],
+            query="news@list.example",
+            target_container_id=containers["Archive"]["id"],
+            summary="Both at once",
+            reason="Which one did it mean",
+        )
+
+
+def test_an_agent_told_a_query_was_narrowed_is_told_by_how_much(client, service, backend):
+    """05: an observation that never looks complete when it is not — and neither does this.
+
+    One of the two matches is already in Archive, so it is left out rather than refusing
+    the bundle, and the answer says so instead of quietly returning one of two.
+    """
+    with service.scope() as scope:
+        account = scope.scalar(sa.select(m.Account))
+        containers = {c.name: c for c in scope.scalars(sa.select(m.Container))}
+        uid = scope.scalar(
+            sa.select(m.Placement.uid)
+            .join(m.Message, m.Placement.message_id == m.Message.id)
+            .where(m.Message.subject == "Lunch on Thursday")
+        )
+        backend.out_of_band_move("INBOX", uid, "Archive")
+        sync.sync_container(scope, account, containers["INBOX"], backend)
+        sync.sync_container(scope, account, containers["Archive"], backend)
+        scope.commit()
+
+    agent = Agent(client)
+    account_id = agent.call("list_accounts")[0]["id"]
+    containers = {c["name"]: c for c in agent.call("list_containers", account_id=account_id)}
+    proposed = agent.call(
+        "propose_bundle",
+        account_id=account_id,
+        operation="move",
+        query="Lunch",
+        target_container_id=containers["Archive"]["id"],
+        summary="Lunch threads",
+        reason="Done with",
+    )
+    assert proposed["query"]["matched"] == 2
+    assert proposed["query"]["proposed"] == 1
+    assert proposed["query"]["skipped"] == {"already_in_target": 1}
+    assert "already in Archive" in proposed["query"]["note"]
+
+
+def test_an_agent_growing_a_bundle_is_told_it_is_still_only_a_proposal(client):
+    agent = Agent(client)
+    proposed = _propose(agent)
+    grown = agent.call("add_to_bundle", bundle_id=proposed["bundle_id"], query="Lunch")
+    assert grown["items"] == proposed["items"] + 2
+    assert grown["status"] == "proposed"
+    assert grown["query"]["proposed"] == 2
+    assert "Nothing has changed in the mailbox" in grown["note"]
+
+
+def test_an_agent_cannot_add_to_a_bundle_another_producer_made(client, service):
+    agent = Agent(client)
+    proposed = _propose(agent)
+    with service.scope() as scope:
+        bundle = scope.get(m.Bundle, proposed["bundle_id"])
+        somebody_else = scope.add(m.Producer(kind=m.ProducerKind.agent, name="somebody-else"))
+        scope.flush()
+        bundle.producer_id = somebody_else.id
+        scope.commit()
+
+    with pytest.raises(ToolRefused, match="only be added to by the producer"):
+        agent.call("add_to_bundle", bundle_id=proposed["bundle_id"], query="Lunch")
+
+
+def test_a_bundle_that_grew_cannot_be_accepted_from_the_page_drawn_before_it(client, backend):
+    """The consent gap, closed end to end: the person reads, the agent adds, the accept
+    refuses and says what arrived."""
+    agent = Agent(client)
+    proposed = _propose(agent)
+
+    page = client.get(f"/bundle/{proposed['bundle_id']}").text
+    shown = re.search(r'name="reviewed_through" value="(\d+)"', page).group(1)
+
+    agent.call("add_to_bundle", bundle_id=proposed["bundle_id"], query="Lunch")
+
+    refused = as_a_person(
+        client,
+        f"/bundle/{proposed['bundle_id']}/accept",
+        data={"reviewed_through": shown},
+        follow_redirects=True,
+    )
+    assert "2 more messages arrived" in refused.text
+    assert len(backend.folders["Archive"].messages) == 0, "it applied anyway"
+
+    # Reading it again is the whole resolution: the page now shows what arrived.
+    assert "added later" in client.get(f"/bundle/{proposed['bundle_id']}").text
+    accepting(client, proposed["bundle_id"])
+    assert len(backend.folders["Archive"].messages) == 3
+
+
+def test_the_review_page_says_a_bundle_was_found_by_searching(client):
+    agent = Agent(client)
+    account = agent.call("list_accounts")[0]
+    containers = {c["name"]: c for c in agent.call("list_containers", account_id=account["id"])}
+    proposed = agent.call(
+        "propose_bundle",
+        account_id=account["id"],
+        operation="move",
+        query="news@list.example",
+        target_container_id=containers["Archive"]["id"],
+        summary="Newsletter issues",
+        reason="Bulk mail",
+    )
+    page = client.get(f"/bundle/{proposed['bundle_id']}").text
+    assert "found by searching for" in page
+    assert "the search is not run again" in page
+
+
 def _propose(agent: Agent) -> dict:
     account = agent.call("list_accounts")[0]
     containers = {c["name"]: c for c in agent.call("list_containers", account_id=account["id"])}
@@ -808,9 +968,7 @@ def test_the_review_page_says_a_folder_would_be_made_before_anything_moves(clien
     assert "Lists/example" in page
     assert "does not exist yet" in page, "the reviewer has to be told what they are making"
 
-    response = as_a_person(
-        client, f"/bundle/{proposed['bundle_id']}/accept", follow_redirects=True
-    )
+    response = accepting(client, proposed["bundle_id"])
     assert response.status_code == 200
     assert "Lists/example" in backend.folders
     assert len(backend.folders["Lists/example"].messages) == len(messages)
@@ -838,9 +996,7 @@ def test_a_discard_is_reviewed_and_accepted_like_anything_else(client, service, 
     assert "cannot lose mail" in page, "why an empty folder is the only one offered"
     assert "Old" in backend.folders, "reading the page changes nothing"
 
-    response = as_a_person(
-        client, f"/bundle/{proposed['bundle_id']}/accept", follow_redirects=True
-    )
+    response = accepting(client, proposed["bundle_id"])
     assert response.status_code == 200
     assert "Old" not in backend.folders
     assert "applied" in response.text
@@ -851,9 +1007,7 @@ def test_accepting_in_the_ui_actually_moves_the_mail(client, backend):
     proposed = _propose(agent)
     assert len(backend.folders["Archive"].messages) == 0
 
-    response = as_a_person(
-        client, f"/bundle/{proposed['bundle_id']}/accept", follow_redirects=True
-    )
+    response = accepting(client, proposed["bundle_id"])
     assert response.status_code == 200
     assert len(backend.folders["Archive"].messages) == 1
     assert "applied" in response.text
@@ -882,9 +1036,7 @@ def test_accepting_a_delete_in_the_ui_files_it_in_trash(client, backend):
         reason="Nothing here is wanted",
     )
 
-    response = as_a_person(
-        client, f"/bundle/{proposed['bundle_id']}/accept", follow_redirects=True
-    )
+    response = accepting(client, proposed["bundle_id"])
     assert response.status_code == 200
     assert "no Trash container is known" not in response.text
     assert len(backend.folders["Trash"].messages) == 1
@@ -907,9 +1059,7 @@ def test_the_ui_refuses_to_accept_around_something_that_moved(client, backend, s
     page = client.get(f"/bundle/{proposed['bundle_id']}").text
     if "moved since this was proposed" in page:
         assert "acknowledge_stale" in page
-    response = as_a_person(
-        client, f"/bundle/{proposed['bundle_id']}/accept", follow_redirects=True
-    )
+    response = accepting(client, proposed["bundle_id"])
     assert response.status_code == 200
 
 
@@ -1361,9 +1511,7 @@ def test_a_browser_that_withholds_the_origin_is_still_a_person(client, backend):
     person out of their own mail.
     """
     proposed = _propose(Agent(client))
-    accepted = as_a_person(
-        client, f"/bundle/{proposed['bundle_id']}/accept", headers={"Origin": "null"}
-    )
+    accepted = accepting(client, proposed["bundle_id"], headers={"Origin": "null"})
     assert accepted.status_code < 400
     assert len(backend.folders["Archive"].messages) == 1, "the accept did not apply"
 
@@ -1397,9 +1545,7 @@ def test_a_refused_change_leaves_a_mark(client, service):
 def test_a_person_at_a_browser_still_gets_through(client, backend):
     """The other half: the check has to let the actual case work."""
     proposed = _propose(Agent(client))
-    response = as_a_person(
-        client, f"/bundle/{proposed['bundle_id']}/accept", follow_redirects=True
-    )
+    response = accepting(client, proposed["bundle_id"])
     assert response.status_code == 200
     assert len(backend.folders["Archive"].messages) == 1
 

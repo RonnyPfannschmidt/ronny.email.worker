@@ -405,6 +405,29 @@ def bundle_detail(scope: TenantScope, bundle_id: int) -> dict:
     if bundle is None:
         raise LookupError(f"no bundle {bundle_id}")
 
+    queries = bundle.payload.get("queries", [])
+    # Everything below the first span was named when the bundle was proposed; each span
+    # after that is one search that grew it.  Ids are enough because items are only ever
+    # appended.
+    found_by = {}
+    for entry in queries:
+        span = entry.get("items") or []
+        if len(span) == 2:
+            found_by[(span[0], span[1])] = entry["text"]
+
+    def arrived_from(suggestion_id: int) -> str | None:
+        for (low, high), text in found_by.items():
+            if low <= suggestion_id <= high:
+                return text
+        return None
+
+    # A bundle can be named outright and then grown, so "arrived late" is not "not in the
+    # first search" — it is "from a search that grew a bundle somebody could have read".
+    grew_from = min(
+        (entry["items"][0] for entry in queries if entry.get("grew") and entry.get("items")),
+        default=None,
+    )
+
     items = []
     for suggestion in bundle.suggestions:
         if suggestion.message_id is None:
@@ -425,6 +448,8 @@ def bundle_detail(scope: TenantScope, bundle_id: int) -> dict:
                 ),
                 "status": suggestion.status.value,
                 "stale_detail": suggestion.stale_detail,
+                "arrived_from": arrived_from(suggestion.id),
+                "arrived_late": grew_from is not None and suggestion.id >= grew_from,
                 "assessment": assessment_of(scope, m.SubjectKind.message, message.id),
             }
         )
@@ -458,6 +483,10 @@ def bundle_detail(scope: TenantScope, bundle_id: int) -> dict:
         "decided_by": bundle.decided_by.name if bundle.decided_by else None,
         "decision_reason": bundle.decision_reason,
         "items": items,
+        #: The last item this page is showing.  Travels back on the accept form so that
+        #: accepting means "the bundle I read" rather than "the bundle as it stands".
+        "reviewed_through": max((s.id for s in bundle.suggestions), default=0),
+        "queries": queries,
         "self_assessed_by": same_producer,
         "attempts": [
             {

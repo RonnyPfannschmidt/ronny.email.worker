@@ -6,6 +6,11 @@ folders.  Homogeneity is what makes showing the whole effect possible, and showi
 whole effect is what keeps accepting it from being a bulk accept over things nobody looked
 at.  That argument never mentioned messages, which is why folders fit inside it.
 
+A bundle's messages are named outright or found by a search, and a search is resolved once,
+when it is run.  A bundle waiting to be reviewed can also be added to by the producer that
+made it — the one thing here that makes a proposal larger after somebody could already have
+read it, which is why :func:`accept` also checks what the page being accepted from showed.
+
 Whether that holds up under a mailbox with thousands of messages in it is the open
 question this iteration exists to answer.
 """
@@ -14,8 +19,10 @@ from __future__ import annotations
 
 import datetime as dt
 
+import attrs
 import sqlalchemy as sa
 
+from mailmind.db import cache
 from mailmind.db import models as m
 from mailmind.db.scope import TenantScope
 from mailmind.imap.sync import flags_hash
@@ -128,13 +135,206 @@ def resolve_target(
     return container, True
 
 
+@attrs.frozen
+class Added:
+    """What became of every message a proposal named, class by class.
+
+    Kept with the bundle as provenance and handed back to the producer as its answer, so
+    the record and the answer cannot come to say different things.
+    """
+
+    added: list[int] = attrs.field(factory=list)
+    #: Left out because the message is already where the bundle would put it.
+    already_in_target: list[int] = attrs.field(factory=list)
+    #: Left out because no folder of this account still shows the message.
+    not_in_any_folder: list[int] = attrs.field(factory=list)
+    #: Left out because this bundle already holds it, whatever became of that item.
+    already_here: list[int] = attrs.field(factory=list)
+    #: The subset of :attr:`already_here` the reviewer had taken out by hand.
+    excluded_here: list[int] = attrs.field(factory=list)
+
+    @property
+    def skipped(self) -> dict[str, int]:
+        """Only the classes that actually bit, so a clean run says nothing at all."""
+        counts = {
+            "already_in_target": len(self.already_in_target),
+            "not_in_any_folder": len(self.not_in_any_folder),
+            "already_here": len(self.already_here),
+            "excluded_here": len(self.excluded_here),
+        }
+        return {name: count for name, count in counts.items() if count}
+
+
+def resolve_query(
+    scope: TenantScope, *, account: m.Account, query: str, max_size: int
+) -> tuple[int, list[int]]:
+    """Turn a search into the enumerated list a bundle is made of.  Once.
+
+    Counted before it is fetched, because the interesting refusal is about how many there
+    are rather than about the ones that came back.  A query matching more than a bundle
+    may hold is refused with the number: taking the best ``max_size`` by relevance would
+    build a bundle whose membership nobody chose — not the producer, which asked for all
+    of them, and not the person, who cannot tell why these and not those.
+    """
+    if cache.fts_query(query) is None:
+        raise ProposalRefused(
+            f"{query!r} has nothing in it to search for, so it names no messages"
+        )
+    matched = cache.count_search_messages(scope, query, account_ids={account.id})
+    if not matched:
+        raise ProposalRefused(
+            f"nothing in {account.name} matches {query!r}, so there is no bundle to review"
+        )
+    if matched > max_size:
+        raise ProposalRefused(
+            f"{matched} messages match {query!r}, more than the {max_size} a single bundle "
+            "may hold; narrow the query — by sender, by list, by date — so the bundle's "
+            "whole effect can be read"
+        )
+    # Cannot bite: the count above already refused anything larger.
+    found = cache.search_messages(scope, query, account_ids={account.id}, limit=max_size)
+    return matched, found
+
+
+def shown_through(bundle: m.Bundle) -> int:
+    """The last item this bundle has, which is the premise of having read it.
+
+    Items are only ever appended: growing is the one thing that writes new rows into a
+    bundle that exists, and nothing anywhere removes one — excluding and dying are both
+    changes of status.  So a single id says what a page showed, and anything above it is
+    what arrived afterwards.
+    """
+    return max((s.id for s in bundle.suggestions), default=0)
+
+
+def _add_messages(
+    scope: TenantScope,
+    *,
+    bundle: m.Bundle,
+    account: m.Account,
+    message_ids: list[int],
+    assert_each: bool,
+) -> Added:
+    """Turn a list of message ids into the bundle's items.
+
+    ``assert_each`` is the difference between being named and being found.  A message
+    named explicitly is a claim about that message, so a claim that does not hold refuses
+    the whole bundle.  A message a query found was never claimed, so one that cannot take
+    part is simply not part of what the query named — and is counted, and said.
+    """
+    added = Added()
+    here = {s.message_id: s for s in bundle.suggestions if s.message_id is not None}
+    seen: set[int] = set()
+    for message_id in message_ids:
+        if message_id in seen:
+            continue
+        seen.add(message_id)
+
+        if message_id in here:
+            # Whatever became of the item already holding this message.  The unique
+            # constraint would make it a crash, but the reason is better than the
+            # constraint: an excluded message is a decision a person made about this
+            # bundle, and a query is not a way to put back what a person took out.
+            added.already_here.append(message_id)
+            if here[message_id].status is m.SuggestionStatus.excluded:
+                added.excluded_here.append(message_id)
+            continue
+
+        placement = _live_placement(scope, account, message_id)
+        if placement is None:
+            if assert_each:
+                raise ProposalRefused(
+                    f"message {message_id} is not currently in any container of this account"
+                )
+            added.not_in_any_folder.append(message_id)
+            continue
+        if placement.container_id == bundle.target_container_id:
+            if assert_each:
+                raise ProposalRefused(
+                    f"message {message_id} is already in the target container"
+                )
+            added.already_in_target.append(message_id)
+            continue
+
+        container = scope.get(m.Container, placement.container_id)
+        # Through the relationship rather than the session, so the collection this
+        # function has already read stays in step with what is being written to it.
+        bundle.suggestions.append(
+            m.Suggestion(
+                bundle_id=bundle.id,
+                message_id=message_id,
+                source_container_id=placement.container_id,
+                premise_container_generation=container.generation,
+                premise_uid=placement.uid,
+                premise_modseq=placement.modseq,
+                premise_flags_hash=flags_hash(placement.flags),
+            )
+        )
+        added.added.append(message_id)
+    return added
+
+
+def _nothing_left_to_do(
+    added: Added, matched: int, query: str, target: m.Container | None
+) -> str:
+    """Why a query that matched mail still named nothing this bundle can do."""
+    if target is not None and len(added.already_in_target) == matched:
+        return (
+            f"all {matched} messages matching {query!r} are already in {target.name}, "
+            "so this bundle would change nothing"
+        )
+    left_out = ", ".join(
+        f"{count} {name.replace('_', ' ')}" for name, count in added.skipped.items()
+    )
+    return f"none of the {matched} messages matching {query!r} can take part: {left_out}"
+
+
+def _record_query(
+    scope: TenantScope,
+    bundle: m.Bundle,
+    *,
+    query: str,
+    producer: m.Producer,
+    matched: int,
+    added: Added,
+    grew: bool,
+) -> None:
+    """Keep the search with the bundle it built.
+
+    A list, so a bundle grown later carries one entry per search, each naming the span of
+    items it brought.  Everything below every span was named when the bundle was proposed.
+
+    ``payload`` is plain JSON rather than a mutable-tracked dict, so it is reassigned
+    rather than appended to; appending would not be persisted.
+    """
+    scope.flush()
+    ours = [s.id for s in bundle.suggestions if s.message_id in set(added.added)]
+    entry = {
+        "text": query,
+        #: Whether this search grew a bundle somebody could already have read, as against
+        #: naming it in the first place.  What the reviewer is warned about is the former.
+        "grew": grew,
+        "at": dt.datetime.now(dt.UTC).isoformat(),
+        "producer_id": producer.id,
+        "matched": matched,
+        "added": len(added.added),
+        "skipped": added.skipped,
+        "items": [min(ours), max(ours)] if ours else [],
+    }
+    bundle.payload = {
+        **bundle.payload,
+        "queries": [*bundle.payload.get("queries", []), entry],
+    }
+
+
 def propose_bundle(
     scope: TenantScope,
     *,
     producer: m.Producer,
     account: m.Account,
     operation: m.Operation,
-    message_ids: list[int],
+    message_ids: list[int] | None = None,
+    query: str | None = None,
     summary: str,
     reason: str,
     target_container_id: int | None = None,
@@ -143,14 +343,33 @@ def propose_bundle(
     expiry_days: int = 7,
     max_size: int = 500,
 ) -> m.Bundle:
+    """Propose one change over a set of messages, named or found.
+
+    The messages are named outright, or a ``query`` finds them — and a query is resolved
+    *now*, once.  What it finds becomes the enumerated list the bundle is, and the bundle
+    never looks again: one that re-ran its own search between being read and being
+    accepted would be a bundle nobody read.
+
+    The two ways of naming differ in what a message that cannot take part means.  An id
+    is the producer claiming *this message, this change*, so a claim that does not hold
+    refuses the bundle.  A query claims nothing about any particular message, so one that
+    cannot take part was never named — it is left out, counted, and said.
+    """
     if operation in m.CONTAINER_OPERATIONS:
         raise ProposalRefused(
             f"{operation.value} is an operation over folders, not messages; "
             "propose it as a discard"
         )
-    if not message_ids:
-        raise ProposalRefused("a bundle with no messages would have no effect to review")
-    if len(message_ids) > max_size:
+    if message_ids and query is not None:
+        raise ProposalRefused(
+            "name the messages or name a query, not both — they can disagree, and then "
+            "nothing knows which one the bundle meant"
+        )
+    if not message_ids and query is None:
+        raise ProposalRefused(
+            "a bundle needs either the messages it is about or a query that finds them"
+        )
+    if message_ids and len(message_ids) > max_size:
         raise ProposalRefused(
             f"{len(message_ids)} messages exceeds the {max_size} a single bundle may hold; "
             "propose narrower bundles so their effect can be read"
@@ -170,6 +389,7 @@ def propose_bundle(
             f"account {account.name} is not reachable, so nothing can be proposed against it"
         )
 
+    target: m.Container | None = None
     if target_container_name is not None:
         target, _ = resolve_target(scope, account, target_container_name)
         target_container_id = target.id
@@ -181,6 +401,14 @@ def propose_bundle(
             raise ProposalRefused(
                 f"{target.name} has been discarded; name it again to have it made afresh"
             )
+
+    # Resolved before the bundle row exists, so a query that names nothing worth reviewing
+    # refuses without leaving an empty bundle behind.
+    matched = 0
+    if query is not None:
+        matched, message_ids = resolve_query(
+            scope, account=account, query=query, max_size=max_size
+        )
 
     bundle = m.Bundle(
         account_id=account.id,
@@ -196,29 +424,24 @@ def propose_bundle(
     scope.add(bundle)
     scope.flush()
 
-    seen: set[int] = set()
-    for message_id in message_ids:
-        if message_id in seen:
-            continue
-        seen.add(message_id)
-        placement = _live_placement(scope, account, message_id)
-        if placement is None:
-            raise ProposalRefused(
-                f"message {message_id} is not currently in any container of this account"
-            )
-        if placement.container_id == target_container_id:
-            raise ProposalRefused(f"message {message_id} is already in the target container")
-        container = scope.get(m.Container, placement.container_id)
-        scope.add(
-            m.Suggestion(
-                bundle_id=bundle.id,
-                message_id=message_id,
-                source_container_id=placement.container_id,
-                premise_container_generation=container.generation,
-                premise_uid=placement.uid,
-                premise_modseq=placement.modseq,
-                premise_flags_hash=flags_hash(placement.flags),
-            )
+    added = _add_messages(
+        scope,
+        bundle=bundle,
+        account=account,
+        message_ids=message_ids,
+        assert_each=query is None,
+    )
+    if query is not None:
+        if not added.added:
+            raise ProposalRefused(_nothing_left_to_do(added, matched, query, target))
+        _record_query(
+            scope,
+            bundle,
+            query=query,
+            producer=producer,
+            matched=matched,
+            added=added,
+            grew=False,
         )
     scope.flush()
     scope.audit(
@@ -229,12 +452,88 @@ def propose_bundle(
         subject_id=bundle.id,
         payload={
             "operation": operation.value,
-            "messages": len(seen),
+            "messages": len(added.added),
             "target_container_id": target_container_id,
             "target_created": target_container_name is not None,
+            "query": query,
         },
     )
     return bundle
+
+
+def add_to_bundle(
+    scope: TenantScope,
+    *,
+    bundle: m.Bundle,
+    producer: m.Producer,
+    query: str,
+    max_size: int = 500,
+) -> Added:
+    """Put what a search finds into a bundle that is already waiting to be reviewed.
+
+    This is the one thing in the service that makes a proposal *larger* after a person
+    could already have read it.  Everything else that touches a waiting bundle takes away
+    — excluding is the reviewer narrowing it, staleness is the service killing what moved
+    — and that is why accepting can be one click.  So the growth is only half of this:
+    the other half is :func:`accept` refusing a page drawn before the growth happened.
+    """
+    # Before anything else, because a bundle whose every message has moved on is still
+    # `proposed` in the database until somebody draws it.  Adding to that one would keep a
+    # bundle a person once trusted alive with its contents replaced; refreshing closes it
+    # first, and then the status check below says so.
+    staleness.refresh_bundle(scope, bundle)
+
+    if bundle.status is not m.BundleStatus.proposed:
+        raise ProposalRefused(f"this bundle is {bundle.status.value} and cannot be added to")
+    if bundle.producer_id != producer.id:
+        raise ProposalRefused("a bundle can only be added to by the producer that made it")
+    if bundle.operation in m.CONTAINER_OPERATIONS:
+        raise ProposalRefused(
+            "this bundle is about folders, not messages, so a search for mail has "
+            "nothing to add to it"
+        )
+
+    account = scope.get(m.Account, bundle.account_id)
+    if account.health is m.AccountHealth.down:
+        raise ProposalRefused(
+            f"account {account.name} is not reachable, so nothing can be proposed against it"
+        )
+
+    matched, found = resolve_query(scope, account=account, query=query, max_size=max_size)
+    holds = len([s for s in bundle.suggestions if s.message_id is not None])
+    arriving = len(set(found) - {s.message_id for s in bundle.suggestions})
+    if holds + arriving > max_size:
+        raise ProposalRefused(
+            f"this bundle already holds {holds} messages and {arriving} more match; "
+            f"{holds + arriving} is more than the {max_size} a single bundle may hold"
+        )
+
+    added = _add_messages(
+        scope, bundle=bundle, account=account, message_ids=found, assert_each=False
+    )
+    if not added.added:
+        raise ProposalRefused(f"nothing matching {query!r} is missing from this bundle")
+
+    _record_query(
+        scope, bundle, query=query, producer=producer, matched=matched, added=added, grew=True
+    )
+    scope.flush()
+    # `expires_at` is deliberately untouched.  The expiry is how long a proposal is worth
+    # keeping for the person; an agent adding to it is not the person doing anything.
+    scope.audit(
+        "bundle_grown",
+        actor_kind="producer",
+        actor_id=producer.id,
+        subject_kind="bundle",
+        subject_id=bundle.id,
+        payload={
+            "query": query,
+            "added": len(added.added),
+            "skipped": added.skipped,
+            "items_now": len(bundle.suggestions),
+        },
+    )
+    return added
 
 
 def propose_discard(
@@ -415,25 +714,70 @@ def exclude(scope: TenantScope, suggestion: m.Suggestion, reviewer: m.Producer) 
     )
 
 
+def _refuse_unless_this_is_the_page_they_read(
+    scope: TenantScope, bundle: m.Bundle, reviewer: m.Producer, reviewed_through: int
+) -> None:
+    """The premise of a review: nothing arrived after the page being accepted was drawn."""
+    if not reviewed_through:
+        # No real suggestion id is nought, so this is a request that never said what it
+        # was showing — a hand-made one, or a form that forgot.
+        raise ProposalRefused(
+            "this page did not say which items it was showing, so there is no way to tell "
+            "whether it showed all of them; open the bundle again and accept from the page "
+            "you read"
+        )
+    arrived = [s for s in bundle.suggestions if s.id > reviewed_through]
+    if not arrived:
+        return
+    scope.audit(
+        "review_premise_moved",
+        actor_kind="person",
+        actor_id=reviewer.id,
+        subject_kind="bundle",
+        subject_id=bundle.id,
+        payload={"reviewed_through": reviewed_through, "arrived": [s.id for s in arrived]},
+    )
+    count = len(arrived)
+    plural = "" if count == 1 else "s"
+    raise ProposalRefused(
+        f"{count} more message{plural} arrived in this bundle after this page was drawn, "
+        f"so accepting it now would be accepting {count} thing{plural} nobody has read; "
+        f"{'it is' if count == 1 else 'they are'} shown with the rest — read "
+        f"{'it' if count == 1 else 'them'} and accept again"
+    )
+
+
 def accept(
     scope: TenantScope,
     bundle: m.Bundle,
     reviewer: m.Producer,
     *,
+    reviewed_through: int,
     acknowledge_stale: bool = False,
 ) -> list[m.Suggestion]:
     """The only transition that matters.
 
-    Staleness is checked first, and a bundle holding something that moved cannot simply
-    be accepted: the reviewer is told what changed and has to say they have seen it.
-    ``acknowledge_stale`` is that second, deliberate act.  It never accepts the stale
-    items — they stay dead — it only says the person read what happened to them.
+    Two premises are checked, not one.  ``reviewed_through`` is the premise of the
+    *review*: the last item the page being accepted from actually showed.  A suggestion
+    records what it was computed against; an acceptance has to record what it was read
+    against, or accepting means "this bundle as it stands now" when the person meant "the
+    bundle I was shown".
 
-    Without this the reviewer would be accepting around a change they were never shown,
-    which is the failure this service exists to prevent.
+    Then staleness, as before: a bundle holding something that moved cannot simply be
+    accepted, and ``acknowledge_stale`` is the second, deliberate act saying the person
+    read what happened.  It never accepts the stale items — they stay dead.
+
+    The two are resolved differently on purpose.  Staleness only ever takes things away,
+    which is why a checkbox can answer it.  Growth adds, and nothing added may be waved
+    through by a checkbox saying "I saw it" — so the answer to growth is reading the page
+    again, never acknowledging it.
     """
     if bundle.status is not m.BundleStatus.proposed:
         raise ProposalRefused(f"this bundle is {bundle.status.value}, not awaiting review")
+
+    # Before the staleness refresh, so a bundle that both grew and lost something reports
+    # the growth first; drawing the page again then shows both.
+    _refuse_unless_this_is_the_page_they_read(scope, bundle, reviewer, reviewed_through)
 
     staleness.refresh_bundle(scope, bundle)
     if bundle.status is m.BundleStatus.stale:

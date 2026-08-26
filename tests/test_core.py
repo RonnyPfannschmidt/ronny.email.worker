@@ -18,6 +18,7 @@ from mailmind.imap import apply as applier
 from mailmind.imap import sync
 from mailmind.imap.capabilities import probe_account
 from mailmind.suggest import model as suggest
+from tests.conftest import accept_as_shown
 from tests.corpus import CORPUS
 
 
@@ -370,7 +371,7 @@ def test_a_bundle_larger_than_the_limit_is_refused(scope, world):
 
 def test_accepting_applies_and_the_mailbox_actually_changes(scope, world, backend):
     bundle = _bundle(scope, world, ["newsletter"])
-    suggest.accept(scope, bundle, world["reviewer"])
+    accept_as_shown(scope, bundle, world["reviewer"])
     attempts = applier.apply_bundle(scope, bundle, backend)
     scope.commit()
 
@@ -382,7 +383,7 @@ def test_accepting_applies_and_the_mailbox_actually_changes(scope, world, backen
 
 def test_a_move_reports_best_effort_because_move_has_no_unchangedsince(scope, world, backend):
     bundle = _bundle(scope, world, ["newsletter"])
-    suggest.accept(scope, bundle, world["reviewer"])
+    accept_as_shown(scope, bundle, world["reviewer"])
     attempt = applier.apply_bundle(scope, bundle, backend)[0]
     assert attempt.precondition is m.Precondition.best_effort
     assert attempt.guarantee_obtained is m.Precondition.best_effort
@@ -399,7 +400,7 @@ def test_a_flag_change_reports_the_conditional_guarantee_it_asked_for(scope, wor
         summary="mark read",
         reason="already read elsewhere",
     )
-    suggest.accept(scope, bundle, world["reviewer"])
+    accept_as_shown(scope, bundle, world["reviewer"])
     attempt = applier.apply_bundle(scope, bundle, backend)[0]
     assert attempt.outcome is m.ApplyOutcome.applied
     assert attempt.guarantee_obtained is m.Precondition.conditional
@@ -415,7 +416,7 @@ def test_gap_one_something_that_moved_before_review_cannot_be_accepted(scope, wo
     sync.sync_container(scope, world["account"], world["containers"]["INBOX"], backend)
 
     with pytest.raises(suggest.ProposalRefused, match="moved since this was proposed"):
-        suggest.accept(scope, bundle, world["reviewer"])
+        accept_as_shown(scope, bundle, world["reviewer"])
 
     dead = [s for s in bundle.suggestions if s.status is m.SuggestionStatus.stale]
     assert len(dead) == 1
@@ -427,11 +428,11 @@ def test_the_reviewer_can_exclude_what_moved_and_accept_the_rest(scope, world, b
     backend.out_of_band_move("INBOX", world["uids"]["ordinary"], "Archive")
     sync.sync_container(scope, world["account"], world["containers"]["INBOX"], backend)
     with pytest.raises(suggest.ProposalRefused):
-        suggest.accept(scope, bundle, world["reviewer"])
+        accept_as_shown(scope, bundle, world["reviewer"])
 
     # The reviewer has now been shown what moved and says so.  The stale item is not
     # accepted by this; it stays dead.
-    accepted = suggest.accept(scope, bundle, world["reviewer"], acknowledge_stale=True)
+    accepted = accept_as_shown(scope, bundle, world["reviewer"], acknowledge_stale=True)
     assert len(accepted) == 1
     attempts = applier.apply_bundle(scope, bundle, backend)
     assert [a.outcome for a in attempts] == [m.ApplyOutcome.applied]
@@ -442,7 +443,7 @@ def test_the_reviewer_can_exclude_what_moved_and_accept_the_rest(scope, world, b
 def test_gap_two_something_that_moves_after_acceptance_is_not_applied(scope, world, backend):
     """The dangerous gap: a person has already said yes."""
     bundle = _bundle(scope, world, ["newsletter"])
-    suggest.accept(scope, bundle, world["reviewer"])
+    accept_as_shown(scope, bundle, world["reviewer"])
 
     # Between the yes and the doing, another client touches it.
     backend.out_of_band_mutate_flags("INBOX", world["uids"]["newsletter"], (r"\Flagged",))
@@ -467,7 +468,7 @@ def test_gap_two_holds_even_when_the_cache_has_not_noticed(scope, world, backend
         summary="mark read",
         reason="r",
     )
-    suggest.accept(scope, bundle, world["reviewer"])
+    accept_as_shown(scope, bundle, world["reviewer"])
     backend.out_of_band_mutate_flags("INBOX", world["uids"]["newsletter"], (r"\Flagged",))
 
     attempts = applier.apply_bundle(scope, bundle, backend)
@@ -484,7 +485,7 @@ def test_a_bundle_that_lost_every_item_is_not_reported_as_applied(scope, world, 
     from mailmind.suggest import staleness
 
     bundle = _bundle(scope, world, ["newsletter"])
-    suggest.accept(scope, bundle, world["reviewer"])
+    accept_as_shown(scope, bundle, world["reviewer"])
 
     # Somebody files it in their own client, and the next sync notices.
     backend.out_of_band_move("INBOX", world["uids"]["newsletter"], "Archive")
@@ -559,7 +560,7 @@ def test_accepting_a_bundle_that_just_died_says_so_rather_than_refusing_forever(
     sync.sync_container(scope, world["account"], world["containers"]["INBOX"], backend)
 
     with pytest.raises(suggest.ProposalRefused) as refused:
-        suggest.accept(scope, bundle, world["reviewer"], acknowledge_stale=True)
+        accept_as_shown(scope, bundle, world["reviewer"], acknowledge_stale=True)
     assert "nothing left to apply" in str(refused.value)
     assert "closed rather than rejected" in str(refused.value)
     assert bundle.status is m.BundleStatus.stale
@@ -598,7 +599,7 @@ def test_a_recreated_folder_kills_everything_resting_on_it(scope, world, backend
 
 def test_nothing_is_applied_against_an_unhealthy_account(scope, world, backend):
     bundle = _bundle(scope, world, ["newsletter"])
-    suggest.accept(scope, bundle, world["reviewer"])
+    accept_as_shown(scope, bundle, world["reviewer"])
     world["account"].health = m.AccountHealth.read_only
     with pytest.raises(applier.NotApplicable, match="not healthy"):
         applier.apply_bundle(scope, bundle, backend)
@@ -621,7 +622,7 @@ def test_unreviewed_bundles_expire(scope, world):
 
 def test_the_record_keeps_who_accepted_what(scope, world, backend):
     bundle = _bundle(scope, world, ["newsletter"])
-    suggest.accept(scope, bundle, world["reviewer"])
+    accept_as_shown(scope, bundle, world["reviewer"])
     applier.apply_bundle(scope, bundle, backend)
     verbs = list(scope.scalars(sa.select(m.AuditEvent.verb).order_by(m.AuditEvent.seq)))
     assert "bundle_proposed" in verbs and "bundle_accepted" in verbs
@@ -659,5 +660,5 @@ def test_a_message_leaving_is_noticed_even_on_a_server_offering_qresync(scope, w
     assert report.vanished == 1
 
     with pytest.raises(suggest.ProposalRefused):
-        suggest.accept(scope, bundle, world["reviewer"])
+        accept_as_shown(scope, bundle, world["reviewer"])
     assert bundle.suggestions[0].status is m.SuggestionStatus.stale

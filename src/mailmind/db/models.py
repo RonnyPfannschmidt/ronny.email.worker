@@ -626,8 +626,11 @@ class Bundle(Base, TenantScoped):
     producer: Mapped[Producer] = relationship(foreign_keys=[producer_id])
     decided_by: Mapped[Producer | None] = relationship(foreign_keys=[decided_by_id])
     target_container: Mapped[Container | None] = relationship()
+    #: In the order they arrived.  Items are only ever appended — excluding and dying are
+    #: changes of status, not removals — which is what lets one id say what a review page
+    #: showed and what arrived after it.
     suggestions: Mapped[list[Suggestion]] = relationship(
-        back_populates="bundle", cascade="all, delete-orphan"
+        back_populates="bundle", cascade="all, delete-orphan", order_by="Suggestion.id"
     )
 
     __table_args__ = (

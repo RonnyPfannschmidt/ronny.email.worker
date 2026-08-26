@@ -500,16 +500,23 @@ def create_app(
         return _back(bundle_id, error)
 
     @app.post("/bundle/{bundle_id}/accept")
-    def accept_bundle(bundle_id: int, acknowledge_stale: str = Form(default="")):  # noqa: ANN202
+    def accept_bundle(  # noqa: ANN202
+        bundle_id: int,
+        reviewed_through: int = Form(default=0),
+        acknowledge_stale: str = Form(default=""),
+    ):
         with service.scope() as scope:
             bundle = scope.get(m.Bundle, bundle_id)
             if bundle is None:
                 return HTMLResponse("no such bundle", status_code=404)
             try:
+                # What the page being accepted from actually showed.  Without it, accept
+                # would mean "this bundle as it stands now" rather than "the bundle I read".
                 suggest.accept(
                     scope,
                     bundle,
                     reviewer(scope),
+                    reviewed_through=reviewed_through,
                     acknowledge_stale=bool(acknowledge_stale),
                 )
             except suggest.ProposalRefused as exc:

@@ -77,6 +77,27 @@ the message moved, its flags changed, the folder was recreated. Accepting a bund
 already visibly stale asks you to acknowledge that first. A bundle nobody decides expires
 after `bundle_expiry_days`.
 
+## When a bundle was built from a search
+
+An agent can name a bundle's mail with a search rather than a list. When it has, the page
+says so and shows the words it searched for.
+
+The search ran once, when the bundle was proposed. What you see is the whole of it — nothing
+is looked up again between now and accepting, and mail that arrives afterwards is not
+quietly swept in. The list is what you are accepting; the search is only how it was found.
+
+## When a bundle grew while you were reading it
+
+The agent that proposed a bundle can add to it while it is still waiting. If that happens
+after the page you are looking at was drawn, accepting is refused: you are told how many
+arrived, and the bundle is shown again with them marked `added later`.
+
+There is no way to acknowledge this and carry on, deliberately. Something dying can be
+acknowledged, because the effect only got smaller. Something arriving cannot, because it
+would mean approving mail nobody read. Read the page again and accept from that.
+
+The day a bundle expires does not move when it grows.
+
 ## Accounts
 
 The accounts page lists them, chooses the one you are working in, and syncs one on demand.

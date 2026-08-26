@@ -101,6 +101,35 @@ def _message(scope: TenantScope, grant: dict[str, Any], message_id: int) -> m.Me
     return message
 
 
+def _query_record(bundle: m.Bundle) -> dict[str, Any]:
+    """What the last search on this bundle found, and what it left out.
+
+    Read back out of what was written as the bundle's provenance rather than built
+    alongside it, so the answer and the record cannot come to disagree.
+    """
+    entry = bundle.payload.get("queries", [])[-1]
+    where = bundle.target_container.name if bundle.target_container else None
+    reasons = {
+        "already_in_target": f"already in {where}" if where else "already where this puts them",
+        "not_in_any_folder": "no longer in any folder",
+        "already_here": "already in this bundle",
+        "excluded_here": "taken out of this bundle by the reviewer",
+    }
+    left_out = "; ".join(
+        f"{count} {reasons.get(name, name)}" for name, count in entry["skipped"].items()
+    )
+    note = f"{entry['matched']} messages match; {entry['added']} are in this bundle."
+    if left_out:
+        note += f" Left out: {left_out}."
+    return {
+        "text": entry["text"],
+        "matched": entry["matched"],
+        "proposed": entry["added"],
+        "skipped": entry["skipped"],
+        "note": note,
+    }
+
+
 def _bundle(scope: TenantScope, grant: dict[str, Any], bundle_id: int) -> m.Bundle:
     bundle = scope.get(m.Bundle, bundle_id)
     if bundle is None or bundle.account_id not in grant["account_ids"]:
@@ -344,14 +373,32 @@ def build_server(
     def propose_bundle(
         account_id: int,
         operation: str,
-        message_ids: list[int],
         summary: str,
         reason: str,
+        message_ids: list[int] | None = None,
+        query: str | None = None,
         target_container_id: int | None = None,
         target_container_name: str | None = None,
         flag: str | None = None,
     ) -> dict:
         """Propose one change over a set of messages, for a person to review.
+
+        Name the messages with ``message_ids``, or let ``query`` find them — one or the
+        other, never both. A query is the same words-not-a-language search
+        ``search_messages`` takes, and it saves listing a mailing list by hand.
+
+        A query is resolved **now**, once. What it finds becomes the enumerated list the
+        bundle is, and the bundle never looks again: one that re-ran its own search between
+        being read and being accepted would be a bundle nobody read.
+
+        The two ways of naming differ in what an unusable message means. An id is a claim
+        about that message, so one that has moved, or is already in the target, refuses the
+        whole bundle. A query claims nothing about any one message, so those are left out
+        instead — and the answer says how many, and why.
+
+        A query matching more than a bundle may hold is refused with the number rather than
+        trimmed to fit: a bundle cut down to its most relevant few is a bundle whose
+        membership nobody chose.
 
         ``operation`` is move, add_flag, remove_flag or delete. A bundle is homogeneous on
         purpose: it is what a person accepts or rejects as a unit, so its whole effect has
@@ -378,6 +425,7 @@ def build_server(
                     account=account,
                     operation=m.Operation(operation),
                     message_ids=message_ids,
+                    query=query,
                     summary=summary,
                     reason=reason,
                     target_container_id=target_container_id,
@@ -388,8 +436,7 @@ def build_server(
                 )
             except ValueError as exc:
                 raise suggest.ProposalRefused(f"unknown operation {operation!r}") from exc
-            s.commit()
-            return {
+            answer = {
                 "bundle_id": bundle.id,
                 "status": bundle.status.value,
                 "items": len(bundle.suggestions),
@@ -399,6 +446,54 @@ def build_server(
                     + (f" Review it at {review_url}bundle/{bundle.id}" if review_url else "")
                 ),
             }
+            if query is not None:
+                answer["query"] = _query_record(bundle)
+            s.commit()
+            return answer
+
+    @server.tool()
+    def add_to_bundle(bundle_id: int, query: str) -> dict:
+        """Put what a search finds into a bundle you proposed and nobody has decided on.
+
+        Only your own bundle, and only while it is still awaiting review. The search works
+        the way ``search_messages`` does, and is resolved once, now — what it finds is
+        added to the enumerated list and the bundle never looks again.
+
+        Mail already in the bundle is left alone, including anything the reviewer has
+        excluded: a search is not a way to put back what a person took out.
+
+        This is the one thing here that makes a proposal larger after somebody could
+        already have read it, so it has a cost. A review page drawn before this call can no
+        longer be accepted from — the person is told what arrived and reads the bundle
+        again. Adding to a bundle somebody is looking at spends their attention, so prefer
+        proposing a second bundle unless this really is the same decision.
+
+        The day the bundle expires does not move.
+        """
+        grant = _require(m.Capability.suggest)
+        with scope() as s:
+            bundle = _bundle(s, grant, bundle_id)
+            producer = s.get(m.Producer, grant["producer_id"])
+            suggest.add_to_bundle(
+                s,
+                bundle=bundle,
+                producer=producer,
+                query=query,
+                max_size=service.config.limits.max_bundle_size,
+            )
+            answer = {
+                "bundle_id": bundle.id,
+                "status": bundle.status.value,
+                "items": len(bundle.suggestions),
+                "query": _query_record(bundle),
+                "resource": f"mailmind://bundle/{bundle.id}",
+                "note": (
+                    "Added, and still awaiting review. Nothing has changed in the mailbox."
+                    + (f" Review it at {review_url}bundle/{bundle.id}" if review_url else "")
+                ),
+            }
+            s.commit()
+            return answer
 
     @server.tool()
     def propose_discard(
