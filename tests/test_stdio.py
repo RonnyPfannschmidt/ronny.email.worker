@@ -10,6 +10,7 @@ thing that proposes anything.
 
 from __future__ import annotations
 
+import asyncio
 import datetime as dt
 import http.cookiejar
 import json
@@ -26,7 +27,7 @@ import pytest
 import sqlalchemy as sa
 
 from mailmind.db import models as m
-from mailmind.db.engine import create_engine
+from mailmind.db.engine import create_engine_async
 from mailmind.db.migrate import upgrade_to_head
 from mailmind.db.scope import make_sessionmaker, tenant_scope
 
@@ -48,32 +49,40 @@ def workspace(tmp_path):
     db = tmp_path / "mm.db"
     url = f"sqlite:///{db}"
     upgrade_to_head(url)
-    sessions = make_sessionmaker(create_engine(url))
-    with tenant_scope(sessions, 0) as scope:
-        account = scope.add(
-            m.Account(name="dev", host="h", username="u", password_url="env://X")
-        )
-        scope.flush()
-        inbox = scope.add(m.Container(account_id=account.id, name="INBOX", generation=1))
-        archive = scope.add(m.Container(account_id=account.id, name="Archive", generation=1))
-        message = scope.add(m.Message(account_id=account.id, content_key="k1", subject="Hi"))
-        scope.flush()
-        scope.add(
-            m.Placement(
-                message_id=message.id,
-                container_id=inbox.id,
-                uid=1,
-                container_generation=1,
-                seen_at=dt.datetime.now(dt.UTC),
+    sessions = make_sessionmaker(create_engine_async(url))
+
+    async def seed() -> dict:
+        async with tenant_scope(sessions, 0) as scope:
+            account = scope.add(
+                m.Account(name="dev", host="h", username="u", password_url="env://X")
             )
-        )
-        scope.commit()
-        ids = {
-            "account": account.id,
-            "inbox": inbox.id,
-            "archive": archive.id,
-            "message": message.id,
-        }
+            await scope.flush()
+            inbox = scope.add(m.Container(account_id=account.id, name="INBOX", generation=1))
+            archive = scope.add(
+                m.Container(account_id=account.id, name="Archive", generation=1)
+            )
+            message = scope.add(
+                m.Message(account_id=account.id, content_key="k1", subject="Hi")
+            )
+            await scope.flush()
+            scope.add(
+                m.Placement(
+                    message_id=message.id,
+                    container_id=inbox.id,
+                    uid=1,
+                    container_generation=1,
+                    seen_at=dt.datetime.now(dt.UTC),
+                )
+            )
+            await scope.commit()
+            return {
+                "account": account.id,
+                "inbox": inbox.id,
+                "archive": archive.id,
+                "message": message.id,
+            }
+
+    ids = asyncio.run(seed())
 
     # A port nothing is on, so "the UI is advertised here" and "this process is not
     # listening here" can both be asserted against the same number.
@@ -336,15 +345,19 @@ def test_the_advertised_review_url_can_be_overridden(workspace):
 
 def test_stdio_reuses_the_named_producer_s_grant_rather_than_widening_it(workspace):
     """`grant --producer x --capability observe` has to narrow the stdio server too."""
-    with tenant_scope(workspace["sessions"], 0) as scope:
-        producer = scope.add(m.Producer(kind=m.ProducerKind.agent, name="narrow"))
-        scope.flush()
-        grant = scope.add(
-            m.Grant(producer_id=producer.id, token_hash="hash", capabilities=["observe"])
-        )
-        scope.flush()
-        scope.add(m.GrantAccount(grant_id=grant.id, account_id=workspace["account"]))
-        scope.commit()
+
+    async def narrow_grant() -> None:
+        async with tenant_scope(workspace["sessions"], 0) as scope:
+            producer = scope.add(m.Producer(kind=m.ProducerKind.agent, name="narrow"))
+            await scope.flush()
+            grant = scope.add(
+                m.Grant(producer_id=producer.id, token_hash="hash", capabilities=["observe"])
+            )
+            await scope.flush()
+            scope.add(m.GrantAccount(grant_id=grant.id, account_id=workspace["account"]))
+            await scope.commit()
+
+    asyncio.run(narrow_grant())
 
     client = StdioClient(workspace["config"], "--producer", "narrow")
     try:
@@ -378,9 +391,13 @@ def test_stdio_reuses_the_named_producer_s_grant_rather_than_widening_it(workspa
     finally:
         client.close()
 
-    with tenant_scope(workspace["sessions"], 0) as scope:
-        grants = scope.scalars(sa.select(m.Grant)).all()
-    assert len(grants) == 1, "a second grant was minted instead of the narrow one reused"
+    async def count_grants() -> int:
+        async with tenant_scope(workspace["sessions"], 0) as scope:
+            return len(await scope.all(sa.select(m.Grant)))
+
+    assert asyncio.run(count_grants()) == 1, (
+        "a second grant was minted instead of the narrow one reused"
+    )
 
 
 def test_stdio_mints_a_grant_that_cannot_be_used_over_http(workspace):
@@ -405,16 +422,19 @@ def test_stdio_mints_a_grant_that_cannot_be_used_over_http(workspace):
     finally:
         client.close()
 
-    with tenant_scope(workspace["sessions"], 0) as scope:
-        grant = scope.scalar(
-            sa.select(m.Grant).join(m.Producer).where(m.Producer.name == "fresh")
-        )
-        assert sorted(grant.capabilities) == ["assess", "observe", "suggest"]
-        assert {ga.account_id for ga in grant.accounts} == {workspace["account"]}
-        minted = scope.scalar(
-            sa.select(m.AuditEvent).where(m.AuditEvent.verb == "grant_minted")
-        )
-        assert minted.payload["transport"] == "stdio"
+    async def check() -> None:
+        async with tenant_scope(workspace["sessions"], 0) as scope:
+            grant = await scope.scalar(
+                sa.select(m.Grant).join(m.Producer).where(m.Producer.name == "fresh")
+            )
+            assert sorted(grant.capabilities) == ["assess", "observe", "suggest"]
+            assert {ga.account_id for ga in grant.accounts} == {workspace["account"]}
+            minted = await scope.scalar(
+                sa.select(m.AuditEvent).where(m.AuditEvent.verb == "grant_minted")
+            )
+            assert minted.payload["transport"] == "stdio"
+
+    asyncio.run(check())
 
 
 #: How to get at the spawn command in each shipped configuration.

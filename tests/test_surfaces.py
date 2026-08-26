@@ -7,6 +7,7 @@ is here, and none of it changes a mailbox.
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import datetime as dt
 import hashlib
@@ -35,6 +36,19 @@ from tests.corpus import CORPUS
 from tests.targets.fake import FakeBackend
 
 TOKEN = "test-token-for-opencode"
+
+
+def scoped(service, work):
+    """One scope's worth of async setup or assertions, on a loop of its own.
+
+    These tests drive the app through TestClient, which brings its own loop — so the
+    tests stay sync and dip into the database the same way the CLI does."""
+
+    async def go():
+        async with service.scope() as scope:
+            return await work(scope)
+
+    return asyncio.run(go())
 
 
 @pytest.fixture
@@ -67,15 +81,15 @@ def service(tmp_path, backend):
         backend_factory=lambda _config: backend,
     )
 
-    with service.scope() as scope:
+    async def _seed(scope):
         account = scope.add(
             m.Account(name="test", host="h", username="u", password_url="env://X")
         )
-        scope.flush()
+        await scope.flush()
         for cap in ("CONDSTORE", "MOVE", "UIDPLUS", "SPECIAL-USE", "IDLE"):
             scope.add(m.AccountCapability(account_id=account.id, name=cap))
         producer = scope.add(m.Producer(kind=m.ProducerKind.agent, name="opencode"))
-        scope.flush()
+        await scope.flush()
         grant = scope.add(
             m.Grant(
                 producer_id=producer.id,
@@ -83,12 +97,14 @@ def service(tmp_path, backend):
                 capabilities=["observe", "suggest", "assess"],
             )
         )
-        scope.flush()
+        await scope.flush()
         scope.add(m.GrantAccount(grant_id=grant.id, account_id=account.id))
-        probe_account(scope, account, backend)
-        for container in sync.discover_containers(scope, account, backend):
-            sync.sync_container(scope, account, container, backend)
-        scope.commit()
+        await probe_account(scope, account, backend)
+        for container in await sync.discover_containers(scope, account, backend):
+            await sync.sync_container(scope, account, container, backend)
+        await scope.commit()
+
+    scoped(service, _seed)
     return service
 
 
@@ -362,9 +378,11 @@ def test_without_a_token_there_is_no_view_at_all(client):
 
 
 def test_an_agent_sees_only_the_accounts_its_grant_covers(client, service):
-    with service.scope() as scope:
+    async def _work(scope):
         scope.add(m.Account(name="other", host="h", username="u2", password_url="env://Y"))
-        scope.commit()
+        await scope.commit()
+
+    scoped(service, _work)
     accounts = Agent(client).call("list_accounts")
     assert [a["name"] for a in accounts] == ["test"]
 
@@ -397,17 +415,23 @@ def other_account(service):
     elsewhere.add_folder("Archive", special_use="archive")
     elsewhere.add_message("INBOX", OTHER_MAIL)
 
-    with service.scope() as scope:
+    async def _work(scope):
         account = scope.add(
             m.Account(name="other", host="h", username="u2", password_url="env://Y")
         )
-        scope.flush()
-        containers = {c.name: c for c in sync.discover_containers(scope, account, elsewhere)}
+        await scope.flush()
+        containers = {
+            c.name: c for c in await sync.discover_containers(scope, account, elsewhere)
+        }
         for container in containers.values():
-            sync.sync_container(scope, account, container, elsewhere)
-        message = scope.scalar(sa.select(m.Message).where(m.Message.account_id == account.id))
-        producer = scope.scalar(sa.select(m.Producer).where(m.Producer.name == "opencode"))
-        bundle = suggest.propose_bundle(
+            await sync.sync_container(scope, account, container, elsewhere)
+        message = await scope.scalar(
+            sa.select(m.Message).where(m.Message.account_id == account.id)
+        )
+        producer = await scope.scalar(
+            sa.select(m.Producer).where(m.Producer.name == "opencode")
+        )
+        bundle = await suggest.propose_bundle(
             scope,
             producer=producer,
             account=account,
@@ -417,17 +441,22 @@ def other_account(service):
             reason="Should be unreachable from a grant that does not cover this account",
             target_container_id=containers["Archive"].id,
         )
-        scope.commit()
+        await scope.commit()
+        suggestion_id = await scope.scalar(
+            sa.select(m.Suggestion.id).where(m.Suggestion.bundle_id == bundle.id)
+        )
         return {
             "account_id": account.id,
-            "test_account_id": scope.scalar(
+            "test_account_id": await scope.scalar(
                 sa.select(m.Account.id).where(m.Account.name == "test")
             ),
             "container_id": containers["INBOX"].id,
             "message_id": message.id,
             "bundle_id": bundle.id,
-            "suggestion_id": bundle.suggestions[0].id,
+            "suggestion_id": suggestion_id,
         }
+
+    return scoped(service, _work)
 
 
 def test_a_grant_expiry_is_honoured_rather_than_taking_the_endpoint_down(client, service):
@@ -441,10 +470,12 @@ def test_a_grant_expiry_is_honoured_rather_than_taking_the_endpoint_down(client,
     assert Agent(client).call("list_accounts"), "a grant with no expiry was refused"
 
     def set_expiry(delta: dt.timedelta) -> None:
-        with service.scope() as scope:
-            grant = scope.scalar(sa.select(m.Grant))
+        async def _work(scope):
+            grant = await scope.scalar(sa.select(m.Grant))
             grant.expires_at = dt.datetime.now(dt.UTC) + delta
-            scope.commit()
+            await scope.commit()
+
+        scoped(service, _work)
 
     set_expiry(dt.timedelta(hours=1))
     assert Agent(client).call("list_accounts"), "a grant that had not expired was refused"
@@ -670,18 +701,21 @@ def test_an_agent_told_a_query_was_narrowed_is_told_by_how_much(client, service,
     One of the two matches is already in Archive, so it is left out rather than refusing
     the bundle, and the answer says so instead of quietly returning one of two.
     """
-    with service.scope() as scope:
-        account = scope.scalar(sa.select(m.Account))
-        containers = {c.name: c for c in scope.scalars(sa.select(m.Container))}
-        uid = scope.scalar(
+
+    async def _work(scope):
+        account = await scope.scalar(sa.select(m.Account))
+        containers = {c.name: c for c in await scope.all(sa.select(m.Container))}
+        uid = await scope.scalar(
             sa.select(m.Placement.uid)
             .join(m.Message, m.Placement.message_id == m.Message.id)
             .where(m.Message.subject == "Lunch on Thursday")
         )
         backend.out_of_band_move("INBOX", uid, "Archive")
-        sync.sync_container(scope, account, containers["INBOX"], backend)
-        sync.sync_container(scope, account, containers["Archive"], backend)
-        scope.commit()
+        await sync.sync_container(scope, account, containers["INBOX"], backend)
+        await sync.sync_container(scope, account, containers["Archive"], backend)
+        await scope.commit()
+
+    scoped(service, _work)
 
     agent = Agent(client)
     account_id = agent.call("list_accounts")[0]["id"]
@@ -714,12 +748,15 @@ def test_an_agent_growing_a_bundle_is_told_it_is_still_only_a_proposal(client):
 def test_an_agent_cannot_add_to_a_bundle_another_producer_made(client, service):
     agent = Agent(client)
     proposed = _propose(agent)
-    with service.scope() as scope:
-        bundle = scope.get(m.Bundle, proposed["bundle_id"])
+
+    async def _work(scope):
+        bundle = await scope.get(m.Bundle, proposed["bundle_id"])
         somebody_else = scope.add(m.Producer(kind=m.ProducerKind.agent, name="somebody-else"))
-        scope.flush()
+        await scope.flush()
         bundle.producer_id = somebody_else.id
-        scope.commit()
+        await scope.commit()
+
+    scoped(service, _work)
 
     with pytest.raises(ToolRefused, match="only be added to by the producer"):
         agent.call("add_to_bundle", bundle_id=proposed["bundle_id"], query="Lunch")
@@ -825,10 +862,13 @@ def test_an_agent_can_propose_discarding_an_empty_folder_and_nothing_happens(
     client, service, backend
 ):
     backend.add_folder("Old")
-    with service.scope() as scope:
-        account_row = scope.scalar(sa.select(m.Account))
-        sync.discover_containers(scope, account_row, backend)
-        scope.commit()
+
+    async def _work(scope):
+        account_row = await scope.scalar(sa.select(m.Account))
+        await sync.discover_containers(scope, account_row, backend)
+        await scope.commit()
+
+    scoped(service, _work)
 
     agent = Agent(client)
     account = agent.call("list_accounts")[0]
@@ -977,9 +1017,12 @@ def test_the_review_page_says_a_folder_would_be_made_before_anything_moves(clien
 
 def test_a_discard_is_reviewed_and_accepted_like_anything_else(client, service, backend):
     backend.add_folder("Old")
-    with service.scope() as scope:
-        sync.discover_containers(scope, scope.scalar(sa.select(m.Account)), backend)
-        scope.commit()
+
+    async def _work(scope):
+        await sync.discover_containers(scope, await scope.scalar(sa.select(m.Account)), backend)
+        await scope.commit()
+
+    scoped(service, _work)
 
     agent = Agent(client)
     account = agent.call("list_accounts")[0]
@@ -1051,11 +1094,14 @@ def test_the_ui_refuses_to_accept_around_something_that_moved(client, backend, s
     # The person filed it themselves, in their own mail client.
     uid = next(iter(backend.folders["INBOX"].messages))
     backend.out_of_band_move("INBOX", uid, "Archive")
-    with service.scope() as scope:
-        account = scope.scalar(sa.select(m.Account).where(m.Account.name == "test"))
-        inbox = scope.scalar(sa.select(m.Container).where(m.Container.name == "INBOX"))
-        sync.sync_container(scope, account, inbox, backend)
-        scope.commit()
+
+    async def _work(scope):
+        account = await scope.scalar(sa.select(m.Account).where(m.Account.name == "test"))
+        inbox = await scope.scalar(sa.select(m.Container).where(m.Container.name == "INBOX"))
+        await sync.sync_container(scope, account, inbox, backend)
+        await scope.commit()
+
+    scoped(service, _work)
 
     page = client.get(f"/bundle/{proposed['bundle_id']}").text
     if "moved since this was proposed" in page:
@@ -1076,23 +1122,30 @@ def test_a_bundle_whose_every_message_moved_leaves_the_queue_by_itself(
     agent = Agent(client)
     proposed = _propose(agent)
 
-    with service.scope() as scope:
-        bundle = scope.get(m.Bundle, proposed["bundle_id"])
-        uids = [s.premise_uid for s in bundle.suggestions]
+    async def _uids(scope):
+        bundle = await scope.get(m.Bundle, proposed["bundle_id"])
+        return [s.premise_uid for s in bundle.suggestions]
+
+    uids = scoped(service, _uids)
     for uid in uids:
         backend.out_of_band_move("INBOX", uid, "Trash")
-    with service.scope() as scope:
-        account = scope.scalar(sa.select(m.Account).where(m.Account.name == "test"))
-        inbox = scope.scalar(sa.select(m.Container).where(m.Container.name == "INBOX"))
-        sync.sync_container(scope, account, inbox, backend)
-        scope.commit()
+
+    async def _sync(scope):
+        account = await scope.scalar(sa.select(m.Account).where(m.Account.name == "test"))
+        inbox = await scope.scalar(sa.select(m.Container).where(m.Container.name == "INBOX"))
+        await sync.sync_container(scope, account, inbox, backend)
+        await scope.commit()
+
+    scoped(service, _sync)
 
     page = client.get(f"/bundle/{proposed['bundle_id']}").text
     assert "closed itself" in page
     assert "Accept — do this to the mailbox" not in page, "a dead bundle offers no buttons"
 
-    with service.scope() as scope:
-        assert scope.get(m.Bundle, proposed["bundle_id"]).status is m.BundleStatus.stale
+    async def _status(scope):
+        return (await scope.get(m.Bundle, proposed["bundle_id"])).status
+
+    assert scoped(service, _status) is m.BundleStatus.stale
 
     # Gone from what is waiting, and nothing was done to the mailbox on the way out.
     queue = client.get("/").text
@@ -1178,26 +1231,33 @@ def test_a_chosen_account_that_goes_away_takes_the_choice_and_not_the_producer(s
     producer is what "who accepted this" points at. Removing accounts is not a feature
     yet — this asserts the clause is there so that it can be.
     """
-    with service.scope() as scope:
+
+    async def _seed(scope):
         spare = scope.add(
             m.Account(name="spare", host="h", username="u3", password_url="env://Z")
         )
         person = scope.add(m.Producer(kind=m.ProducerKind.person, name="reviewer"))
-        scope.flush()
+        await scope.flush()
         person.current_account_id = spare.id
-        scope.commit()
-        spare_id, person_id = spare.id, person.id
+        await scope.commit()
+        return spare.id, person.id
 
-    with service.scope() as scope:
-        scope.execute(sa.delete(m.Account).where(m.Account.id == spare_id))
-        scope.commit()
+    spare_id, person_id = scoped(service, _seed)
 
-    with service.scope() as scope:
-        person = scope.get(m.Producer, person_id)
+    async def _remove(scope):
+        await scope.execute(sa.delete(m.Account).where(m.Account.id == spare_id))
+        await scope.commit()
+
+    scoped(service, _remove)
+
+    async def _check(scope):
+        person = await scope.get(m.Producer, person_id)
         assert person is not None, "the producer went with the account"
         assert person.current_account_id is None
         # And the fallback puts the reviewer back in a real account.
-        assert app_module.chosen_account(scope).name == "test"
+        assert (await app_module.chosen_account(scope)).name == "test"
+
+    scoped(service, _check)
 
 
 def test_an_unauthenticated_review_ui_refuses_to_listen_to_the_network(service, backend):
@@ -1247,7 +1307,9 @@ def test_an_account_that_exists_only_in_the_database_can_still_connect(service, 
     same time — and the file cannot be the source of truth for something a web form
     writes.
     """
-    with service.scope() as scope:
+    from mailmind.service import account_config
+
+    async def _work(scope):
         row = scope.add(
             m.Account(
                 name="never-configured",
@@ -1258,14 +1320,13 @@ def test_an_account_that_exists_only_in_the_database_can_still_connect(service, 
                 password_url="env://NEVER_CONFIGURED",
             )
         )
-        scope.commit()
+        await scope.commit()
         assert row.name not in {a.name for a in service.config.accounts}
-        with service.backend(row) as opened:
-            assert opened is backend
+        async with service.backend(row) as opened_backend:
+            assert opened_backend is backend
+        return account_config(row)
 
-    from mailmind.service import account_config
-
-    derived = account_config(row)
+    derived = scoped(service, _work)
     assert (derived.host, derived.port, derived.use_ssl) == ("imap.invalid", 1143, False)
     assert derived.login.username == "someone@example.org"
     assert derived.login.password == "env://NEVER_CONFIGURED"
@@ -1335,30 +1396,35 @@ def test_a_sync_that_dies_partway_keeps_the_folders_it_finished(tmp_path):
     backend.add_message("Archive", CORPUS["ordinary"])
 
     service = Service(Config(database_url=url), backend_factory=lambda _config: backend)
-    with service.scope() as scope:
+
+    async def _seed(scope):
         account = scope.add(
             m.Account(name="real", host="h", username="u", password_url="env://X")
         )
-        scope.commit()
-        account_id = account.id
+        await scope.commit()
+        return account.id
+
+    account_id = scoped(service, _seed)
 
     with opened(create_app(service, session_key=SESSION_KEY)) as client:
         died = as_a_person(client, f"/accounts/{account_id}/sync")
     # The person pressed a button, so what comes back is a page, not a stack trace.
     assert died.status_code < 400
 
-    with service.scope() as scope:
-        account = scope.get(m.Account, account_id)
+    async def _check(scope):
+        account = await scope.get(m.Account, account_id)
         assert account.health is m.AccountHealth.down, "the mailbox failed and nothing said so"
         assert "the connection went away" in account.health_detail
-        cached = {
+        return {
             c.name: n
-            for c, n in scope.execute(
+            for c, n in await scope.execute(
                 sa.select(m.Container, sa.func.count(m.Placement.id))
                 .outerjoin(m.Placement, m.Placement.container_id == m.Container.id)
                 .group_by(m.Container.id)
             )
         }
+
+    cached = scoped(service, _check)
     assert cached["INBOX"] == len(CORPUS), "the folders that finished were thrown away"
     assert cached["Archive"] == 1
     assert cached["Zzz"] == 0
@@ -1380,7 +1446,8 @@ def test_a_mailbox_that_cannot_be_reached_says_so_on_the_page(tmp_path):
         )
 
     service = Service(Config(database_url=url), backend_factory=unreachable)
-    with service.scope() as scope:
+
+    async def _seed(scope):
         account = scope.add(
             m.Account(
                 name="real",
@@ -1389,16 +1456,20 @@ def test_a_mailbox_that_cannot_be_reached_says_so_on_the_page(tmp_path):
                 password_url="env://X",
             )
         )
-        scope.commit()
-        account_id = account.id
+        await scope.commit()
+        return account.id
+
+    account_id = scoped(service, _seed)
 
     with opened(create_app(service, session_key=SESSION_KEY)) as client:
         pressed = as_a_person(client, f"/accounts/{account_id}/sync", follow_redirects=True)
         assert pressed.status_code == 200, "a mailbox being down is not a bug in the request"
         assert "Hostname mismatch" in pressed.text, "the page does not say what went wrong"
 
-    with service.scope() as scope:
-        account = scope.get(m.Account, account_id)
+    async def _account(scope):
+        return await scope.get(m.Account, account_id)
+
+    account = scoped(service, _account)
     assert account.health is m.AccountHealth.down
     assert "cannot reach imap.example.org:993" in account.health_detail
 
@@ -1571,10 +1642,12 @@ def test_a_refused_change_leaves_a_mark(client, service):
     proposed = _propose(Agent(client))
     assert client.post(f"/bundle/{proposed['bundle_id']}/accept").status_code == 403
 
-    with service.scope() as scope:
-        event = scope.scalar(
+    async def _work(scope):
+        return await scope.scalar(
             sa.select(m.AuditEvent).where(m.AuditEvent.verb == "ui_change_refused")
         )
+
+    event = scoped(service, _work)
     assert event is not None, "a refused change should be findable afterwards"
     assert event.payload["path"].endswith("/accept")
     assert "origin" in event.payload["problem"]
@@ -1959,8 +2032,11 @@ def test_refreshing_does_not_multiply_what_a_person_agreed_to(client, service):
     stop being answerable.
     """
     issued = log_in(client)
-    with service.scope() as scope:
-        before = len(scope.scalars(sa.select(m.Grant)).all())
+
+    async def _count(scope):
+        return len(await scope.all(sa.select(m.Grant)))
+
+    before = scoped(service, _count)
 
     for _ in range(3):
         issued = {
@@ -1975,8 +2051,7 @@ def test_refreshing_does_not_multiply_what_a_person_agreed_to(client, service):
             ).json(),
         }
 
-    with service.scope() as scope:
-        assert len(scope.scalars(sa.select(m.Grant)).all()) == before
+    assert scoped(service, _count) == before
 
 
 def test_revoking_on_the_agents_page_stops_a_token_that_was_working(client, service):
@@ -1987,9 +2062,11 @@ def test_revoking_on_the_agents_page_stops_a_token_that_was_working(client, serv
     listed = client.get("/agents")
     assert "OpenCode" in listed.text
 
-    with service.scope() as scope:
-        grant = scope.scalar(sa.select(m.Grant).where(m.Grant.client_id.is_not(None)))
-        grant_id = grant.id
+    async def _work(scope):
+        grant = await scope.scalar(sa.select(m.Grant).where(m.Grant.client_id.is_not(None)))
+        return grant.id
+
+    grant_id = scoped(service, _work)
     as_a_person(client, f"/agents/{grant_id}/revoke")
 
     with pytest.raises((ToolRefused, AssertionError)):
@@ -2007,12 +2084,15 @@ def test_a_token_minted_on_the_command_line_still_works(client):
 
 def test_an_expired_access_token_is_refused(client, service):
     issued = log_in(client)
-    with service.scope() as scope:
-        row = scope.scalar(
+
+    async def _work(scope):
+        row = await scope.scalar(
             sa.select(m.OAuthToken).where(m.OAuthToken.kind == m.OAuthTokenKind.access)
         )
         row.expires_at = dt.datetime.now(dt.UTC) - dt.timedelta(seconds=1)
-        scope.commit()
+        await scope.commit()
+
+    scoped(service, _work)
 
     with pytest.raises((ToolRefused, AssertionError)):
         Agent(client, token=issued["access_token"]).call("list_accounts")
@@ -2023,12 +2103,14 @@ def test_a_stale_consent_request_cannot_be_answered(client, service):
     client_id = register(client)
     request_id = ask(client, client_id, challenge)
 
-    with service.scope() as scope:
-        row = scope.scalar(
+    async def _work(scope):
+        row = await scope.scalar(
             sa.select(m.OAuthAuthorization).where(m.OAuthAuthorization.request_id == request_id)
         )
         row.expires_at = dt.datetime.now(dt.UTC) - dt.timedelta(seconds=1)
-        scope.commit()
+        await scope.commit()
+
+    scoped(service, _work)
 
     assert client.get(f"/consent?request={request_id}").status_code == 404
     assert oauth.REQUEST_TTL > dt.timedelta(0)

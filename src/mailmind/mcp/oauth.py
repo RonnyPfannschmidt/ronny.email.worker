@@ -76,8 +76,8 @@ def _live_token(row: m.OAuthToken | None) -> bool:
 class MailmindAuthorizationServer:
     """Implements the SDK's ``OAuthAuthorizationServerProvider`` against the mailmind tables.
 
-    Every method here runs the database work synchronously.  That matches what the rest of
-    the service does under Starlette, and these are single-row lookups against SQLite.
+    Every method here does its database work on the loop, through the same async scope
+    the rest of the service uses; these are single-row lookups against SQLite.
     """
 
     def __init__(self, service: Service) -> None:
@@ -102,12 +102,14 @@ class MailmindAuthorizationServer:
         )
 
     async def get_client(self, client_id: str) -> OAuthClientInformationFull | None:
-        with self.service.scope() as s:
-            row = s.scalar(sa.select(m.OAuthClient).where(m.OAuthClient.client_id == client_id))
+        async with self.service.scope() as s:
+            row = await s.scalar(
+                sa.select(m.OAuthClient).where(m.OAuthClient.client_id == client_id)
+            )
             return self._client_info(row) if row is not None else None
 
     async def register_client(self, client_info: OAuthClientInformationFull) -> None:
-        with self.service.scope() as s:
+        async with self.service.scope() as s:
             row = m.OAuthClient(
                 client_id=client_info.client_id,
                 client_secret_hash=(
@@ -121,7 +123,7 @@ class MailmindAuthorizationServer:
                 token_endpoint_auth_method=client_info.token_endpoint_auth_method or "none",
             )
             s.add(row)
-            s.audit(
+            await s.audit(
                 "oauth_client_registered",
                 actor_kind="service",
                 subject_kind="oauth_client",
@@ -131,7 +133,7 @@ class MailmindAuthorizationServer:
                     "client_name_claimed": client_info.client_name,
                 },
             )
-            s.commit()
+            await s.commit()
 
     # ------------------------------------------------------------ authorization
 
@@ -144,7 +146,7 @@ class MailmindAuthorizationServer:
         agrees, because until then there is nothing to point at.
         """
         request_id = secrets.token_urlsafe(24)
-        with self.service.scope() as s:
+        async with self.service.scope() as s:
             s.add(
                 m.OAuthAuthorization(
                     request_id=request_id,
@@ -158,14 +160,14 @@ class MailmindAuthorizationServer:
                     expires_at=dt.datetime.now(dt.UTC) + REQUEST_TTL,
                 )
             )
-            s.commit()
+            await s.commit()
         return f"/consent?request={request_id}"
 
     async def load_authorization_code(
         self, client: OAuthClientInformationFull, authorization_code: str
     ) -> AuthorizationCode | None:
-        with self.service.scope() as s:
-            row = s.scalar(
+        async with self.service.scope() as s:
+            row = await s.scalar(
                 sa.select(m.OAuthAuthorization).where(
                     m.OAuthAuthorization.code_hash == hash_token(authorization_code)
                 )
@@ -194,8 +196,8 @@ class MailmindAuthorizationServer:
         The SDK has already checked the expiry, the redirect URI and the PKCE verifier by
         the time this runs; what is left is to make sure it is spent exactly once.
         """
-        with self.service.scope() as s:
-            row = s.scalar(
+        async with self.service.scope() as s:
+            row = await s.scalar(
                 sa.select(m.OAuthAuthorization).where(
                     m.OAuthAuthorization.code_hash == hash_token(authorization_code.code)
                 )
@@ -204,7 +206,7 @@ class MailmindAuthorizationServer:
                 raise TokenError("invalid_grant", "that code has been used or never existed")
             row.used_at = dt.datetime.now(dt.UTC)
             token = self._issue(s, grant_id=row.grant_id, client_id=row.client_id)
-            s.commit()
+            await s.commit()
             return token
 
     # ------------------------------------------------------------------ tokens
@@ -241,8 +243,8 @@ class MailmindAuthorizationServer:
     async def load_refresh_token(
         self, client: OAuthClientInformationFull, refresh_token: str
     ) -> RefreshToken | None:
-        with self.service.scope() as s:
-            row = s.scalar(
+        async with self.service.scope() as s:
+            row = await s.scalar(
                 sa.select(m.OAuthToken).where(
                     m.OAuthToken.token_hash == hash_token(refresh_token),
                     m.OAuthToken.kind == m.OAuthTokenKind.refresh,
@@ -270,8 +272,8 @@ class MailmindAuthorizationServer:
         client uses its own, rather than quietly working alongside it.  The grant is not
         touched: what a person consented to is not re-decided every hour.
         """
-        with self.service.scope() as s:
-            row = s.scalar(
+        async with self.service.scope() as s:
+            row = await s.scalar(
                 sa.select(m.OAuthToken).where(
                     m.OAuthToken.token_hash == hash_token(refresh_token.token),
                     m.OAuthToken.kind == m.OAuthTokenKind.refresh,
@@ -279,12 +281,12 @@ class MailmindAuthorizationServer:
             )
             if not _live_token(row):
                 raise TokenError("invalid_grant", "that refresh token is spent")
-            grant = s.get(m.Grant, row.grant_id)
+            grant = await s.get(m.Grant, row.grant_id)
             if grant is None or grant.revoked_at is not None:
                 raise TokenError("invalid_grant", "the grant behind that token is gone")
             row.revoked_at = dt.datetime.now(dt.UTC)
             token = self._issue(s, grant_id=row.grant_id, client_id=row.client_id)
-            s.commit()
+            await s.commit()
             return token
 
     async def load_access_token(self, token: str) -> AccessToken | None:
@@ -298,15 +300,15 @@ class MailmindAuthorizationServer:
         from mailmind.mcp import server as mcp_server
 
         hashed = hash_token(token)
-        with self.service.scope() as s:
-            row = s.scalar(
+        async with self.service.scope() as s:
+            row = await s.scalar(
                 sa.select(m.OAuthToken).where(
                     m.OAuthToken.token_hash == hashed,
                     m.OAuthToken.kind == m.OAuthTokenKind.access,
                 )
             )
             if _live_token(row):
-                grant = s.get(m.Grant, row.grant_id)
+                grant = await s.get(m.Grant, row.grant_id)
                 if mcp_server._live(grant):
                     return GrantAccessToken(
                         token=token,
@@ -318,7 +320,7 @@ class MailmindAuthorizationServer:
                 return None
 
             # The other shape: a grant minted on the command line and handed over by hand.
-            grant = s.scalar(sa.select(m.Grant).where(m.Grant.token_hash == hashed))
+            grant = await s.scalar(sa.select(m.Grant).where(m.Grant.token_hash == hashed))
             if mcp_server._live(grant):
                 return GrantAccessToken(
                     token=token,
@@ -335,15 +337,15 @@ class MailmindAuthorizationServer:
         Only the credential.  Taking back what was agreed to is revoking the grant, which
         is a thing a person does on the agents page, not something a client asks for.
         """
-        with self.service.scope() as s:
-            row = s.scalar(
+        async with self.service.scope() as s:
+            row = await s.scalar(
                 sa.select(m.OAuthToken).where(
                     m.OAuthToken.token_hash == hash_token(token.token)
                 )
             )
             if row is not None and row.revoked_at is None:
                 row.revoked_at = dt.datetime.now(dt.UTC)
-                s.commit()
+                await s.commit()
 
 
 def settings_and_provider(service: Service, public_url: str) -> tuple[Any, Any]:
@@ -373,7 +375,7 @@ def settings_and_provider(service: Service, public_url: str) -> tuple[Any, Any]:
     return settings, MailmindAuthorizationServer(service)
 
 
-def consent(
+async def consent(
     s: Any,
     request_row: m.OAuthAuthorization,
     *,
@@ -397,7 +399,7 @@ def consent(
         client_id=request_row.client_id,
     )
     s.add(grant)
-    s.flush()
+    await s.flush()
     for account_id in account_ids:
         s.add(m.GrantAccount(grant_id=grant.id, account_id=account_id))
 
@@ -405,7 +407,7 @@ def consent(
     request_row.grant_id = grant.id
     request_row.code_hash = hash_token(code)
     request_row.code_expires_at = now + CODE_TTL
-    s.audit(
+    await s.audit(
         "grant_consented",
         actor_kind="person",
         subject_kind="grant",

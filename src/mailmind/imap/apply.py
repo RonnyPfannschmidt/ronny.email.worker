@@ -11,10 +11,15 @@ Two of the operations here are about folders rather than mail: a move may have t
 folder it lands in, and a discard removes one that holds nothing.  Both go through review
 like everything else — this module is still reached only from the review flow, and there
 is still no way to it from the agent surface.
+
+The orchestration runs on the event loop; each blocking IMAP call is a dip into a thread
+via :func:`asyncio.to_thread`, and only plain data crosses that line — the ORM rows stay
+on the loop.
 """
 
 from __future__ import annotations
 
+import asyncio
 import datetime as dt
 
 import sqlalchemy as sa
@@ -42,7 +47,7 @@ class NotApplicable(Exception):
     pass
 
 
-def apply_bundle(
+async def apply_bundle(
     scope: TenantScope,
     bundle: m.Bundle,
     backend: MailBackend,
@@ -52,24 +57,26 @@ def apply_bundle(
     if bundle.status is not m.BundleStatus.accepted:
         raise NotApplicable(f"a {bundle.status.value} bundle is not applied")
 
-    account = scope.get(m.Account, bundle.account_id)
+    account = await scope.get(m.Account, bundle.account_id)
     if account.health is not m.AccountHealth.ok:
         raise NotApplicable(
             f"account {account.name} is {account.health.value}; "
             "suggestions are not applied against an account that is not healthy"
         )
 
-    ordered = _in_order(scope, bundle)
+    ordered = _in_order(bundle)
     if ordered:
         # Only once there is something to put in it.  A bundle whose every item died
         # between acceptance and here should leave no trace, and a folder nothing was
         # ever moved into is a trace.
-        _ensure_target_exists(scope, bundle, backend)
+        await _ensure_target_exists(scope, bundle, backend)
 
     attempts = []
     for suggestion in ordered:
         attempts.append(
-            _apply_one(scope, bundle, suggestion, backend, trash_container=trash_container)
+            await _apply_one(
+                scope, bundle, suggestion, backend, trash_container=trash_container
+            )
         )
 
     if not attempts:
@@ -86,7 +93,7 @@ def apply_bundle(
     bundle.status = (
         m.BundleStatus.applied if applied == len(attempts) else m.BundleStatus.partially_applied
     )
-    scope.audit(
+    await scope.audit(
         "bundle_applied",
         actor_kind="service",
         subject_kind="bundle",
@@ -96,7 +103,7 @@ def apply_bundle(
     return attempts
 
 
-def _in_order(scope: TenantScope, bundle: m.Bundle) -> list[m.Suggestion]:
+def _in_order(bundle: m.Bundle) -> list[m.Suggestion]:
     """The accepted items, in the order they have to happen.
 
     For everything but a discard the order is immaterial and this is the list as it
@@ -114,7 +121,7 @@ def _in_order(scope: TenantScope, bundle: m.Bundle) -> list[m.Suggestion]:
         return accepted
 
     def depth(suggestion: m.Suggestion) -> tuple[int, str]:
-        container = scope.get(m.Container, suggestion.source_container_id)
+        container = suggestion.source_container
         delimiter = container.delimiter
         levels = container.name.count(delimiter) if delimiter else 0
         return (-levels, container.name)
@@ -122,7 +129,9 @@ def _in_order(scope: TenantScope, bundle: m.Bundle) -> list[m.Suggestion]:
     return sorted(accepted, key=depth)
 
 
-def _ensure_target_exists(scope: TenantScope, bundle: m.Bundle, backend: MailBackend) -> None:
+async def _ensure_target_exists(
+    scope: TenantScope, bundle: m.Bundle, backend: MailBackend
+) -> None:
     """Make the folder the bundle is about to move mail into, if it is not there yet.
 
     This is the moment the person's acceptance turns into a folder.  Nothing before it
@@ -139,7 +148,7 @@ def _ensure_target_exists(scope: TenantScope, bundle: m.Bundle, backend: MailBac
         return
 
     try:
-        info = backend.create_container(target.name)
+        info = await asyncio.to_thread(backend.create_container, target.name)
     except MailboxUnhealthy as exc:
         raise NotApplicable(
             f"the folder {target.name} could not be created: {exc}. Nothing was done to "
@@ -154,7 +163,7 @@ def _ensure_target_exists(scope: TenantScope, bundle: m.Bundle, backend: MailBac
     target.selectable = info.selectable
     target.exists_on_server = True
     target.discarded_at = None
-    scope.audit(
+    await scope.audit(
         "container_created",
         actor_kind="service",
         subject_kind="container",
@@ -163,7 +172,7 @@ def _ensure_target_exists(scope: TenantScope, bundle: m.Bundle, backend: MailBac
     )
 
 
-def _apply_one(
+async def _apply_one(
     scope: TenantScope,
     bundle: m.Bundle,
     suggestion: m.Suggestion,
@@ -175,11 +184,11 @@ def _apply_one(
 
     # The second check.  A person has already said yes, which is exactly why this one
     # matters more than the first.
-    verdict = staleness.check(scope, suggestion)
+    verdict = await staleness.check(scope, suggestion)
     if not verdict.fresh:
         suggestion.status = m.SuggestionStatus.stale
         suggestion.stale_detail = verdict.detail
-        return _record(
+        return await _record(
             scope,
             suggestion,
             precondition,
@@ -188,18 +197,20 @@ def _apply_one(
             verdict.detail,
         )
 
-    source = scope.get(m.Container, suggestion.source_container_id)
+    source = await scope.get(m.Container, suggestion.source_container_id)
 
     if suggestion.message_id is not None and suggestion.premise_modseq is None:
         # Without CONDSTORE the premise is only a flag fingerprint, and the cache it was
         # checked against may be older than the mailbox.  Looking at the server directly
         # narrows the window; it does not close it, which is why the guarantee reported
         # below is still best effort.
-        observed = backend.fetch_envelopes(source.name, [suggestion.premise_uid])
+        observed = await asyncio.to_thread(
+            backend.fetch_envelopes, source.name, [suggestion.premise_uid]
+        )
         if not observed:
             suggestion.status = m.SuggestionStatus.stale
             suggestion.stale_detail = f"the message has left {source.name}"
-            return _record(
+            return await _record(
                 scope,
                 suggestion,
                 precondition,
@@ -213,7 +224,7 @@ def _apply_one(
                 f"the message's flags changed on the server (now: "
                 f"{' '.join(sorted(observed[0].flags)) or 'none'})"
             )
-            return _record(
+            return await _record(
                 scope,
                 suggestion,
                 precondition,
@@ -222,11 +233,25 @@ def _apply_one(
                 suggestion.stale_detail,
             )
 
+    # Plain values only from here down: `_perform` runs in a thread, and ORM rows do not.
+    target = bundle.target_container
     try:
-        result = _perform(bundle, suggestion, backend, source, trash_container)
+        result = await asyncio.to_thread(
+            _perform,
+            backend,
+            bundle.operation,
+            source_name=source.name,
+            source_exists_on_server=source.exists_on_server,
+            source_delimiter=source.delimiter,
+            premise_uid=suggestion.premise_uid,
+            premise_modseq=suggestion.premise_modseq,
+            flag=bundle.flag,
+            target_name=target.name if target is not None else None,
+            trash_name=trash_container.name if trash_container is not None else None,
+        )
     except MailboxUnhealthy as exc:
         suggestion.status = m.SuggestionStatus.failed
-        return _record(
+        return await _record(
             scope, suggestion, precondition, precondition, m.ApplyOutcome.failed, str(exc)
         )
 
@@ -235,7 +260,7 @@ def _apply_one(
         # Refused because the message moved under us between the check and the command.
         suggestion.status = m.SuggestionStatus.stale
         suggestion.stale_detail = result.detail or "the server declined; the message changed"
-        return _record(
+        return await _record(
             scope,
             suggestion,
             precondition,
@@ -245,8 +270,8 @@ def _apply_one(
         )
 
     suggestion.status = m.SuggestionStatus.applied
-    _update_cache(scope, bundle, suggestion, result.resulting_uid)
-    return _record(
+    await _update_cache(scope, bundle, suggestion, result.resulting_uid)
+    return await _record(
         scope,
         suggestion,
         precondition,
@@ -257,65 +282,91 @@ def _apply_one(
     )
 
 
-def _perform(bundle, suggestion, backend, source, trash_container):  # noqa: ANN001
-    if bundle.operation in (m.Operation.add_flag, m.Operation.remove_flag):
+def _perform(
+    backend: MailBackend,
+    operation: m.Operation,
+    *,
+    source_name: str,
+    source_exists_on_server: bool,
+    source_delimiter: str | None,
+    premise_uid: int | None,
+    premise_modseq: int | None,
+    flag: str | None,
+    target_name: str | None,
+    trash_name: str | None,
+) -> StoreResult:
+    """One operation against the server, as a single dip.
+
+    Deliberately sync, and called through :func:`asyncio.to_thread`: everything here is
+    backend calls and plain data, so the whole exchange — for a discard, the
+    select-then-list-then-delete sequence — happens off the loop in one go.
+    """
+    if operation in (m.Operation.add_flag, m.Operation.remove_flag):
         return backend.store_flags(
-            source.name,
-            suggestion.premise_uid,
-            (bundle.flag,),
-            add=bundle.operation is m.Operation.add_flag,
-            unchanged_since=suggestion.premise_modseq,
+            source_name,
+            premise_uid,
+            (flag,),
+            add=operation is m.Operation.add_flag,
+            unchanged_since=premise_modseq,
         )
-    if bundle.operation is m.Operation.move:
-        target = bundle.target_container
+    if operation is m.Operation.move:
         return backend.move(
-            source.name,
-            suggestion.premise_uid,
-            target.name,
-            expected_modseq=suggestion.premise_modseq,
+            source_name,
+            premise_uid,
+            target_name,
+            expected_modseq=premise_modseq,
         )
-    if bundle.operation is m.Operation.discard_container:
-        return _discard(backend, source)
-    if bundle.operation is m.Operation.delete:
+    if operation is m.Operation.discard_container:
+        return _discard(
+            backend,
+            source_name,
+            exists_on_server=source_exists_on_server,
+            delimiter=source_delimiter,
+        )
+    if operation is m.Operation.delete:
         # Deleting is moving to Trash, and nothing more: no \Deleted, no expunge.  01
         # says mail has no undo, and this is the one place that could prove it.
-        if trash_container is None:
+        if trash_name is None:
             raise MailboxUnhealthy("no Trash container is known for this account")
         moved = backend.move(
-            source.name,
-            suggestion.premise_uid,
-            trash_container.name,
-            expected_modseq=suggestion.premise_modseq,
+            source_name,
+            premise_uid,
+            trash_name,
+            expected_modseq=premise_modseq,
         )
         return moved
-    raise NotApplicable(f"unsupported operation {bundle.operation}")
+    raise NotApplicable(f"unsupported operation {operation}")
 
 
-def _discard(backend: MailBackend, container: m.Container) -> StoreResult:
+def _discard(
+    backend: MailBackend,
+    name: str,
+    *,
+    exists_on_server: bool,
+    delimiter: str | None,
+) -> StoreResult:
     """Remove a folder, having just made sure there is nothing in it.
 
     This is the second check for a discard, and it goes to the server.  The first one
     asked the cache, which can be older than the mailbox — and the gap between them is
     exactly where a forgotten filter drops mail into a folder that looked abandoned.
     """
-    if not container.exists_on_server:
+    if not exists_on_server:
         # Proposed and never made: the bundle that would have created it was never
         # accepted, or this is the same bundle undoing its own idea.  Nothing to ask the
         # server for, and the folder is gone in the only sense it ever existed.
         return StoreResult(True, "best_effort", "the folder had never been made")
 
     try:
-        selected = backend.select(container.name, readonly=True)
+        selected = backend.select(name, readonly=True)
     except IdentityLost:
-        return StoreResult(
-            False, "best_effort", f"{container.name} is already gone from the server"
-        )
+        return StoreResult(False, "best_effort", f"{name} is already gone from the server")
 
     if selected.message_count:
         return StoreResult(
             False,
             "best_effort",
-            f"{container.name} now holds {selected.message_count} messages, so it is no "
+            f"{name} now holds {selected.message_count} messages, so it is no "
             "longer a folder whose removal cannot lose mail",
         )
 
@@ -324,23 +375,23 @@ def _discard(backend: MailBackend, container: m.Container) -> StoreResult:
     children = sorted(
         info.name
         for info in backend.list_containers()
-        if container.delimiter and info.name.startswith(container.name + container.delimiter)
+        if delimiter and info.name.startswith(name + delimiter)
     )
     if children:
         return StoreResult(
             False,
             "best_effort",
-            f"{container.name} still has folders under it: {', '.join(children)}",
+            f"{name} still has folders under it: {', '.join(children)}",
         )
 
-    backend.delete_container(container.name)
+    backend.delete_container(name)
     return StoreResult(True, "best_effort")
 
 
-def _update_cache(scope: TenantScope, bundle, suggestion, resulting_uid) -> None:  # noqa: ANN001
+async def _update_cache(scope: TenantScope, bundle, suggestion, resulting_uid) -> None:  # noqa: ANN001
     """Reflect what we just did, so the next staleness check does not see our own change."""
     if bundle.operation is m.Operation.discard_container:
-        container = scope.get(m.Container, suggestion.source_container_id)
+        container = await scope.get(m.Container, suggestion.source_container_id)
         # Marked, not deleted: this suggestion still points at the row, and so may older
         # placements.  A reviewer reading what happened deserves a folder with a date on
         # it rather than a dangling id.
@@ -349,7 +400,7 @@ def _update_cache(scope: TenantScope, bundle, suggestion, resulting_uid) -> None
         container.message_count = 0
         return
 
-    placement = scope.scalar(
+    placement = await scope.scalar(
         sa.select(m.Placement).where(
             m.Placement.container_id == suggestion.source_container_id,
             m.Placement.container_generation == suggestion.premise_container_generation,
@@ -366,7 +417,7 @@ def _update_cache(scope: TenantScope, bundle, suggestion, resulting_uid) -> None
         placement.flags = " ".join(sorted(set(placement.flags.split()) - {bundle.flag}))
 
 
-def _record(
+async def _record(
     scope: TenantScope,
     suggestion: m.Suggestion,
     precondition: m.Precondition,
@@ -385,7 +436,7 @@ def _record(
         resulting_uid=resulting_uid,
     )
     scope.add(attempt)
-    scope.audit(
+    await scope.audit(
         "apply_attempted",
         actor_kind="service",
         subject_kind="suggestion",

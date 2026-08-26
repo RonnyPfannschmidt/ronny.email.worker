@@ -9,6 +9,8 @@ review UI forever.
 
 from __future__ import annotations
 
+import asyncio
+
 import sqlalchemy as sa
 from click.testing import CliRunner
 
@@ -48,25 +50,42 @@ def seeded(tmp_path):  # noqa: ANN201
             ),
         )
     )
-    with service.scope(TENANT_ZERO) as scope:
+
+    async def seed(scope):  # noqa: ANN001, ANN202
+        leftover_id = None
         for name, host in (("wanted", "imap.example.net"), ("leftover", "imap.example.org")):
             account = scope.add(
                 m.Account(name=name, host=host, username="u", password_url="env://X")
             )
-            scope.flush()
+            await scope.flush()
             scope.add(m.AccountCapability(account_id=account.id, name="MOVE"))
             if name == "leftover":
                 leftover_id = account.id
         scope.add(m.Producer(kind=m.ProducerKind.person, name="reviewer"))
-        scope.flush()
-        scope.scalar(sa.select(m.Producer)).current_account_id = leftover_id
-        scope.commit()
+        await scope.flush()
+        (await scope.scalar(sa.select(m.Producer))).current_account_id = leftover_id
+        await scope.commit()
+
+    scoped(service, seed)
     service.close()
     return config, f"sqlite:///{db}"
 
 
 def run(config, *args):  # noqa: ANN201
     return CliRunner().invoke(main, ["--config", str(config), *args])
+
+
+def scoped(service, work):  # noqa: ANN001, ANN201
+    """Run one scope's worth of async setup or assertions on a loop of its own.
+
+    These tests drive the CLI with CliRunner, and the CLI owns its own ``asyncio.run`` —
+    so the tests stay sync and dip into the database the same way."""
+
+    async def go():  # noqa: ANN202
+        async with service.scope(TENANT_ZERO) as scope:
+            return await work(scope)
+
+    return asyncio.run(go())
 
 
 def test_list_says_which_account_the_configuration_no_longer_asks_for(tmp_path):
@@ -85,17 +104,22 @@ def test_forgetting_an_account_takes_the_preference_with_it(tmp_path):
     assert forgotten.exit_code == 0, forgotten.output
 
     service = Service(Config(database_url=url))
-    with service.scope(TENANT_ZERO) as scope:
-        assert [a.name for a in scope.scalars(sa.select(m.Account))] == ["wanted"]
+
+    async def check(scope):  # noqa: ANN001, ANN202
+        assert [a.name for a in await scope.all(sa.select(m.Account))] == ["wanted"]
         # The producer stays — it is what "who accepted this" points at — and loses only
         # the preference.
-        producer = scope.scalar(sa.select(m.Producer))
+        producer = await scope.scalar(sa.select(m.Producer))
         assert producer is not None and producer.current_account_id is None
-        assert scope.scalar(sa.select(sa.func.count()).select_from(m.AccountCapability)) == 1
-        forgetting = scope.scalar(
+        assert (
+            await scope.scalar(sa.select(sa.func.count()).select_from(m.AccountCapability))
+        ) == 1
+        forgetting = await scope.scalar(
             sa.select(m.AuditEvent).where(m.AuditEvent.verb == "account_forgotten")
         )
         assert forgetting is not None and forgetting.payload["name"] == "leftover"
+
+    scoped(service, check)
     service.close()
 
 
@@ -109,10 +133,13 @@ def test_an_account_the_configuration_still_names_would_only_come_back(tmp_path)
 def test_an_account_holding_cached_mail_is_not_forgotten_in_passing(tmp_path):
     config, url = seeded(tmp_path)
     service = Service(Config(database_url=url))
-    with service.scope(TENANT_ZERO) as scope:
-        account = scope.scalar(sa.select(m.Account).where(m.Account.name == "leftover"))
+
+    async def add_folder(scope):  # noqa: ANN001, ANN202
+        account = await scope.scalar(sa.select(m.Account).where(m.Account.name == "leftover"))
         scope.add(m.Container(account_id=account.id, name="INBOX", generation=1))
-        scope.commit()
+        await scope.commit()
+
+    scoped(service, add_folder)
     service.close()
 
     refused = run(config, "account", "forget", "leftover")
@@ -139,10 +166,13 @@ def test_a_row_that_disagrees_with_the_configuration_is_reported_not_overwritten
     host its configuration had stopped naming, and nothing anywhere said so."""
     config, url = seeded(tmp_path)
     service = Service(Config(database_url=url))
-    with service.scope(TENANT_ZERO) as scope:
-        row = scope.scalar(sa.select(m.Account).where(m.Account.name == "wanted"))
+
+    async def diverge(scope):  # noqa: ANN001, ANN202
+        row = await scope.scalar(sa.select(m.Account).where(m.Account.name == "wanted"))
         row.host = "old.example"
-        scope.commit()
+        await scope.commit()
+
+    scoped(service, diverge)
     service.close()
 
     reported = run(config, "account", "seed")
@@ -151,19 +181,23 @@ def test_a_row_that_disagrees_with_the_configuration_is_reported_not_overwritten
     assert "--update" in reported.output
 
     service = Service(Config(database_url=url))
-    with service.scope(TENANT_ZERO) as scope:
-        assert scope.scalar(sa.select(m.Account).where(m.Account.name == "wanted")).host == (
-            "old.example"
-        ), "reporting is not writing"
+
+    async def unchanged(scope):  # noqa: ANN001, ANN202
+        row = await scope.scalar(sa.select(m.Account).where(m.Account.name == "wanted"))
+        assert row.host == "old.example", "reporting is not writing"
+
+    scoped(service, unchanged)
     service.close()
 
     applied = run(config, "account", "seed", "--update")
     assert applied.exit_code == 0, applied.output
     service = Service(Config(database_url=url))
-    with service.scope(TENANT_ZERO) as scope:
-        assert scope.scalar(
-            sa.select(m.Account).where(m.Account.name == "wanted")
-        ).host == "imap.example.net"
+
+    async def updated(scope):  # noqa: ANN001, ANN202
+        row = await scope.scalar(sa.select(m.Account).where(m.Account.name == "wanted"))
+        assert row.host == "imap.example.net"
+
+    scoped(service, updated)
     service.close()
 
 
@@ -177,15 +211,18 @@ def test_a_capability_the_configuration_dropped_stops_being_declared(tmp_path):
     """
     config, url = seeded(tmp_path)
     service = Service(Config(database_url=url))
-    with service.scope(TENANT_ZERO) as scope:
-        account = scope.scalar(sa.select(m.Account).where(m.Account.name == "wanted"))
+
+    async def declare(scope):  # noqa: ANN001, ANN202
+        account = await scope.scalar(sa.select(m.Account).where(m.Account.name == "wanted"))
         scope.add(m.AccountCapability(account_id=account.id, name="QRESYNC", declared=True))
         scope.add(
             m.AccountCapability(
                 account_id=account.id, name="SORT", declared=False, probed_present=True
             )
         )
-        scope.commit()
+        await scope.commit()
+
+    scoped(service, declare)
     service.close()
 
     reported = run(config, "account", "seed")
@@ -194,16 +231,19 @@ def test_a_capability_the_configuration_dropped_stops_being_declared(tmp_path):
     run(config, "account", "seed", "--update")
 
     service = Service(Config(database_url=url))
-    with service.scope(TENANT_ZERO) as scope:
-        account = scope.scalar(sa.select(m.Account).where(m.Account.name == "wanted"))
-        held = {
+
+    async def read_back(scope):  # noqa: ANN001, ANN202
+        account = await scope.scalar(sa.select(m.Account).where(m.Account.name == "wanted"))
+        return {
             c.name: c
-            for c in scope.scalars(
+            for c in await scope.all(
                 sa.select(m.AccountCapability).where(
                     m.AccountCapability.account_id == account.id
                 )
             )
         }
+
+    held = scoped(service, read_back)
     assert held["QRESYNC"].declared is False, "the claim is withdrawn"
     assert held["SORT"].probed_present is True, "and what the probe learned is still there"
     service.close()

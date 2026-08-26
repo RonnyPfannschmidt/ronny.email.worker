@@ -165,9 +165,7 @@ def test_folder_names_survive_the_wire_in_the_alphabet_they_were_written_in(
         assert backend.select(name, readonly=True) is not None, f"{name!r} cannot be opened"
 
 
-def test_a_message_in_a_folder_with_an_umlaut_is_fetched_like_any_other(
-    backend, out_of_band
-):
+def test_a_message_in_a_folder_with_an_umlaut_is_fetched_like_any_other(backend, out_of_band):
     """Selecting it is one thing; the FETCH that follows names it again."""
     ensure_folder(out_of_band, "Ärger & Co")
     out_of_band.append(

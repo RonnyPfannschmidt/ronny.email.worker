@@ -12,6 +12,7 @@ would turn conditional applies into best-effort ones without anybody noticing.
 
 from __future__ import annotations
 
+import asyncio
 import datetime as dt
 
 import attrs
@@ -35,7 +36,7 @@ class CapabilityReport:
         return bool(self.missing or self.undeclared)
 
 
-def probe_account(
+async def probe_account(
     scope: TenantScope, account: m.Account, backend: MailBackend
 ) -> CapabilityReport:
     """Compare what the server offers against what the account declares.
@@ -45,12 +46,12 @@ def probe_account(
     and assessed is worth more than one that goes dark, and nothing is applied against an
     account that is not ``ok`` anyway.
     """
-    offered = {c.upper() for c in backend.capabilities()}
+    offered = {c.upper() for c in await asyncio.to_thread(backend.capabilities)}
     now = dt.datetime.now(dt.UTC)
 
-    declared_rows = scope.scalars(
+    declared_rows = await scope.all(
         sa.select(m.AccountCapability).where(m.AccountCapability.account_id == account.id)
-    ).all()
+    )
     declared = {row.name for row in declared_rows if row.declared}
 
     for row in declared_rows:
@@ -82,7 +83,7 @@ def probe_account(
         account.health_detail = None
 
     report = CapabilityReport(account=account.name, missing=missing, undeclared=undeclared)
-    scope.audit(
+    await scope.audit(
         "capability_probe",
         actor_kind="service",
         subject_kind="account",
@@ -96,10 +97,10 @@ def probe_account(
     return report
 
 
-def declares(scope: TenantScope, account_id: int, capability: str) -> bool:
+async def declares(scope: TenantScope, account_id: int, capability: str) -> bool:
     """What the service is allowed to attempt.  The declaration, never the probe."""
     return bool(
-        scope.scalar(
+        await scope.scalar(
             sa.select(m.AccountCapability.id).where(
                 m.AccountCapability.account_id == account_id,
                 m.AccountCapability.name == capability,

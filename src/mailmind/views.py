@@ -50,7 +50,7 @@ def instant(value: str, field: str) -> dt.datetime:
     return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=dt.UTC)
 
 
-def accounts(scope: TenantScope, allowed: set[int] | None = None) -> list[dict]:
+async def accounts(scope: TenantScope, allowed: set[int] | None = None) -> list[dict]:
     stmt = sa.select(m.Account)
     if allowed is not None:
         stmt = stmt.where(m.Account.id.in_(allowed or {-1}))
@@ -62,21 +62,23 @@ def accounts(scope: TenantScope, allowed: set[int] | None = None) -> list[dict]:
             "health": a.health.value,
             "health_detail": a.health_detail,
         }
-        for a in scope.scalars(stmt)
+        for a in await scope.all(stmt)
     ]
 
 
-def containers(scope: TenantScope, account_id: int) -> list[dict]:
+async def containers(scope: TenantScope, account_id: int) -> list[dict]:
     counts = dict(
-        scope.execute(
-            sa.select(m.Placement.container_id, sa.func.count())
-            .join(m.Container, m.Placement.container_id == m.Container.id)
-            .where(
-                m.Placement.gone_at.is_(None),
-                m.Placement.container_generation == m.Container.generation,
-                m.Container.account_id == account_id,
+        (
+            await scope.execute(
+                sa.select(m.Placement.container_id, sa.func.count())
+                .join(m.Container, m.Placement.container_id == m.Container.id)
+                .where(
+                    m.Placement.gone_at.is_(None),
+                    m.Placement.container_generation == m.Container.generation,
+                    m.Container.account_id == account_id,
+                )
+                .group_by(m.Placement.container_id)
             )
-            .group_by(m.Placement.container_id)
         ).all()
     )
     return [
@@ -94,7 +96,7 @@ def containers(scope: TenantScope, account_id: int) -> list[dict]:
             if c.last_incremental_sync_at
             else None,
         }
-        for c in scope.scalars(
+        for c in await scope.all(
             sa.select(m.Container)
             .where(
                 m.Container.account_id == account_id,
@@ -127,7 +129,7 @@ def bounded(rows: list[dict], total: int, *, kind: str = "messages") -> dict:
     }
 
 
-def messages(
+async def messages(
     scope: TenantScope,
     *,
     container_id: int,
@@ -155,15 +157,18 @@ def messages(
     if since:
         stmt = stmt.where(m.Message.date_header >= instant(since, "since"))
 
-    total = scope.scalar(sa.select(sa.func.count()).select_from(stmt.order_by(None).subquery()))
-    rows = scope.scalars(
-        stmt.order_by(m.Message.date_header.desc().nullslast()).limit(limit)
-    ).all()
-    return bounded([_message_row(scope, p) for p in rows], total)
+    total = await scope.scalar(
+        sa.select(sa.func.count()).select_from(stmt.order_by(None).subquery())
+    )
+    rows = await scope.all(stmt.order_by(m.Message.date_header.desc().nullslast()).limit(limit))
+    listed = []
+    for placement in rows:
+        listed.append(await _message_row(scope, placement))
+    return bounded(listed, total)
 
 
-def _message_row(scope: TenantScope, placement: m.Placement) -> dict:
-    message = scope.get(m.Message, placement.message_id)
+async def _message_row(scope: TenantScope, placement: m.Placement) -> dict:
+    message = await scope.get(m.Message, placement.message_id)
     return {
         "message_id": message.id,
         "container_id": placement.container_id,
@@ -180,11 +185,15 @@ def _message_row(scope: TenantScope, placement: m.Placement) -> dict:
     }
 
 
-def message_detail(scope: TenantScope, message_id: int, *, include_body: bool = False) -> dict:
-    message = scope.get(m.Message, message_id)
+async def message_detail(
+    scope: TenantScope, message_id: int, *, include_body: bool = False
+) -> dict:
+    message = await scope.get(m.Message, message_id)
     if message is None:
         raise LookupError(f"no message {message_id}")
-    placement = scope.scalar(live_placements().where(m.Placement.message_id == message_id))
+    placement = await scope.scalar(
+        live_placements().where(m.Placement.message_id == message_id)
+    )
     detail = {
         "message_id": message.id,
         "subject": message.subject,
@@ -199,10 +208,10 @@ def message_detail(scope: TenantScope, message_id: int, *, include_body: bool = 
         ],
         "list_id": message.list_id,
         "parse_status": message.parse_status.value,
-        "assessment": assessment_of(scope, m.SubjectKind.message, message.id),
+        "assessment": await assessment_of(scope, m.SubjectKind.message, message.id),
     }
     if include_body:
-        body = scope.scalar(
+        body = await scope.scalar(
             sa.select(m.MessageBody).where(m.MessageBody.message_id == message_id)
         )
         if body is not None:
@@ -220,12 +229,12 @@ def message_detail(scope: TenantScope, message_id: int, *, include_body: bool = 
     return detail
 
 
-def assessment_of(scope: TenantScope, kind: m.SubjectKind, subject_id: int) -> list[dict]:
-    rows = scope.scalars(
+async def assessment_of(scope: TenantScope, kind: m.SubjectKind, subject_id: int) -> list[dict]:
+    rows = await scope.all(
         sa.select(m.Assessment).where(
             m.Assessment.subject_kind == kind, m.Assessment.subject_id == subject_id
         )
-    ).all()
+    )
     return [
         {
             "origin": a.origin.value,
@@ -246,7 +255,7 @@ def assessment_of(scope: TenantScope, kind: m.SubjectKind, subject_id: int) -> l
     ]
 
 
-def summarize_senders(scope: TenantScope, container_id: int, limit: int = 100) -> dict:
+async def summarize_senders(scope: TenantScope, container_id: int, limit: int = 100) -> dict:
     """What an untended mailbox is actually made of.
 
     Without this an agent enumerates thousands of messages to learn what one GROUP BY
@@ -276,9 +285,9 @@ def summarize_senders(scope: TenantScope, container_id: int, limit: int = 100) -
             "last_seen": str(last) if last else None,
             "unread": int(unread or 0),
         }
-        for address, display, count, first, last, unread in scope.execute(stmt)
+        for address, display, count, first, last, unread in await scope.execute(stmt)
     ]
-    total = scope.scalar(
+    total = await scope.scalar(
         sa.select(sa.func.count(sa.distinct(m.Message.from_address)))
         .select_from(m.Message)
         .join(placements, placements.c.message_id == m.Message.id)
@@ -286,7 +295,7 @@ def summarize_senders(scope: TenantScope, container_id: int, limit: int = 100) -
     return bounded(rows, total, kind="senders")
 
 
-def summarize_lists(scope: TenantScope, container_id: int, limit: int = 100) -> dict:
+async def summarize_lists(scope: TenantScope, container_id: int, limit: int = 100) -> dict:
     placements = live_placements(container_id).subquery()
     stmt = (
         sa.select(
@@ -308,9 +317,9 @@ def summarize_lists(scope: TenantScope, container_id: int, limit: int = 100) -> 
             "last_seen": str(last) if last else None,
             "has_unsubscribe": bool(unsub),
         }
-        for list_id, count, last, unsub in scope.execute(stmt)
+        for list_id, count, last, unsub in await scope.execute(stmt)
     ]
-    total = scope.scalar(
+    total = await scope.scalar(
         sa.select(sa.func.count(sa.distinct(m.Message.list_id)))
         .select_from(m.Message)
         .join(placements, placements.c.message_id == m.Message.id)
@@ -319,21 +328,25 @@ def summarize_lists(scope: TenantScope, container_id: int, limit: int = 100) -> 
     return bounded(rows, total, kind="lists")
 
 
-def search(scope: TenantScope, query: str, *, account_ids: set[int] | None, limit: int) -> dict:
-    ids = cache.search_messages(scope, query, account_ids=account_ids, limit=limit)
+async def search(
+    scope: TenantScope, query: str, *, account_ids: set[int] | None, limit: int
+) -> dict:
+    ids = await cache.search_messages(scope, query, account_ids=account_ids, limit=limit)
     rows = []
     for message_id in ids:
-        placement = scope.scalar(live_placements().where(m.Placement.message_id == message_id))
+        placement = await scope.scalar(
+            live_placements().where(m.Placement.message_id == message_id)
+        )
         if placement is not None:
-            rows.append(_message_row(scope, placement))
-    total = cache.count_search_messages(scope, query, account_ids=account_ids)
+            rows.append(await _message_row(scope, placement))
+    total = await cache.count_search_messages(scope, query, account_ids=account_ids)
     return bounded(rows, total)
 
 
 # ------------------------------------------------------------------------ bundles
 
 
-def bundle_summaries(
+async def bundle_summaries(
     scope: TenantScope,
     statuses: list[m.BundleStatus],
     *,
@@ -342,7 +355,7 @@ def bundle_summaries(
     stmt = sa.select(m.Bundle).where(m.Bundle.status.in_(statuses))
     if account_ids is not None:
         stmt = stmt.where(m.Bundle.account_id.in_(account_ids or {-1}))
-    bundles = scope.scalars(stmt.order_by(m.Bundle.created_at.desc())).all()
+    bundles = await scope.all(stmt.order_by(m.Bundle.created_at.desc()))
     return [
         {
             "bundle_id": b.id,
@@ -366,18 +379,20 @@ def bundle_summaries(
     ]
 
 
-def proposed_counts(scope: TenantScope) -> dict[int, int]:
+async def proposed_counts(scope: TenantScope) -> dict[int, int]:
     """How many bundles await review, per account — for the header, so waiting work in
     an account nobody is looking at is not invisible until it expires."""
-    rows = scope.session.execute(
-        sa.select(m.Bundle.account_id, sa.func.count())
-        .where(m.Bundle.status == m.BundleStatus.proposed)
-        .group_by(m.Bundle.account_id)
+    rows = (
+        await scope.execute(
+            sa.select(m.Bundle.account_id, sa.func.count())
+            .where(m.Bundle.status == m.BundleStatus.proposed)
+            .group_by(m.Bundle.account_id)
+        )
     ).all()
     return dict(rows)
 
 
-def _folder_item(scope: TenantScope, suggestion: m.Suggestion) -> dict:
+async def _folder_item(scope: TenantScope, suggestion: m.Suggestion) -> dict:
     """An item that names a folder instead of a message.
 
     What a reviewer needs of a folder is what a discard turns on: how much it holds and
@@ -387,13 +402,13 @@ def _folder_item(scope: TenantScope, suggestion: m.Suggestion) -> dict:
     container = suggestion.source_container
     prefix = container.name + container.delimiter if container.delimiter else None
     children = (
-        scope.scalars(
+        await scope.all(
             sa.select(m.Container.name).where(
                 m.Container.account_id == container.account_id,
                 m.Container.discarded_at.is_(None),
                 m.Container.name.startswith(prefix, autoescape=True),
             )
-        ).all()
+        )
         if prefix
         else []
     )
@@ -402,7 +417,7 @@ def _folder_item(scope: TenantScope, suggestion: m.Suggestion) -> dict:
         "message_id": None,
         "container_id": container.id,
         "container": container.name,
-        "cached_messages": staleness.live_message_count(scope, container),
+        "cached_messages": await staleness.live_message_count(scope, container),
         "children": sorted(children),
         "exists_on_server": container.exists_on_server,
         "status": suggestion.status.value,
@@ -411,8 +426,8 @@ def _folder_item(scope: TenantScope, suggestion: m.Suggestion) -> dict:
     }
 
 
-def bundle_detail(scope: TenantScope, bundle_id: int) -> dict:
-    bundle = scope.get(m.Bundle, bundle_id)
+async def bundle_detail(scope: TenantScope, bundle_id: int) -> dict:
+    bundle = await scope.get(m.Bundle, bundle_id)
     if bundle is None:
         raise LookupError(f"no bundle {bundle_id}")
 
@@ -442,7 +457,7 @@ def bundle_detail(scope: TenantScope, bundle_id: int) -> dict:
     items = []
     for suggestion in bundle.suggestions:
         if suggestion.message_id is None:
-            items.append(_folder_item(scope, suggestion))
+            items.append(await _folder_item(scope, suggestion))
             continue
         message = suggestion.message
         items.append(
@@ -461,7 +476,7 @@ def bundle_detail(scope: TenantScope, bundle_id: int) -> dict:
                 "stale_detail": suggestion.stale_detail,
                 "arrived_from": arrived_from(suggestion.id),
                 "arrived_late": grew_from is not None and suggestion.id >= grew_from,
-                "assessment": assessment_of(scope, m.SubjectKind.message, message.id),
+                "assessment": await assessment_of(scope, m.SubjectKind.message, message.id),
             }
         )
 
@@ -474,6 +489,12 @@ def bundle_detail(scope: TenantScope, bundle_id: int) -> dict:
             for a in item["assessment"]
             if a["producer_id"] == bundle.producer_id
         }
+    )
+
+    attempts = await scope.all(
+        sa.select(m.ApplyAttempt).where(
+            m.ApplyAttempt.suggestion_id.in_([s.id for s in bundle.suggestions] or [-1])
+        )
     )
 
     return {
@@ -507,10 +528,6 @@ def bundle_detail(scope: TenantScope, bundle_id: int) -> dict:
                 "guarantee_obtained": a.guarantee_obtained.value,
                 "detail": a.server_response,
             }
-            for a in scope.scalars(
-                sa.select(m.ApplyAttempt).where(
-                    m.ApplyAttempt.suggestion_id.in_([s.id for s in bundle.suggestions] or [-1])
-                )
-            )
+            for a in attempts
         ],
     }

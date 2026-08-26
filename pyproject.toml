@@ -11,6 +11,10 @@ requires-python = ">=3.13"
 dynamic = ["version"]
 dependencies = [
     "sqlalchemy>=2.0",
+    # The async engine's SQLite driver; the sync sqlite3 driver stays for alembic.
+    "aiosqlite>=0.20",
+    # sqlalchemy's asyncio support bridges to sync ORM internals through greenlet.
+    "greenlet>=3",
     "alembic>=1.13",
     "imapclient>=3.0",
     "mcp>=1.2",

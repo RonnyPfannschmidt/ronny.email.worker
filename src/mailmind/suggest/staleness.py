@@ -29,13 +29,13 @@ class Freshness:
 FRESH = Freshness(True)
 
 
-def check(scope: TenantScope, suggestion: m.Suggestion) -> Freshness:
-    container = scope.get(m.Container, suggestion.source_container_id)
+async def check(scope: TenantScope, suggestion: m.Suggestion) -> Freshness:
+    container = await scope.get(m.Container, suggestion.source_container_id)
     if container is None:
         return Freshness(False, "the folder this referred to is no longer known")
 
     if suggestion.message_id is None:
-        return _check_container(scope, container, suggestion)
+        return await _check_container(scope, container, suggestion)
 
     if container.generation != suggestion.premise_container_generation:
         return Freshness(
@@ -44,7 +44,7 @@ def check(scope: TenantScope, suggestion: m.Suggestion) -> Freshness:
             "referred to can no longer be identified",
         )
 
-    placement = scope.scalar(
+    placement = await scope.scalar(
         sa.select(m.Placement).where(
             m.Placement.container_id == container.id,
             m.Placement.container_generation == suggestion.premise_container_generation,
@@ -75,7 +75,7 @@ def check(scope: TenantScope, suggestion: m.Suggestion) -> Freshness:
     return FRESH
 
 
-def _check_container(
+async def _check_container(
     scope: TenantScope, container: m.Container, suggestion: m.Suggestion
 ) -> Freshness:
     """Is the folder still one there is any point discarding?
@@ -97,7 +97,7 @@ def _check_container(
             "folder this offered to remove",
         )
 
-    held = live_message_count(scope, container)
+    held = await live_message_count(scope, container)
     if held:
         return Freshness(
             False,
@@ -107,7 +107,7 @@ def _check_container(
     return FRESH
 
 
-def live_message_count(scope: TenantScope, container: m.Container) -> int:
+async def live_message_count(scope: TenantScope, container: m.Container) -> int:
     """How much the cache believes this folder holds.
 
     The cache, not the server: this is a premise, and a premise is what was believed when
@@ -115,7 +115,7 @@ def live_message_count(scope: TenantScope, container: m.Container) -> int:
     the check that actually protects anything.
     """
     return (
-        scope.scalar(
+        await scope.scalar(
             sa.select(sa.func.count())
             .select_from(m.Placement)
             .where(
@@ -128,7 +128,7 @@ def live_message_count(scope: TenantScope, container: m.Container) -> int:
     )
 
 
-def refresh_bundle(scope: TenantScope, bundle: m.Bundle) -> dict[int, Freshness]:
+async def refresh_bundle(scope: TenantScope, bundle: m.Bundle) -> dict[int, Freshness]:
     """Check every live item and mark the ones that have died.
 
     Called before the bundle is shown.  Items that have gone stale are marked, not
@@ -147,12 +147,12 @@ def refresh_bundle(scope: TenantScope, bundle: m.Bundle) -> dict[int, Freshness]
             m.SuggestionStatus.accepted,
         ):
             continue
-        verdict = check(scope, suggestion)
+        verdict = await check(scope, suggestion)
         verdicts[suggestion.id] = verdict
         if not verdict.fresh:
             suggestion.status = m.SuggestionStatus.stale
             suggestion.stale_detail = verdict.detail
-            scope.audit(
+            await scope.audit(
                 "suggestion_stale",
                 actor_kind="service",
                 subject_kind="suggestion",
@@ -160,11 +160,11 @@ def refresh_bundle(scope: TenantScope, bundle: m.Bundle) -> dict[int, Freshness]
                 payload={"detail": verdict.detail},
             )
 
-    _close_if_nothing_survived(scope, bundle)
+    await _close_if_nothing_survived(scope, bundle)
     return verdicts
 
 
-def _close_if_nothing_survived(scope: TenantScope, bundle: m.Bundle) -> None:
+async def _close_if_nothing_survived(scope: TenantScope, bundle: m.Bundle) -> None:
     """Take a bundle out of the queue once staleness has emptied it.
 
     Only when something actually went stale.  A bundle the reviewer emptied by excluding
@@ -182,7 +182,7 @@ def _close_if_nothing_survived(scope: TenantScope, bundle: m.Bundle) -> None:
         return
 
     bundle.status = m.BundleStatus.stale
-    scope.audit(
+    await scope.audit(
         "bundle_stale",
         actor_kind="service",
         subject_kind="bundle",
@@ -191,7 +191,7 @@ def _close_if_nothing_survived(scope: TenantScope, bundle: m.Bundle) -> None:
     )
 
 
-def sweep_queue(scope: TenantScope, account_ids: set[int] | None = None) -> int:
+async def sweep_queue(scope: TenantScope, account_ids: set[int] | None = None) -> int:
     """Refresh every bundle still awaiting review, and return how many closed.
 
     Drawing the queue is the moment somebody is about to act on it, so it is also the
@@ -207,8 +207,8 @@ def sweep_queue(scope: TenantScope, account_ids: set[int] | None = None) -> int:
     if account_ids is not None:
         stmt = stmt.where(m.Bundle.account_id.in_(account_ids))
     closed = 0
-    for bundle in scope.scalars(stmt):
-        refresh_bundle(scope, bundle)
+    for bundle in await scope.all(stmt):
+        await refresh_bundle(scope, bundle)
         if bundle.status is m.BundleStatus.stale:
             closed += 1
     return closed

@@ -18,14 +18,14 @@ carrying somebody else's.
 
 from __future__ import annotations
 
-from collections.abc import Iterator
-from contextlib import contextmanager
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from typing import Any
 
 import sqlalchemy as sa
 from sqlalchemy import event
-from sqlalchemy.engine import Engine
-from sqlalchemy.orm import Session, sessionmaker, with_loader_criteria
+from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
+from sqlalchemy.orm import Session, with_loader_criteria
 
 from mailmind.db.models import AuditEvent, TenantScoped
 
@@ -94,44 +94,50 @@ class TenantScope:
     """A session bound to one tenant, and the only way rows are reached.
 
     Repository functions take a scope rather than a session, so there is no signature in
-    the codebase that can be handed an unbound session by accident.
+    the codebase that can be handed an unbound session by accident.  Async throughout —
+    the loop owns every transaction; the only threads are the IMAP dips, and they never
+    see a session.
     """
 
-    def __init__(self, session: Session, tenant_id: int) -> None:
+    def __init__(self, session: AsyncSession, tenant_id: int) -> None:
         self.session = session
         self.tenant_id = tenant_id
-        session.info[TENANT_KEY] = tenant_id
+        session.sync_session.info[TENANT_KEY] = tenant_id
 
     def add(self, obj: Any) -> Any:
         self.session.add(obj)
         return obj
 
-    def delete(self, obj: Any) -> None:
+    async def delete(self, obj: Any) -> None:
         """Remove a row that was loaded through this scope, and so is this tenant's."""
-        self.session.delete(obj)
+        await self.session.delete(obj)
 
-    def flush(self) -> None:
-        self.session.flush()
+    async def flush(self) -> None:
+        await self.session.flush()
 
-    def commit(self) -> None:
-        self.session.commit()
+    async def commit(self) -> None:
+        await self.session.commit()
 
-    def rollback(self) -> None:
-        self.session.rollback()
+    async def rollback(self) -> None:
+        await self.session.rollback()
 
-    def get(self, entity: type, ident: Any) -> Any:
-        return self.session.get(entity, ident)
+    async def get(self, entity: type, ident: Any) -> Any:
+        return await self.session.get(entity, ident)
 
-    def scalars(self, statement: Any) -> Any:
-        return self.session.scalars(statement)
+    async def scalars(self, statement: Any) -> Any:
+        return await self.session.scalars(statement)
 
-    def scalar(self, statement: Any) -> Any:
-        return self.session.scalar(statement)
+    async def all(self, statement: Any) -> list:
+        """Every scalar the statement finds — the chainable ``.scalars().all()`` shape."""
+        return list((await self.session.scalars(statement)).all())
 
-    def execute(self, statement: Any) -> Any:
-        return self.session.execute(statement)
+    async def scalar(self, statement: Any) -> Any:
+        return await self.session.scalar(statement)
 
-    def audit(
+    async def execute(self, statement: Any) -> Any:
+        return await self.session.execute(statement)
+
+    async def audit(
         self,
         verb: str,
         *,
@@ -143,7 +149,7 @@ class TenantScope:
     ) -> AuditEvent:
         """Append to the record.  Never updated, never deleted."""
         next_seq = (
-            self.session.scalar(
+            await self.session.scalar(
                 sa.select(sa.func.coalesce(sa.func.max(AuditEvent.seq), 0)).where(
                     AuditEvent.tenant_id == self.tenant_id
                 )
@@ -163,22 +169,26 @@ class TenantScope:
         return event_row
 
 
-def make_sessionmaker(engine: Engine) -> sessionmaker[Session]:
-    return sessionmaker(engine, expire_on_commit=False)
+def make_sessionmaker(engine: AsyncEngine) -> async_sessionmaker[AsyncSession]:
+    return async_sessionmaker(engine, expire_on_commit=False)
 
 
-@contextmanager
-def tenant_scope(sessions: sessionmaker[Session], tenant_id: int) -> Iterator[TenantScope]:
-    with sessions() as session:
+@asynccontextmanager
+async def tenant_scope(
+    sessions: async_sessionmaker[AsyncSession], tenant_id: int
+) -> AsyncIterator[TenantScope]:
+    async with sessions() as session:
         yield TenantScope(session, tenant_id)
 
 
-@contextmanager
-def unscoped_session(sessions: sessionmaker[Session]) -> Iterator[Session]:
+@asynccontextmanager
+async def unscoped_session(
+    sessions: async_sessionmaker[AsyncSession],
+) -> AsyncIterator[AsyncSession]:
     """For migrations and administration only — tenancy is not enforced here.
 
     Every ORM statement issued through it must carry
     ``execution_options(mailmind_unscoped=True)``, which is deliberately noisy.
     """
-    with sessions() as session:
+    async with sessions() as session:
         yield session

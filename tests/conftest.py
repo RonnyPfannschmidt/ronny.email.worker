@@ -4,7 +4,7 @@ import pytest
 import sqlalchemy as sa
 
 from mailmind.db import models as m
-from mailmind.db.engine import create_engine
+from mailmind.db.engine import create_engine_async
 from mailmind.db.migrate import upgrade_to_head
 from mailmind.db.scope import make_sessionmaker, tenant_scope
 from mailmind.imap import sync
@@ -30,12 +30,12 @@ def sessions(database_url):
     runs on.  It also means every test run exercises the migration.
     """
     upgrade_to_head(database_url)
-    return make_sessionmaker(create_engine(database_url))
+    return make_sessionmaker(create_engine_async(database_url))
 
 
 @pytest.fixture
-def scope(sessions):
-    with tenant_scope(sessions, TENANT_ZERO) as scope:
+async def scope(sessions):
+    async with tenant_scope(sessions, TENANT_ZERO) as scope:
         yield scope
 
 
@@ -52,7 +52,7 @@ def backend():
 
 
 @pytest.fixture
-def world(scope, backend):
+async def world(scope, backend):
     """An account, its containers synced, and a seed map from logical name to message id."""
     account = scope.add(
         m.Account(
@@ -62,22 +62,22 @@ def world(scope, backend):
             password_url="env://X",
         )
     )
-    scope.flush()
+    await scope.flush()
     for name in DECLARED:
         scope.add(m.AccountCapability(account_id=account.id, name=name))
     producer = scope.add(m.Producer(kind=m.ProducerKind.agent, name="opencode"))
     reviewer = scope.add(m.Producer(kind=m.ProducerKind.person, name="ronny"))
-    scope.flush()
+    await scope.flush()
 
     uids = {name: backend.add_message("INBOX", raw) for name, raw in CORPUS.items()}
-    probe_account(scope, account, backend)
-    containers = {c.name: c for c in sync.discover_containers(scope, account, backend)}
-    sync.sync_container(scope, account, containers["INBOX"], backend)
-    scope.commit()
+    await probe_account(scope, account, backend)
+    containers = {c.name: c for c in await sync.discover_containers(scope, account, backend)}
+    await sync.sync_container(scope, account, containers["INBOX"], backend)
+    await scope.commit()
 
     seed = {}
     for name, uid in uids.items():
-        placement = scope.scalar(
+        placement = await scope.scalar(
             sa.select(m.Placement).where(
                 m.Placement.container_id == containers["INBOX"].id, m.Placement.uid == uid
             )
@@ -93,7 +93,7 @@ def world(scope, backend):
     }
 
 
-def accept_as_shown(scope, bundle, reviewer, **kw):
+async def accept_as_shown(scope, bundle, reviewer, **kw):
     """Accept the way a person does: from the page they were shown.
 
     ``reviewed_through`` is required rather than defaulted, so that a review surface
@@ -102,6 +102,6 @@ def accept_as_shown(scope, bundle, reviewer, **kw):
     """
     from mailmind.suggest import model as suggest
 
-    return suggest.accept(
+    return await suggest.accept(
         scope, bundle, reviewer, reviewed_through=suggest.shown_through(bundle), **kw
     )

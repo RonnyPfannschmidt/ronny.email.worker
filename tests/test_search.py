@@ -46,56 +46,58 @@ PUNCTUATION = [
 ]
 
 
-def test_no_query_a_person_could_type_is_an_error(scope, world):
+async def test_no_query_a_person_could_type_is_an_error(scope, world):
     """Every one of these raised OperationalError, straight out of the tool."""
     for query in PUNCTUATION:
-        result = search(scope, query, account_ids=None, limit=10)
+        result = await search(scope, query, account_ids=None, limit=10)
         assert result["returned"] <= result["total_matching"], query
 
 
-def test_an_address_finds_the_mail_that_carries_it(scope, world):
+async def test_an_address_finds_the_mail_that_carries_it(scope, world):
     """The obvious search on a mailbox, and the one that used to be a syntax error."""
-    found = search(scope, "alice@example.com", account_ids=None, limit=10)
+    found = await search(scope, "alice@example.com", account_ids=None, limit=10)
     assert found["total_matching"] >= 1
     assert any(row["from_address"] == "alice@example.com" for row in found["messages"])
 
 
-def test_a_body_becomes_searchable_when_it_is_fetched_and_not_before(scope, world, backend):
+async def test_a_body_becomes_searchable_when_it_is_fetched_and_not_before(
+    scope, world, backend
+):
     """A sync sees headers, so a preview cannot exist yet. Nothing used to fill it in
     afterwards either: every preview in every listing was empty, the index's preview column
     held nothing, and the tool went on describing a search over previews."""
-    ordinary = scope.get(m.Message, world["seed"]["ordinary"])
+    ordinary = await scope.get(m.Message, world["seed"]["ordinary"])
     assert ordinary.preview is None, "a header-only sync should not invent a preview"
-    assert search(scope, "free", account_ids=None, limit=10)["total_matching"] == 0
+    assert (await search(scope, "free", account_ids=None, limit=10))["total_matching"] == 0
 
     from mailmind.imap import sync as sync_module
 
-    placement = scope.scalar(
+    placement = await scope.scalar(
         live_placements().where(m.Placement.message_id == ordinary.id)
     )
-    container = scope.get(m.Container, placement.container_id)
-    sync_module.fetch_and_cache_body(
+    container = await scope.get(m.Container, placement.container_id)
+    await sync_module.fetch_and_cache_body(
         scope, world["account"], container, placement, backend, budget_bytes=10_000_000
     )
-    scope.flush()
+    await scope.flush()
 
-    assert scope.get(m.Message, ordinary.id).preview == "Are you free?"
-    assert search(scope, "free", account_ids=None, limit=10)["total_matching"] == 1
+    assert (await scope.get(m.Message, ordinary.id)).preview == "Are you free?"
+    assert (await search(scope, "free", account_ids=None, limit=10))["total_matching"] == 1
 
 
-def test_a_message_no_folder_still_shows_is_not_counted_as_a_match(scope, world, backend):
+async def test_a_message_no_folder_still_shows_is_not_counted_as_a_match(scope, world, backend):
     """The index keeps the message; the mailbox does not. Counting it made the totals
     disagree with the rows, which reads as truncation that never happened."""
-    before = search(scope, "lunch", account_ids=None, limit=10)
+    before = await search(scope, "lunch", account_ids=None, limit=10)
     assert before["total_matching"] == before["returned"] >= 1
 
-    ordinary = scope.get(m.Message, world["seed"]["ordinary"])
-    for placement in scope.scalars(
+    ordinary = await scope.get(m.Message, world["seed"]["ordinary"])
+    for placement in await scope.all(
         sa.select(m.Placement).where(m.Placement.message_id == ordinary.id)
     ):
         placement.gone_at = sa.func.now()
-    scope.flush()
+    await scope.flush()
 
-    after = search(scope, "lunch", account_ids=None, limit=10)
+    after = await search(scope, "lunch", account_ids=None, limit=10)
     assert after["total_matching"] == after["returned"] == before["returned"] - 1
     assert after["truncated"] is False

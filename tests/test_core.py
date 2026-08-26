@@ -22,8 +22,8 @@ from tests.conftest import accept_as_shown
 from tests.corpus import CORPUS
 
 
-def _bundle(scope, world, names, operation=m.Operation.move, target="Archive"):
-    return suggest.propose_bundle(
+async def _bundle(scope, world, names, operation=m.Operation.move, target="Archive"):
+    return await suggest.propose_bundle(
         scope,
         producer=world["producer"],
         account=world["account"],
@@ -38,18 +38,18 @@ def _bundle(scope, world, names, operation=m.Operation.move, target="Archive"):
 # ------------------------------------------------------------------- syncing
 
 
-def test_sync_caches_every_message_with_its_placement(scope, world):
-    count = scope.scalar(sa.select(sa.func.count()).select_from(m.Message))
+async def test_sync_caches_every_message_with_its_placement(scope, world):
+    count = await scope.scalar(sa.select(sa.func.count()).select_from(m.Message))
     assert count == len(CORPUS)
-    live = scope.scalar(
+    live = await scope.scalar(
         sa.select(sa.func.count()).select_from(m.Placement).where(m.Placement.gone_at.is_(None))
     )
     assert live == len(CORPUS)
 
 
-def _codes(scope, message_id):
+async def _codes(scope, message_id):
     return set(
-        scope.scalars(
+        await scope.all(
             sa.select(m.Finding.code)
             .join(m.Assessment, m.Finding.assessment_id == m.Assessment.id)
             .where(m.Assessment.subject_id == message_id)
@@ -57,22 +57,24 @@ def _codes(scope, message_id):
     )
 
 
-def test_mechanical_findings_are_recorded_without_a_model(scope, world):
+async def test_mechanical_findings_are_recorded_without_a_model(scope, world):
     """A sync fetches headers only, so only header-level findings exist yet."""
-    codes = _codes(scope, world["seed"]["spoofed_display_name"])
+    codes = await _codes(scope, world["seed"]["spoofed_display_name"])
     assert "display_name_spoofs_address" in codes
     assert all(
         f.finding_class is m.FindingClass.mechanical
-        for f in scope.scalars(sa.select(m.Finding))
+        for f in await scope.all(sa.select(m.Finding))
     )
 
 
-def test_body_findings_appear_once_a_body_is_actually_fetched(scope, world, backend):
+async def test_body_findings_appear_once_a_body_is_actually_fetched(scope, world, backend):
     message_id = world["seed"]["spoofed_display_name"]
-    assert "body_only_address" not in _codes(scope, message_id)
+    assert "body_only_address" not in await _codes(scope, message_id)
 
-    placement = scope.scalar(sa.select(m.Placement).where(m.Placement.message_id == message_id))
-    sync.fetch_and_cache_body(
+    placement = await scope.scalar(
+        sa.select(m.Placement).where(m.Placement.message_id == message_id)
+    )
+    await sync.fetch_and_cache_body(
         scope,
         world["account"],
         world["containers"]["INBOX"],
@@ -80,13 +82,15 @@ def test_body_findings_appear_once_a_body_is_actually_fetched(scope, world, back
         backend,
         budget_bytes=10_000_000,
     )
-    assert "body_only_address" in _codes(scope, message_id)
+    assert "body_only_address" in await _codes(scope, message_id)
 
 
-def test_a_link_whose_text_disagrees_with_its_target_is_found(scope, world, backend):
+async def test_a_link_whose_text_disagrees_with_its_target_is_found(scope, world, backend):
     message_id = world["seed"]["instruction_shaped"]
-    placement = scope.scalar(sa.select(m.Placement).where(m.Placement.message_id == message_id))
-    sync.fetch_and_cache_body(
+    placement = await scope.scalar(
+        sa.select(m.Placement).where(m.Placement.message_id == message_id)
+    )
+    await sync.fetch_and_cache_body(
         scope,
         world["account"],
         world["containers"]["INBOX"],
@@ -94,10 +98,10 @@ def test_a_link_whose_text_disagrees_with_its_target_is_found(scope, world, back
         backend,
         budget_bytes=10_000_000,
     )
-    assert "link_target_mismatch" in _codes(scope, message_id)
+    assert "link_target_mismatch" in await _codes(scope, message_id)
 
 
-def test_a_sender_never_seen_before_is_marked_and_a_familiar_one_is_not(
+async def test_a_sender_never_seen_before_is_marked_and_a_familiar_one_is_not(
     scope, world, backend
 ):
     """The finding says what was known when the message arrived.
@@ -106,7 +110,7 @@ def test_a_sender_never_seen_before_is_marked_and_a_familiar_one_is_not(
     counting messages from the address counted the message being assessed and every
     sender looked familiar.
     """
-    assert "first_contact" in _codes(scope, world["seed"]["ordinary"])
+    assert "first_contact" in await _codes(scope, world["seed"]["ordinary"])
 
     second = backend.add_message(
         "INBOX",
@@ -118,32 +122,32 @@ def test_a_sender_never_seen_before_is_marked_and_a_familiar_one_is_not(
         b"\r\n"
         b"About Thursday.\r\n",
     )
-    sync.sync_container(scope, world["account"], world["containers"]["INBOX"], backend)
-    scope.flush()
+    await sync.sync_container(scope, world["account"], world["containers"]["INBOX"], backend)
+    await scope.flush()
 
-    placement = scope.scalar(
+    placement = await scope.scalar(
         sa.select(m.Placement).where(
             m.Placement.container_id == world["containers"]["INBOX"].id,
             m.Placement.uid == second,
         )
     )
-    assert "first_contact" not in _codes(scope, placement.message_id)
-    assert "first_contact" in _codes(scope, world["seed"]["ordinary"]), (
+    assert "first_contact" not in await _codes(scope, placement.message_id)
+    assert "first_contact" in await _codes(scope, world["seed"]["ordinary"]), (
         "the first message stopped being first contact once a second one arrived"
     )
 
 
-def test_a_cached_message_carries_the_size_the_server_reported(scope, world, backend):
+async def test_a_cached_message_carries_the_size_the_server_reported(scope, world, backend):
     """Not the size of the blob that was parsed, which during a sync is headers only."""
-    message = scope.get(m.Message, world["seed"]["ordinary"])
+    message = await scope.get(m.Message, world["seed"]["ordinary"])
     raw = CORPUS["ordinary"]
     assert message.size_bytes == len(raw)
     assert message.size_bytes > len(raw.partition(b"\r\n\r\n")[0])
 
 
-def test_a_message_with_no_message_id_is_still_cached_and_flagged(scope, world):
+async def test_a_message_with_no_message_id_is_still_cached_and_flagged(scope, world):
     codes = set(
-        scope.scalars(
+        await scope.all(
             sa.select(m.Finding.code)
             .join(m.Assessment, m.Finding.assessment_id == m.Assessment.id)
             .where(m.Assessment.subject_id == world["seed"]["no_message_id"])
@@ -152,31 +156,31 @@ def test_a_message_with_no_message_id_is_still_cached_and_flagged(scope, world):
     assert "no_message_id" in codes
 
 
-def test_malformed_mime_is_marked_once_there_is_a_body_to_judge(scope, world, backend):
+async def test_malformed_mime_is_marked_once_there_is_a_body_to_judge(scope, world, backend):
     """A sync reads headers, and a truncated multipart's headers are a healthy multipart's.
 
     Flagging it at sync time meant flagging every multipart message — most of a real
     mailbox — for a body that had not been fetched. The judgement waits for the body now,
     and says what was wrong with it when it comes.
     """
-    message = scope.get(m.Message, world["seed"]["malformed_mime"])
+    message = await scope.get(m.Message, world["seed"]["malformed_mime"])
     assert message.parse_status is m.ParseStatus.ok, "nothing was wrong with the headers"
 
-    placement = scope.scalar(
+    placement = await scope.scalar(
         sa.select(m.Placement).where(m.Placement.message_id == message.id)
     )
-    container = scope.get(m.Container, placement.container_id)
-    sync.fetch_and_cache_body(
+    container = await scope.get(m.Container, placement.container_id)
+    await sync.fetch_and_cache_body(
         scope, world["account"], container, placement, backend, budget_bytes=10_000_000
     )
-    scope.flush()
+    await scope.flush()
 
-    message = scope.get(m.Message, world["seed"]["malformed_mime"])
+    message = await scope.get(m.Message, world["seed"]["malformed_mime"])
     assert message.parse_status is not m.ParseStatus.ok
     assert "Boundary" in (message.parse_detail or ""), message.parse_detail
 
 
-def test_an_ordinary_multipart_message_is_not_reported_as_damaged(scope, world, backend):
+async def test_an_ordinary_multipart_message_is_not_reported_as_damaged(scope, world, backend):
     """The finding that started this: 16,755 of 29,079 messages in a real mailbox marked
     partial, and 16,659 of those merely multipart."""
     uid = backend.add_message(
@@ -185,25 +189,25 @@ def test_an_ordinary_multipart_message_is_not_reported_as_damaged(scope, world, 
         b"Message-ID: <invoice@example.net>\r\nDate: Mon, 17 Aug 2026 09:00:00 +0000\r\n"
         b'MIME-Version: 1.0\r\nContent-Type: multipart/mixed; boundary="B"\r\n\r\n'
         b"--B\r\nContent-Type: text/plain\r\n\r\nDie Rechnung liegt bei.\r\n"
-        b'--B\r\nContent-Type: application/pdf\r\nContent-Disposition: attachment; '
+        b"--B\r\nContent-Type: application/pdf\r\nContent-Disposition: attachment; "
         b'filename="rechnung.pdf"\r\n\r\n%PDF-1.4\r\n--B--\r\n',
     )
-    sync.sync_container(scope, world["account"], world["containers"]["INBOX"], backend)
-    scope.flush()
+    await sync.sync_container(scope, world["account"], world["containers"]["INBOX"], backend)
+    await scope.flush()
 
-    placement = scope.scalar(
+    placement = await scope.scalar(
         sa.select(m.Placement).where(
             m.Placement.container_id == world["containers"]["INBOX"].id,
             m.Placement.uid == uid,
         )
     )
-    message = scope.get(m.Message, placement.message_id)
+    message = await scope.get(m.Message, placement.message_id)
     assert message.parse_status is m.ParseStatus.ok
     assert message.parse_detail is None
     # And no attachment is invented from a body nobody fetched.
     assert message.has_attachments is False
 
-    sync.fetch_and_cache_body(
+    await sync.fetch_and_cache_body(
         scope,
         world["account"],
         world["containers"]["INBOX"],
@@ -211,8 +215,8 @@ def test_an_ordinary_multipart_message_is_not_reported_as_damaged(scope, world, 
         backend,
         budget_bytes=10_000_000,
     )
-    scope.flush()
-    message = scope.get(m.Message, placement.message_id)
+    await scope.flush()
+    message = await scope.get(m.Message, placement.message_id)
     assert message.has_attachments is True, "the body says there is one"
     assert message.parse_status is m.ParseStatus.ok
 
@@ -225,7 +229,7 @@ def test_an_ordinary_multipart_message_is_not_reported_as_damaged(scope, world, 
         ("unknown_8bit_word", "H\ufffdndler"),
     ],
 )
-def test_eight_bit_bytes_in_a_display_name_are_cached_rather_than_fatal(
+async def test_eight_bit_bytes_in_a_display_name_are_cached_rather_than_fatal(
     scope, world, name, expected
 ):
     """The whole sync used to die here, on the folder rather than on the message.
@@ -234,39 +238,43 @@ def test_eight_bit_bytes_in_a_display_name_are_cached_rather_than_fatal(
     SQLite refuses to store a lone surrogate, and a mailbox with 187 folders synced none of
     them because the first one held a shop's name in Latin-1.
     """
-    message = scope.get(m.Message, world["seed"][name])
+    message = await scope.get(m.Message, world["seed"][name])
     assert message.from_display == expected
     message.from_display.encode("utf-8")  # what the exception was raised by
 
 
-def test_utf_8_in_a_domain_survives_as_the_character_it_was(scope, world):
+async def test_utf_8_in_a_domain_survives_as_the_character_it_was(scope, world):
     """The case seen in the wild, and the reason this replaces rather than drops.
 
     Those bytes *were* UTF-8 — one surrogate per byte of a two-byte character — so putting
     them back through utf-8 recovers the address somebody actually wrote.
     """
-    message = scope.get(m.Message, world["seed"]["non_ascii_domain"])
+    message = await scope.get(m.Message, world["seed"]["non_ascii_domain"])
     assert message.from_address == "hallo@gr\u00fc\u00dfe.example"
     assert message.from_display == "Gr\u00fc\u00dfe"
 
 
-def test_a_full_sync_re_reads_what_an_incremental_one_would_skip(scope, world, backend):
+async def test_a_full_sync_re_reads_what_an_incremental_one_would_skip(scope, world, backend):
     """The cache holds what the parser made of a message, not the message. So when the
     parser is corrected, the way to correct the cache is to read it all again — and an
     incremental sync, by design, reads nothing that has not changed."""
-    message = scope.get(m.Message, world["seed"]["ordinary"])
+    message = await scope.get(m.Message, world["seed"]["ordinary"])
     message.subject = "whatever an older parse made of it"
-    scope.flush()
+    await scope.flush()
 
-    quiet = sync.sync_container(scope, world["account"], world["containers"]["INBOX"], backend)
+    quiet = await sync.sync_container(
+        scope, world["account"], world["containers"]["INBOX"], backend
+    )
     assert quiet.added == quiet.updated == 0, "nothing changed on the server"
-    assert scope.get(m.Message, message.id).subject == "whatever an older parse made of it"
+    assert (
+        await scope.get(m.Message, message.id)
+    ).subject == "whatever an older parse made of it"
 
-    again = sync.sync_container(
+    again = await sync.sync_container(
         scope, world["account"], world["containers"]["INBOX"], backend, force_full=True
     )
     assert again.full
-    assert scope.get(m.Message, message.id).subject == "Lunch on Thursday"
+    assert (await scope.get(m.Message, message.id)).subject == "Lunch on Thursday"
 
 
 class Watcher:
@@ -283,7 +291,7 @@ class Watcher:
         self.ticks.append(count)
 
 
-def test_a_sync_says_how_far_it_has_got_while_it_is_getting_there(
+async def test_a_sync_says_how_far_it_has_got_while_it_is_getting_there(
     scope, world, backend, monkeypatch
 ):
     """A first sync is 187 folders and takes minutes. It used to print one line per folder
@@ -295,7 +303,7 @@ def test_a_sync_says_how_far_it_has_got_while_it_is_getting_there(
     """
     monkeypatch.setattr(sync, "FETCH_BATCH", 2)
     watcher = Watcher()
-    report = sync.sync_container(
+    report = await sync.sync_container(
         scope,
         world["account"],
         world["containers"]["INBOX"],
@@ -309,15 +317,15 @@ def test_a_sync_says_how_far_it_has_got_while_it_is_getting_there(
     assert sum(watcher.ticks) == len(CORPUS) == report.added + report.updated
 
 
-def test_a_sync_with_nobody_watching_is_the_same_sync(scope, world, backend):
+async def test_a_sync_with_nobody_watching_is_the_same_sync(scope, world, backend):
     """The display is optional, and the reporting is not the work."""
-    quiet = sync.sync_container(
+    quiet = await sync.sync_container(
         scope, world["account"], world["containers"]["INBOX"], backend, force_full=True
     )
     assert quiet.updated == len(CORPUS)
 
 
-def test_what_a_sync_will_read_is_countable_before_it_reads_it(scope, world, backend):
+async def test_what_a_sync_will_read_is_countable_before_it_reads_it(scope, world, backend):
     """The progress total. A folder about to be read whole can be counted with STATUS; a
     folder about to be asked what changed cannot, and saying a number anyway is worse than
     saying none — which is what a total that grew as folders reported in amounted to."""
@@ -334,11 +342,13 @@ def test_what_a_sync_will_read_is_countable_before_it_reads_it(scope, world, bac
     )
 
 
-def test_an_incremental_sync_sees_an_out_of_band_flag_change(scope, world, backend):
+async def test_an_incremental_sync_sees_an_out_of_band_flag_change(scope, world, backend):
     backend.out_of_band_mutate_flags("INBOX", world["uids"]["ordinary"], (r"\Seen",))
-    report = sync.sync_container(scope, world["account"], world["containers"]["INBOX"], backend)
+    report = await sync.sync_container(
+        scope, world["account"], world["containers"]["INBOX"], backend
+    )
     assert not report.full
-    placement = scope.scalar(
+    placement = await scope.scalar(
         sa.select(m.Placement).where(m.Placement.message_id == world["seed"]["ordinary"])
     )
     assert placement.flags == r"\Seen"
@@ -347,16 +357,16 @@ def test_an_incremental_sync_sees_an_out_of_band_flag_change(scope, world, backe
 # ------------------------------------------------------- proposing and review
 
 
-def test_a_bundle_captures_a_premise_for_every_item(scope, world):
-    bundle = _bundle(scope, world, ["newsletter", "instruction_shaped"])
+async def test_a_bundle_captures_a_premise_for_every_item(scope, world):
+    bundle = await _bundle(scope, world, ["newsletter", "instruction_shaped"])
     assert len(bundle.suggestions) == 2
     assert all(s.premise_modseq is not None for s in bundle.suggestions)
     assert all(s.premise_container_generation == 1 for s in bundle.suggestions)
 
 
-def test_a_bundle_larger_than_the_limit_is_refused(scope, world):
+async def test_a_bundle_larger_than_the_limit_is_refused(scope, world):
     with pytest.raises(suggest.ProposalRefused, match="exceeds"):
-        suggest.propose_bundle(
+        await suggest.propose_bundle(
             scope,
             producer=world["producer"],
             account=world["account"],
@@ -369,11 +379,11 @@ def test_a_bundle_larger_than_the_limit_is_refused(scope, world):
         )
 
 
-def test_accepting_applies_and_the_mailbox_actually_changes(scope, world, backend):
-    bundle = _bundle(scope, world, ["newsletter"])
-    accept_as_shown(scope, bundle, world["reviewer"])
-    attempts = applier.apply_bundle(scope, bundle, backend)
-    scope.commit()
+async def test_accepting_applies_and_the_mailbox_actually_changes(scope, world, backend):
+    bundle = await _bundle(scope, world, ["newsletter"])
+    await accept_as_shown(scope, bundle, world["reviewer"])
+    attempts = await applier.apply_bundle(scope, bundle, backend)
+    await scope.commit()
 
     assert [a.outcome for a in attempts] == [m.ApplyOutcome.applied]
     assert bundle.status is m.BundleStatus.applied
@@ -381,16 +391,20 @@ def test_accepting_applies_and_the_mailbox_actually_changes(scope, world, backen
     assert len(backend.folders["Archive"].messages) == 1
 
 
-def test_a_move_reports_best_effort_because_move_has_no_unchangedsince(scope, world, backend):
-    bundle = _bundle(scope, world, ["newsletter"])
-    accept_as_shown(scope, bundle, world["reviewer"])
-    attempt = applier.apply_bundle(scope, bundle, backend)[0]
+async def test_a_move_reports_best_effort_because_move_has_no_unchangedsince(
+    scope, world, backend
+):
+    bundle = await _bundle(scope, world, ["newsletter"])
+    await accept_as_shown(scope, bundle, world["reviewer"])
+    attempt = (await applier.apply_bundle(scope, bundle, backend))[0]
     assert attempt.precondition is m.Precondition.best_effort
     assert attempt.guarantee_obtained is m.Precondition.best_effort
 
 
-def test_a_flag_change_reports_the_conditional_guarantee_it_asked_for(scope, world, backend):
-    bundle = suggest.propose_bundle(
+async def test_a_flag_change_reports_the_conditional_guarantee_it_asked_for(
+    scope, world, backend
+):
+    bundle = await suggest.propose_bundle(
         scope,
         producer=world["producer"],
         account=world["account"],
@@ -400,8 +414,8 @@ def test_a_flag_change_reports_the_conditional_guarantee_it_asked_for(scope, wor
         summary="mark read",
         reason="already read elsewhere",
     )
-    accept_as_shown(scope, bundle, world["reviewer"])
-    attempt = applier.apply_bundle(scope, bundle, backend)[0]
+    await accept_as_shown(scope, bundle, world["reviewer"])
+    attempt = (await applier.apply_bundle(scope, bundle, backend))[0]
     assert attempt.outcome is m.ApplyOutcome.applied
     assert attempt.guarantee_obtained is m.Precondition.conditional
 
@@ -409,56 +423,60 @@ def test_a_flag_change_reports_the_conditional_guarantee_it_asked_for(scope, wor
 # ------------------------------------------------------------ the two gaps
 
 
-def test_gap_one_something_that_moved_before_review_cannot_be_accepted(scope, world, backend):
+async def test_gap_one_something_that_moved_before_review_cannot_be_accepted(
+    scope, world, backend
+):
     """Proposed, then the person filed it themselves in their own client."""
-    bundle = _bundle(scope, world, ["newsletter", "ordinary"])
+    bundle = await _bundle(scope, world, ["newsletter", "ordinary"])
     backend.out_of_band_move("INBOX", world["uids"]["ordinary"], "Archive")
-    sync.sync_container(scope, world["account"], world["containers"]["INBOX"], backend)
+    await sync.sync_container(scope, world["account"], world["containers"]["INBOX"], backend)
 
     with pytest.raises(suggest.ProposalRefused, match="moved since this was proposed"):
-        accept_as_shown(scope, bundle, world["reviewer"])
+        await accept_as_shown(scope, bundle, world["reviewer"])
 
     dead = [s for s in bundle.suggestions if s.status is m.SuggestionStatus.stale]
     assert len(dead) == 1
     assert "has left INBOX" in dead[0].stale_detail
 
 
-def test_the_reviewer_can_exclude_what_moved_and_accept_the_rest(scope, world, backend):
-    bundle = _bundle(scope, world, ["newsletter", "ordinary"])
+async def test_the_reviewer_can_exclude_what_moved_and_accept_the_rest(scope, world, backend):
+    bundle = await _bundle(scope, world, ["newsletter", "ordinary"])
     backend.out_of_band_move("INBOX", world["uids"]["ordinary"], "Archive")
-    sync.sync_container(scope, world["account"], world["containers"]["INBOX"], backend)
+    await sync.sync_container(scope, world["account"], world["containers"]["INBOX"], backend)
     with pytest.raises(suggest.ProposalRefused):
-        accept_as_shown(scope, bundle, world["reviewer"])
+        await accept_as_shown(scope, bundle, world["reviewer"])
 
     # The reviewer has now been shown what moved and says so.  The stale item is not
     # accepted by this; it stays dead.
-    accepted = accept_as_shown(scope, bundle, world["reviewer"], acknowledge_stale=True)
+    accepted = await accept_as_shown(scope, bundle, world["reviewer"], acknowledge_stale=True)
     assert len(accepted) == 1
-    attempts = applier.apply_bundle(scope, bundle, backend)
+    attempts = await applier.apply_bundle(scope, bundle, backend)
     assert [a.outcome for a in attempts] == [m.ApplyOutcome.applied]
     stale = [s for s in bundle.suggestions if s.status is m.SuggestionStatus.stale]
     assert len(stale) == 1
 
 
-def test_gap_two_something_that_moves_after_acceptance_is_not_applied(scope, world, backend):
+async def test_gap_two_something_that_moves_after_acceptance_is_not_applied(
+    scope, world, backend
+):
     """The dangerous gap: a person has already said yes."""
-    bundle = _bundle(scope, world, ["newsletter"])
-    accept_as_shown(scope, bundle, world["reviewer"])
+    bundle = await _bundle(scope, world, ["newsletter"])
+    await accept_as_shown(scope, bundle, world["reviewer"])
 
     # Between the yes and the doing, another client touches it.
     backend.out_of_band_mutate_flags("INBOX", world["uids"]["newsletter"], (r"\Flagged",))
-    sync.sync_container(scope, world["account"], world["containers"]["INBOX"], backend)
+    await sync.sync_container(scope, world["account"], world["containers"]["INBOX"], backend)
 
-    attempts = applier.apply_bundle(scope, bundle, backend)
+    attempts = await applier.apply_bundle(scope, bundle, backend)
     assert [a.outcome for a in attempts] == [m.ApplyOutcome.refused_stale]
     assert bundle.suggestions[0].status is m.SuggestionStatus.stale
     # And the mailbox is untouched.
     assert world["uids"]["newsletter"] in backend.folders["INBOX"].messages
 
 
-def test_gap_two_holds_even_when_the_cache_has_not_noticed(scope, world, backend):
+async def test_gap_two_holds_even_when_the_cache_has_not_noticed(scope, world, backend):
     """No sync between the change and the apply: the server still refuses."""
-    bundle = suggest.propose_bundle(
+    bundle = await suggest.propose_bundle(
         scope,
         producer=world["producer"],
         account=world["account"],
@@ -468,14 +486,14 @@ def test_gap_two_holds_even_when_the_cache_has_not_noticed(scope, world, backend
         summary="mark read",
         reason="r",
     )
-    accept_as_shown(scope, bundle, world["reviewer"])
+    await accept_as_shown(scope, bundle, world["reviewer"])
     backend.out_of_band_mutate_flags("INBOX", world["uids"]["newsletter"], (r"\Flagged",))
 
-    attempts = applier.apply_bundle(scope, bundle, backend)
+    attempts = await applier.apply_bundle(scope, bundle, backend)
     assert [a.outcome for a in attempts] == [m.ApplyOutcome.refused_stale]
 
 
-def test_a_bundle_that_lost_every_item_is_not_reported_as_applied(scope, world, backend):
+async def test_a_bundle_that_lost_every_item_is_not_reported_as_applied(scope, world, backend):
     """Zero of zero used to count as all of them.
 
     ``applied == len(attempts)`` holds trivially when nothing was attempted, so a bundle
@@ -484,22 +502,24 @@ def test_a_bundle_that_lost_every_item_is_not_reported_as_applied(scope, world, 
     """
     from mailmind.suggest import staleness
 
-    bundle = _bundle(scope, world, ["newsletter"])
-    accept_as_shown(scope, bundle, world["reviewer"])
+    bundle = await _bundle(scope, world, ["newsletter"])
+    await accept_as_shown(scope, bundle, world["reviewer"])
 
     # Somebody files it in their own client, and the next sync notices.
     backend.out_of_band_move("INBOX", world["uids"]["newsletter"], "Archive")
-    sync.sync_container(scope, world["account"], world["containers"]["INBOX"], backend)
-    staleness.refresh_bundle(scope, bundle)
+    await sync.sync_container(scope, world["account"], world["containers"]["INBOX"], backend)
+    await staleness.refresh_bundle(scope, bundle)
     assert all(s.status is m.SuggestionStatus.stale for s in bundle.suggestions)
 
     with pytest.raises(applier.NotApplicable) as refused:
-        applier.apply_bundle(scope, bundle, backend)
+        await applier.apply_bundle(scope, bundle, backend)
     assert "nothing was done to the mailbox" in str(refused.value)
     assert bundle.status is m.BundleStatus.accepted
 
 
-def test_a_bundle_nobody_decided_and_nothing_survived_closes_itself(scope, world, backend):
+async def test_a_bundle_nobody_decided_and_nothing_survived_closes_itself(
+    scope, world, backend
+):
     """The bug: it could be neither accepted nor honestly closed.
 
     Accepting is impossible, because there is nothing left to apply. Rejecting would work
@@ -511,24 +531,24 @@ def test_a_bundle_nobody_decided_and_nothing_survived_closes_itself(scope, world
     """
     from mailmind.suggest import staleness
 
-    bundle = _bundle(scope, world, ["newsletter"])
+    bundle = await _bundle(scope, world, ["newsletter"])
     assert bundle.status is m.BundleStatus.proposed
 
     # Filed by the person in their own client, and the next sync notices.
     backend.out_of_band_move("INBOX", world["uids"]["newsletter"], "Archive")
-    sync.sync_container(scope, world["account"], world["containers"]["INBOX"], backend)
-    staleness.refresh_bundle(scope, bundle)
+    await sync.sync_container(scope, world["account"], world["containers"]["INBOX"], backend)
+    await staleness.refresh_bundle(scope, bundle)
 
     assert bundle.status is m.BundleStatus.stale
     assert bundle.decided_by_id is None, "nobody decided it, so nobody is recorded as having"
     assert bundle.decided_at is None
 
     # And it is out of the queue rather than sitting there looking actionable.
-    waiting = views.bundle_summaries(scope, [m.BundleStatus.proposed])
+    waiting = await views.bundle_summaries(scope, [m.BundleStatus.proposed])
     assert [b for b in waiting if b["bundle_id"] == bundle.id] == []
 
 
-def test_drawing_the_queue_retires_what_died_in_it(scope, world, backend):
+async def test_drawing_the_queue_retires_what_died_in_it(scope, world, backend):
     """Somebody looking at the queue is about to act on it.
 
     So that is the moment a dead bundle stops being offered, rather than after they open
@@ -537,16 +557,16 @@ def test_drawing_the_queue_retires_what_died_in_it(scope, world, backend):
     """
     from mailmind.suggest import staleness
 
-    bundle = _bundle(scope, world, ["newsletter"])
+    bundle = await _bundle(scope, world, ["newsletter"])
     backend.out_of_band_move("INBOX", world["uids"]["newsletter"], "Archive")
-    sync.sync_container(scope, world["account"], world["containers"]["INBOX"], backend)
+    await sync.sync_container(scope, world["account"], world["containers"]["INBOX"], backend)
 
-    assert staleness.sweep_queue(scope) == 1
+    assert await staleness.sweep_queue(scope) == 1
     assert bundle.status is m.BundleStatus.stale
-    assert views.bundle_summaries(scope, [m.BundleStatus.proposed]) == []
+    assert await views.bundle_summaries(scope, [m.BundleStatus.proposed]) == []
 
 
-def test_accepting_a_bundle_that_just_died_says_so_rather_than_refusing_forever(
+async def test_accepting_a_bundle_that_just_died_says_so_rather_than_refusing_forever(
     scope, world, backend
 ):
     """The same thing, reached through accept rather than through looking at the page.
@@ -555,38 +575,40 @@ def test_accepting_a_bundle_that_just_died_says_so_rather_than_refusing_forever(
     only place they learn what happened. It says the bundle closed, not that the accept
     was rejected.
     """
-    bundle = _bundle(scope, world, ["newsletter"])
+    bundle = await _bundle(scope, world, ["newsletter"])
     backend.out_of_band_move("INBOX", world["uids"]["newsletter"], "Archive")
-    sync.sync_container(scope, world["account"], world["containers"]["INBOX"], backend)
+    await sync.sync_container(scope, world["account"], world["containers"]["INBOX"], backend)
 
     with pytest.raises(suggest.ProposalRefused) as refused:
-        accept_as_shown(scope, bundle, world["reviewer"], acknowledge_stale=True)
+        await accept_as_shown(scope, bundle, world["reviewer"], acknowledge_stale=True)
     assert "nothing left to apply" in str(refused.value)
     assert "closed rather than rejected" in str(refused.value)
     assert bundle.status is m.BundleStatus.stale
 
 
-def test_a_reviewer_emptying_a_bundle_is_not_the_world_moving(scope, world, backend):
+async def test_a_reviewer_emptying_a_bundle_is_not_the_world_moving(scope, world, backend):
     """Excluding every item is a person deciding, so it is not recorded as staleness.
 
     The bundle stays proposed and stays theirs to reject. Guarding the boundary here
     because `stale` is a claim about the mailbox, and it should never be made about
     something a person did.
     """
-    bundle = _bundle(scope, world, ["newsletter"])
+    bundle = await _bundle(scope, world, ["newsletter"])
     for suggestion in list(bundle.suggestions):
-        suggest.exclude(scope, suggestion, world["reviewer"])
+        await suggest.exclude(scope, suggestion, world["reviewer"])
 
     from mailmind.suggest import staleness
 
-    staleness.refresh_bundle(scope, bundle)
+    await staleness.refresh_bundle(scope, bundle)
     assert bundle.status is m.BundleStatus.proposed
 
 
-def test_a_recreated_folder_kills_everything_resting_on_it(scope, world, backend):
-    bundle = _bundle(scope, world, ["newsletter", "ordinary"])
+async def test_a_recreated_folder_kills_everything_resting_on_it(scope, world, backend):
+    bundle = await _bundle(scope, world, ["newsletter", "ordinary"])
     backend.force_uidvalidity_change("INBOX")
-    report = sync.sync_container(scope, world["account"], world["containers"]["INBOX"], backend)
+    report = await sync.sync_container(
+        scope, world["account"], world["containers"]["INBOX"], backend
+    )
     assert report.identity_broken
     assert report.suggestions_killed == 2
     assert world["containers"]["INBOX"].generation == 2
@@ -597,51 +619,53 @@ def test_a_recreated_folder_kills_everything_resting_on_it(scope, world, backend
 # -------------------------------------------------------------- health, expiry
 
 
-def test_nothing_is_applied_against_an_unhealthy_account(scope, world, backend):
-    bundle = _bundle(scope, world, ["newsletter"])
-    accept_as_shown(scope, bundle, world["reviewer"])
+async def test_nothing_is_applied_against_an_unhealthy_account(scope, world, backend):
+    bundle = await _bundle(scope, world, ["newsletter"])
+    await accept_as_shown(scope, bundle, world["reviewer"])
     world["account"].health = m.AccountHealth.read_only
     with pytest.raises(applier.NotApplicable, match="not healthy"):
-        applier.apply_bundle(scope, bundle, backend)
+        await applier.apply_bundle(scope, bundle, backend)
 
 
-def test_a_missing_declared_capability_is_loud(scope, world, backend):
+async def test_a_missing_declared_capability_is_loud(scope, world, backend):
     backend.set_capabilities(frozenset({"MOVE", "UIDPLUS", "SPECIAL-USE", "IDLE"}))
-    report = probe_account(scope, world["account"], backend)
+    report = await probe_account(scope, world["account"], backend)
     assert report.missing == ("CONDSTORE",)
     assert world["account"].health is m.AccountHealth.read_only
     assert "CONDSTORE" in world["account"].health_detail
 
 
-def test_unreviewed_bundles_expire(scope, world):
-    bundle = _bundle(scope, world, ["newsletter"])
+async def test_unreviewed_bundles_expire(scope, world):
+    bundle = await _bundle(scope, world, ["newsletter"])
     bundle.expires_at = dt.datetime.now(dt.UTC) - dt.timedelta(seconds=1)
-    assert suggest.expire_due(scope) == 1
+    assert await suggest.expire_due(scope) == 1
     assert bundle.status is m.BundleStatus.expired
 
 
-def test_the_record_keeps_who_accepted_what(scope, world, backend):
-    bundle = _bundle(scope, world, ["newsletter"])
-    accept_as_shown(scope, bundle, world["reviewer"])
-    applier.apply_bundle(scope, bundle, backend)
-    verbs = list(scope.scalars(sa.select(m.AuditEvent.verb).order_by(m.AuditEvent.seq)))
+async def test_the_record_keeps_who_accepted_what(scope, world, backend):
+    bundle = await _bundle(scope, world, ["newsletter"])
+    await accept_as_shown(scope, bundle, world["reviewer"])
+    await applier.apply_bundle(scope, bundle, backend)
+    verbs = list(await scope.all(sa.select(m.AuditEvent.verb).order_by(m.AuditEvent.seq)))
     assert "bundle_proposed" in verbs and "bundle_accepted" in verbs
-    accepted = scope.scalar(
+    accepted = await scope.scalar(
         sa.select(m.AuditEvent).where(m.AuditEvent.verb == "bundle_accepted")
     )
     assert accepted.actor_id == world["reviewer"].id
     assert accepted.actor_kind == "person"
 
 
-def test_a_producer_cannot_withdraw_someone_elses_bundle(scope, world):
-    bundle = _bundle(scope, world, ["newsletter"])
+async def test_a_producer_cannot_withdraw_someone_elses_bundle(scope, world):
+    bundle = await _bundle(scope, world, ["newsletter"])
     other = scope.add(m.Producer(kind=m.ProducerKind.agent, name="other"))
-    scope.flush()
+    await scope.flush()
     with pytest.raises(suggest.ProposalRefused, match="only be withdrawn"):
-        suggest.withdraw(scope, bundle, other, "mine now")
+        await suggest.withdraw(scope, bundle, other, "mine now")
 
 
-def test_a_message_leaving_is_noticed_even_on_a_server_offering_qresync(scope, world, backend):
+async def test_a_message_leaving_is_noticed_even_on_a_server_offering_qresync(
+    scope, world, backend
+):
     """QRESYNC is declared by real servers and not implemented here.
 
     A sync that trusted the capability instead of the implementation stopped noticing
@@ -650,15 +674,15 @@ def test_a_message_leaving_is_noticed_even_on_a_server_offering_qresync(scope, w
     assert "QRESYNC" not in backend.capabilities()
     backend.set_capabilities(backend.capabilities() | {"QRESYNC"})
 
-    bundle = _bundle(scope, world, ["newsletter"])
+    bundle = await _bundle(scope, world, ["newsletter"])
     backend.out_of_band_move("INBOX", world["uids"]["newsletter"], "Archive")
 
-    report = sync.sync_container(
+    report = await sync.sync_container(
         scope, world["account"], world["containers"]["INBOX"], backend
     )
     assert not report.full, "this must hold on the incremental path, not only a full sync"
     assert report.vanished == 1
 
     with pytest.raises(suggest.ProposalRefused):
-        accept_as_shown(scope, bundle, world["reviewer"])
+        await accept_as_shown(scope, bundle, world["reviewer"])
     assert bundle.suggestions[0].status is m.SuggestionStatus.stale

@@ -7,15 +7,16 @@ reach — the applier is imported by the review flow and by nothing on the agent
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import secrets
 import threading
-from collections.abc import Callable, Iterator
-from contextlib import contextmanager
+from collections.abc import AsyncIterator, Callable
+from contextlib import asynccontextmanager
 
 from mailmind.config import AccountConfig, Config, Login, load_config
 from mailmind.db import models as m
-from mailmind.db.engine import create_engine
+from mailmind.db.engine import create_engine_async
 from mailmind.db.scope import TenantScope, make_sessionmaker, tenant_scope
 from mailmind.imap.backend import MailBackend
 
@@ -61,27 +62,29 @@ class Service:
         backend_factory: Callable[[AccountConfig], MailBackend] | None = None,
     ) -> None:
         self.config = config or load_config()
-        self.engine = create_engine(self.config.database_url)
+        self.engine = create_engine_async(self.config.database_url)
         self.sessions = make_sessionmaker(self.engine)
         self._backend_factory = backend_factory or _real_backend
         self._backends: dict[str, MailBackend] = {}
-        self._backend_locks: dict[str, threading.Lock] = {}
+        self._backend_locks: dict[str, asyncio.Lock] = {}
         self._registry_lock = threading.Lock()
+        #: Set by the task runner at startup; a no-op until one is running.
+        self.notify_tasks: Callable[[], None] = lambda: None
 
-    @contextmanager
-    def scope(self, tenant_id: int = TENANT_ZERO) -> Iterator[TenantScope]:
-        with tenant_scope(self.sessions, tenant_id) as scope:
+    @asynccontextmanager
+    async def scope(self, tenant_id: int = TENANT_ZERO) -> AsyncIterator[TenantScope]:
+        async with tenant_scope(self.sessions, tenant_id) as scope:
             yield scope
 
-    @contextmanager
-    def backend(self, account: m.Account) -> Iterator[MailBackend]:
+    @asynccontextmanager
+    async def backend(self, account: m.Account) -> AsyncIterator[MailBackend]:
         """One account's connection, held for as long as the caller needs it.
 
-        A backend is handed out under a lock rather than returned, because IMAP is a
-        stateful protocol with a selected folder and a connection therefore belongs to
-        one worker at a time — which the routes and the MCP tools, running in threadpools
-        of their own, would otherwise not respect.  Two threads interleaving SELECTs on
-        one connection do not fail; they read the wrong folder.
+        A backend is handed out under a per-account lock rather than returned, because
+        IMAP is a stateful protocol with a selected folder, and a connection therefore
+        belongs to one logical sequence at a time.  Everything that talks IMAP runs on
+        the one loop, so the lock is an ``asyncio.Lock``; the blocking calls themselves
+        happen in thread dips that only ever carry plain data.
         """
         with self._registry_lock:
             backend = self._backends.get(account.name)
@@ -89,8 +92,8 @@ class Service:
                 backend = self._backends[account.name] = self._backend_factory(
                     account_config(account)
                 )
-            lock = self._backend_locks.setdefault(account.name, threading.Lock())
-        with lock:
+            lock = self._backend_locks.setdefault(account.name, asyncio.Lock())
+        async with lock:
             yield backend
 
     def close(self) -> None:

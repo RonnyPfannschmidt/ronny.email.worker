@@ -169,9 +169,9 @@ class Grant(Base, TenantScoped):
     expires_at: Mapped[dt.datetime | None] = mapped_column(default=None)
     revoked_at: Mapped[dt.datetime | None] = mapped_column(default=None)
 
-    producer: Mapped[Producer] = relationship()
+    producer: Mapped[Producer] = relationship(lazy="selectin")
     accounts: Mapped[list[GrantAccount]] = relationship(
-        back_populates="grant", cascade="all, delete-orphan"
+        lazy="selectin", back_populates="grant", cascade="all, delete-orphan"
     )
 
     def allows(self, capability: Capability) -> bool:
@@ -187,7 +187,7 @@ class GrantAccount(Base, TenantScoped):
     grant_id: Mapped[int] = mapped_column(sa.ForeignKey("grant.id"))
     account_id: Mapped[int] = mapped_column(sa.ForeignKey("account.id"))
 
-    grant: Mapped[Grant] = relationship(back_populates="accounts")
+    grant: Mapped[Grant] = relationship(lazy="selectin", back_populates="accounts")
 
     __table_args__ = (sa.UniqueConstraint("grant_id", "account_id"),)
 
@@ -259,7 +259,7 @@ class OAuthAuthorization(Base, TenantScoped):
     #: An authorization code is redeemable once.  A second attempt is evidence, not traffic.
     used_at: Mapped[dt.datetime | None] = mapped_column(default=None)
 
-    grant: Mapped[Grant | None] = relationship()
+    grant: Mapped[Grant | None] = relationship(lazy="selectin")
 
 
 class OAuthTokenKind(enum.Enum):
@@ -287,7 +287,7 @@ class OAuthToken(Base, TenantScoped):
     expires_at: Mapped[dt.datetime | None] = mapped_column(default=None)
     revoked_at: Mapped[dt.datetime | None] = mapped_column(default=None)
 
-    grant: Mapped[Grant] = relationship()
+    grant: Mapped[Grant] = relationship(lazy="selectin")
 
 
 # --------------------------------------------------------------------- mailbox access
@@ -330,9 +330,11 @@ class Account(Base, TenantScoped):
     cache_bodies: Mapped[bool] = mapped_column(default=True)
 
     capabilities: Mapped[list[AccountCapability]] = relationship(
-        back_populates="account", cascade="all, delete-orphan"
+        lazy="selectin", back_populates="account", cascade="all, delete-orphan"
     )
-    containers: Mapped[list[Container]] = relationship(back_populates="account")
+    containers: Mapped[list[Container]] = relationship(
+        lazy="selectin", back_populates="account"
+    )
 
     __table_args__ = (sa.UniqueConstraint("tenant_id", "name"),)
 
@@ -355,7 +357,7 @@ class AccountCapability(Base, TenantScoped):
     probed_present: Mapped[bool | None] = mapped_column(default=None)
     probed_at: Mapped[dt.datetime | None] = mapped_column(default=None)
 
-    account: Mapped[Account] = relationship(back_populates="capabilities")
+    account: Mapped[Account] = relationship(lazy="selectin", back_populates="capabilities")
 
     __table_args__ = (sa.UniqueConstraint("account_id", "name"),)
 
@@ -393,7 +395,7 @@ class Container(Base, TenantScoped):
     #: reviewer nothing.
     discarded_at: Mapped[dt.datetime | None] = mapped_column(default=None)
 
-    account: Mapped[Account] = relationship(back_populates="containers")
+    account: Mapped[Account] = relationship(lazy="selectin", back_populates="containers")
 
     __table_args__ = (sa.UniqueConstraint("account_id", "name"),)
 
@@ -442,9 +444,11 @@ class Message(Base, TenantScoped):
     )
     cached_at: Mapped[dt.datetime] = mapped_column(default=utcnow)
 
-    placements: Mapped[list[Placement]] = relationship(back_populates="message")
+    placements: Mapped[list[Placement]] = relationship(
+        lazy="selectin", back_populates="message"
+    )
     addresses: Mapped[list[MessageAddress]] = relationship(
-        back_populates="message", cascade="all, delete-orphan"
+        lazy="selectin", back_populates="message", cascade="all, delete-orphan"
     )
 
     __table_args__ = (
@@ -480,8 +484,8 @@ class Placement(Base, TenantScoped):
     #: what happened rather than shown a dangling reference.
     gone_at: Mapped[dt.datetime | None] = mapped_column(default=None)
 
-    message: Mapped[Message] = relationship(back_populates="placements")
-    container: Mapped[Container] = relationship()
+    message: Mapped[Message] = relationship(lazy="selectin", back_populates="placements")
+    container: Mapped[Container] = relationship(lazy="selectin")
 
     __table_args__ = (
         sa.UniqueConstraint("container_id", "container_generation", "uid"),
@@ -512,7 +516,7 @@ class MessageAddress(Base, TenantScoped):
     address: Mapped[str] = mapped_column(sa.String(320))
     display_name: Mapped[str | None] = mapped_column(sa.Text, default=None)
 
-    message: Mapped[Message] = relationship(back_populates="addresses")
+    message: Mapped[Message] = relationship(lazy="selectin", back_populates="addresses")
 
     __table_args__ = (sa.Index("ix_message_address", "tenant_id", "address"),)
 
@@ -537,7 +541,7 @@ class MessageBody(Base, TenantScoped):
     cached_at: Mapped[dt.datetime] = mapped_column(default=utcnow)
     last_read_at: Mapped[dt.datetime] = mapped_column(default=utcnow)
 
-    message: Mapped[Message] = relationship()
+    message: Mapped[Message] = relationship(lazy="selectin")
 
 
 # ----------------------------------------------------------------------- suggestions
@@ -621,15 +625,20 @@ class Bundle(Base, TenantScoped):
     )
     decision_reason: Mapped[str | None] = mapped_column(sa.Text, default=None)
 
-    account: Mapped[Account] = relationship()
-    producer: Mapped[Producer] = relationship(foreign_keys=[producer_id])
-    decided_by: Mapped[Producer | None] = relationship(foreign_keys=[decided_by_id])
-    target_container: Mapped[Container | None] = relationship()
+    account: Mapped[Account] = relationship(lazy="selectin")
+    producer: Mapped[Producer] = relationship(lazy="selectin", foreign_keys=[producer_id])
+    decided_by: Mapped[Producer | None] = relationship(
+        lazy="selectin", foreign_keys=[decided_by_id]
+    )
+    target_container: Mapped[Container | None] = relationship(lazy="selectin")
     #: In the order they arrived.  Items are only ever appended — excluding and dying are
     #: changes of status, not removals — which is what lets one id say what a review page
     #: showed and what arrived after it.
     suggestions: Mapped[list[Suggestion]] = relationship(
-        back_populates="bundle", cascade="all, delete-orphan", order_by="Suggestion.id"
+        lazy="selectin",
+        back_populates="bundle",
+        cascade="all, delete-orphan",
+        order_by="Suggestion.id",
     )
 
     __table_args__ = (
@@ -703,9 +712,9 @@ class Suggestion(Base, TenantScoped):
     #: the item silently disappearing.
     stale_detail: Mapped[str | None] = mapped_column(sa.Text, default=None)
 
-    bundle: Mapped[Bundle] = relationship(back_populates="suggestions")
-    message: Mapped[Message | None] = relationship()
-    source_container: Mapped[Container] = relationship()
+    bundle: Mapped[Bundle] = relationship(lazy="selectin", back_populates="suggestions")
+    message: Mapped[Message | None] = relationship(lazy="selectin")
+    source_container: Mapped[Container] = relationship(lazy="selectin")
 
     __table_args__ = (
         sa.UniqueConstraint("bundle_id", "message_id"),
@@ -753,9 +762,9 @@ class Assessment(Base, TenantScoped):
     producer_id: Mapped[int | None] = mapped_column(sa.ForeignKey("producer.id"), default=None)
     created_at: Mapped[dt.datetime] = mapped_column(default=utcnow)
 
-    producer: Mapped[Producer | None] = relationship()
+    producer: Mapped[Producer | None] = relationship(lazy="selectin")
     findings: Mapped[list[Finding]] = relationship(
-        back_populates="assessment", cascade="all, delete-orphan"
+        lazy="selectin", back_populates="assessment", cascade="all, delete-orphan"
     )
 
     __table_args__ = (
@@ -785,7 +794,7 @@ class Finding(Base, TenantScoped):
     detail: Mapped[str] = mapped_column(sa.Text)
     evidence: Mapped[dict[str, Any]] = mapped_column(default=dict)
 
-    assessment: Mapped[Assessment] = relationship(back_populates="findings")
+    assessment: Mapped[Assessment] = relationship(lazy="selectin", back_populates="findings")
 
 
 # --------------------------------------------------------------------------- record
@@ -826,7 +835,7 @@ class ApplyAttempt(Base, TenantScoped):
     #: From UIDPLUS COPYUID, where the server offers it.
     resulting_uid: Mapped[int | None] = mapped_column(sa.BigInteger, default=None)
 
-    suggestion: Mapped[Suggestion] = relationship()
+    suggestion: Mapped[Suggestion] = relationship(lazy="selectin")
 
 
 class AuditEvent(Base, TenantScoped):

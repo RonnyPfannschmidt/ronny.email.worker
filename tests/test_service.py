@@ -6,7 +6,7 @@ surfaces share and that neither of them can see going wrong.
 
 from __future__ import annotations
 
-import threading
+import asyncio
 
 from mailmind.config import AccountConfig, Config, Login
 from mailmind.db import models as m
@@ -28,59 +28,53 @@ def _service(tmp_path) -> Service:
     )
 
 
-def test_a_backend_is_held_by_one_worker_at_a_time(tmp_path):
+async def test_a_backend_is_held_by_one_task_at_a_time(tmp_path):
     """IMAP is stateful: a connection carries a selected folder.
 
-    Two threads sharing one do not fail — they read the wrong folder. Proved by giving a
-    second worker every chance to get in while the first is inside, the point being that
+    Two tasks sharing one do not fail — they read the wrong folder. Proved by giving a
+    second task every chance to get in while the first is inside, the point being that
     it does not, and then that it does once the first lets go.
     """
     service = _service(tmp_path)
     account = m.Account(name="test", host="h", username="u", password_url="env://X")
 
-    holding, second_is_in, release = (threading.Event() for _ in range(3))
+    holding, second_is_in, release = (asyncio.Event() for _ in range(3))
 
-    def first() -> None:
-        with service.backend(account):
+    async def first() -> None:
+        async with service.backend(account):
             holding.set()
-            release.wait(timeout=10)
+            await release.wait()
 
-    def second() -> None:
-        with service.backend(account):
+    async def second() -> None:
+        async with service.backend(account):
             second_is_in.set()
 
-    threads = [threading.Thread(target=first), threading.Thread(target=second)]
-    threads[0].start()
-    assert holding.wait(timeout=10), "the first worker never got the connection"
-    threads[1].start()
+    task_one = asyncio.create_task(first())
+    await asyncio.wait_for(holding.wait(), timeout=10)
+    task_two = asyncio.create_task(second())
 
-    assert not second_is_in.wait(timeout=0.25), (
-        "two workers held the same IMAP connection at once"
-    )
+    # Every chance to get in: yield the loop repeatedly while the first still holds it.
+    for _ in range(20):
+        await asyncio.sleep(0)
+    assert not second_is_in.is_set(), "two tasks held the same IMAP connection at once"
+
     release.set()
-    for thread in threads:
-        thread.join(timeout=10)
+    await asyncio.wait_for(asyncio.gather(task_one, task_two), timeout=10)
     assert second_is_in.is_set(), "the connection was never handed on"
 
 
-def test_one_connection_per_account_however_many_ask_at_once(tmp_path):
+async def test_one_connection_per_account_however_many_ask_at_once(tmp_path):
     """Racing to open the same account must not log in twice and leak one of them."""
     service = _service(tmp_path)
     account = m.Account(name="test", host="h", username="u", password_url="env://X")
 
     seen: list[object] = []
-    start = threading.Barrier(6)
 
-    def take() -> None:
-        start.wait(timeout=10)
-        with service.backend(account) as backend:
+    async def take() -> None:
+        async with service.backend(account) as backend:
             seen.append(backend)
 
-    threads = [threading.Thread(target=take) for _ in range(6)]
-    for thread in threads:
-        thread.start()
-    for thread in threads:
-        thread.join(timeout=10)
+    await asyncio.wait_for(asyncio.gather(*(take() for _ in range(6))), timeout=10)
 
     assert len(seen) == 6
     assert len({id(backend) for backend in seen}) == 1

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import json
 import sys
@@ -148,33 +149,39 @@ def make_grant(
     """Mint a bearer token. Printed once; only its hash is stored."""
     service = _service(ctx.obj["config_path"])
     token = mint_token()
-    with service.scope(TENANT_ZERO) as scope:
-        row = scope.scalar(sa.select(m.Producer).where(m.Producer.name == producer))
-        if row is None:
-            row = m.Producer(kind=m.ProducerKind.agent, name=producer)
-            scope.add(row)
-            scope.flush()
-        grant = m.Grant(
-            producer_id=row.id, token_hash=hash_token(token), capabilities=list(capabilities)
-        )
-        scope.add(grant)
-        scope.flush()
-        accounts = scope.scalars(
-            sa.select(m.Account).where(m.Account.name.in_(account_names))
-            if account_names
-            else sa.select(m.Account)
-        ).all()
-        for account in accounts:
-            scope.add(m.GrantAccount(grant_id=grant.id, account_id=account.id))
-        scope.audit(
-            "grant_minted",
-            actor_kind="person",
-            subject_kind="grant",
-            subject_id=grant.id,
-            payload={"producer": producer, "capabilities": list(capabilities)},
-        )
-        scope.commit()
-        click.echo(f"grant {grant.id} for {producer} over {len(accounts)} account(s)")
+
+    async def go() -> None:
+        async with service.scope(TENANT_ZERO) as scope:
+            row = await scope.scalar(sa.select(m.Producer).where(m.Producer.name == producer))
+            if row is None:
+                row = m.Producer(kind=m.ProducerKind.agent, name=producer)
+                scope.add(row)
+                await scope.flush()
+            grant = m.Grant(
+                producer_id=row.id,
+                token_hash=hash_token(token),
+                capabilities=list(capabilities),
+            )
+            scope.add(grant)
+            await scope.flush()
+            accounts = await scope.all(
+                sa.select(m.Account).where(m.Account.name.in_(account_names))
+                if account_names
+                else sa.select(m.Account)
+            )
+            for account in accounts:
+                scope.add(m.GrantAccount(grant_id=grant.id, account_id=account.id))
+            await scope.audit(
+                "grant_minted",
+                actor_kind="person",
+                subject_kind="grant",
+                subject_id=grant.id,
+                payload={"producer": producer, "capabilities": list(capabilities)},
+            )
+            await scope.commit()
+            click.echo(f"grant {grant.id} for {producer} over {len(accounts)} account(s)")
+
+    asyncio.run(go())
     click.echo(f"\n  {token}\n")
     click.echo("This is shown once. Give it to the agent as a bearer token.")
 
@@ -186,25 +193,31 @@ def probe(ctx: click.Context) -> None:
     from mailmind.imap.capabilities import probe_account
 
     service = _service(ctx.obj["config_path"])
-    diverged = False
-    with service.scope(TENANT_ZERO) as scope:
-        for account in scope.scalars(sa.select(m.Account)):
-            with service.backend(account) as backend:
-                report = probe_account(scope, account, backend)
-            if report.missing:
-                diverged = True
-                click.secho(
-                    f"{account.name}: DECLARED BUT NOT OFFERED: {', '.join(report.missing)}",
-                    fg="red",
-                )
-            if report.undeclared:
-                click.echo(
-                    f"{account.name}: offered but not declared: {', '.join(report.undeclared)}"
-                )
-            if not report.diverged:
-                click.secho(f"{account.name}: as declared", fg="green")
-        scope.commit()
-    raise SystemExit(1 if diverged else 0)
+
+    async def go() -> bool:
+        diverged = False
+        async with service.scope(TENANT_ZERO) as scope:
+            for account in await scope.all(sa.select(m.Account)):
+                async with service.backend(account) as backend:
+                    report = await probe_account(scope, account, backend)
+                if report.missing:
+                    diverged = True
+                    click.secho(
+                        f"{account.name}: DECLARED BUT NOT OFFERED: "
+                        f"{', '.join(report.missing)}",
+                        fg="red",
+                    )
+                if report.undeclared:
+                    click.echo(
+                        f"{account.name}: offered but not declared: "
+                        f"{', '.join(report.undeclared)}"
+                    )
+                if not report.diverged:
+                    click.secho(f"{account.name}: as declared", fg="green")
+            await scope.commit()
+        return diverged
+
+    raise SystemExit(1 if asyncio.run(go()) else 0)
 
 
 def messages_to_read(folders, backend, *, force_full: bool) -> int | None:  # noqa: ANN001
@@ -353,36 +366,42 @@ def sync(ctx: click.Context, account_name: str | None, force_full: bool) -> None
     from mailmind.imap import sync as sync_module
 
     service = _service(ctx.obj["config_path"])
-    with service.scope(TENANT_ZERO) as scope:
-        stmt = sa.select(m.Account)
-        if account_name:
-            stmt = stmt.where(m.Account.name == account_name)
-        for account in scope.scalars(stmt):
-            with service.backend(account) as backend:
-                folders = [
-                    c
-                    for c in sync_module.discover_containers(scope, account, backend)
-                    if c.selectable
-                ]
-                expected = messages_to_read(folders, backend, force_full=force_full)
-                with sync_display(len(folders), expected) as display:
-                    for container in folders:
-                        report = sync_module.sync_container(
-                            scope,
-                            account,
-                            container,
-                            backend,
-                            force_full=force_full,
-                            progress=display,
-                        )
-                        display.folder_finished(report)
-                        # Per folder, not per account.  A first sync of a real mailbox is
-                        # long, and one transaction around the whole of it holds SQLite's
-                        # write lock for the duration — which every other request then
-                        # waits on and gives up.  It also made the whole sync
-                        # all-or-nothing, so interrupting an hour of fetching threw the
-                        # hour away.
-                        scope.commit()
+
+    async def go() -> None:
+        async with service.scope(TENANT_ZERO) as scope:
+            stmt = sa.select(m.Account)
+            if account_name:
+                stmt = stmt.where(m.Account.name == account_name)
+            for account in await scope.all(stmt):
+                async with service.backend(account) as backend:
+                    folders = [
+                        c
+                        for c in await sync_module.discover_containers(scope, account, backend)
+                        if c.selectable
+                    ]
+                    expected = await asyncio.to_thread(
+                        messages_to_read, folders, backend, force_full=force_full
+                    )
+                    with sync_display(len(folders), expected) as display:
+                        for container in folders:
+                            report = await sync_module.sync_container(
+                                scope,
+                                account,
+                                container,
+                                backend,
+                                force_full=force_full,
+                                progress=display,
+                            )
+                            display.folder_finished(report)
+                            # Per folder, not per account.  A first sync of a real
+                            # mailbox is long, and one transaction around the whole of it
+                            # holds SQLite's write lock for the duration — which every
+                            # other request then waits on and gives up.  It also made the
+                            # whole sync all-or-nothing, so interrupting an hour of
+                            # fetching threw the hour away.
+                            await scope.commit()
+
+    asyncio.run(go())
     service.close()
 
 
@@ -393,9 +412,13 @@ def status(ctx: click.Context) -> None:
     from mailmind import views
 
     service = _service(ctx.obj["config_path"])
-    with service.scope(TENANT_ZERO) as scope:
-        bundles = views.bundle_summaries(scope, [m.BundleStatus.proposed])
-        click.echo(json.dumps(bundles, indent=2))
+
+    async def go() -> None:
+        async with service.scope(TENANT_ZERO) as scope:
+            bundles = await views.bundle_summaries(scope, [m.BundleStatus.proposed])
+            click.echo(json.dumps(bundles, indent=2))
+
+    asyncio.run(go())
 
 
 @main.command("mcp")
@@ -454,7 +477,6 @@ def mcp_stdio(
     somebody whose agent is the only thing that ever proposes anything: start the agent,
     get told where to review, review it while the agent is still there.
     """
-    import asyncio
     import socket
 
     import uvicorn
@@ -503,20 +525,22 @@ def mcp_stdio(
     if not review_url.endswith("/"):
         review_url += "/"
 
-    try:
-        context = (
-            mcp_server.grant_context(service, token)
-            if token
-            else mcp_server.local_context(service, producer)
-        )
-    except ConfigError as exc:
-        raise click.ClickException(str(exc)) from exc
-    if context is None:
-        raise click.ClickException("that token does not resolve to a grant that is still live")
-
     server = mcp_server.build_server(service, review_url=review_url)
 
     async def run() -> None:
+        # Resolved here because it reads the database, and the loop owns transactions.
+        try:
+            context = (
+                await mcp_server.grant_context(service, token)
+                if token
+                else await mcp_server.local_context(service, producer)
+            )
+        except ConfigError as exc:
+            raise click.ClickException(str(exc)) from exc
+        if context is None:
+            raise click.ClickException(
+                "that token does not resolve to a grant that is still live"
+            )
         mcp_server.CURRENT_GRANT.set(context)
         if listener is None:
             await server.run_stdio_async()
@@ -576,30 +600,35 @@ def list_accounts(ctx: click.Context) -> None:
     """What is in the database, and whether the configuration still asks for it."""
     service = _service(ctx.obj["config_path"])
     configured = {a.name for a in service.config.accounts}
-    with service.scope(TENANT_ZERO) as scope:
-        chosen = {
-            p.current_account_id
-            for p in scope.scalars(sa.select(m.Producer))
-            if p.current_account_id
-        }
-        for row in scope.scalars(sa.select(m.Account).order_by(m.Account.name)):
-            folders = scope.scalar(
-                sa.select(sa.func.count())
-                .select_from(m.Container)
-                .where(m.Container.account_id == row.id)
-            )
-            notes = []
-            if row.name not in configured:
-                notes.append("not in the configuration")
-            if row.id in chosen:
-                notes.append("being reviewed")
-            trailer = f"  ({', '.join(notes)})" if notes else ""
-            # Not `user@host`: a username is usually an address already, and two @ in a
-            # row reads as a typo.
-            click.echo(
-                f"{row.name}  {row.username} on {row.host}:{row.port}  "
-                f"{row.health.value}  {folders} folder(s){trailer}"
-            )
+
+    async def go() -> None:
+        chosen: set[int]
+        async with service.scope(TENANT_ZERO) as scope:
+            chosen = {
+                p.current_account_id
+                for p in await scope.all(sa.select(m.Producer))
+                if p.current_account_id
+            }
+            for row in await scope.all(sa.select(m.Account).order_by(m.Account.name)):
+                folders = await scope.scalar(
+                    sa.select(sa.func.count())
+                    .select_from(m.Container)
+                    .where(m.Container.account_id == row.id)
+                )
+                notes = []
+                if row.name not in configured:
+                    notes.append("not in the configuration")
+                if row.id in chosen:
+                    notes.append("being reviewed")
+                trailer = f"  ({', '.join(notes)})" if notes else ""
+                # Not `user@host`: a username is usually an address already, and two @ in
+                # a row reads as a typo.
+                click.echo(
+                    f"{row.name}  {row.username} on {row.host}:{row.port}  "
+                    f"{row.health.value}  {folders} folder(s){trailer}"
+                )
+
+    asyncio.run(go())
 
 
 @account.command("seed")
@@ -619,28 +648,34 @@ def seed_accounts(ctx: click.Context, apply_changes: bool) -> None:
     on connecting to a host its configuration had stopped naming.
     """
     service = _service(ctx.obj["config_path"])
-    with service.scope(TENANT_ZERO) as scope:
-        for account_config in service.config.accounts:
-            row = scope.scalar(
-                sa.select(m.Account).where(m.Account.name == account_config.name)
-            )
-            if row is None:
-                row = m.Account(
-                    name=account_config.name,
-                    host=account_config.host,
-                    port=account_config.port,
-                    use_ssl=account_config.use_ssl,
-                    username=account_config.login.username,
-                    password_url=account_config.login.password,
-                    cache_bodies=account_config.cache_bodies,
+
+    async def go() -> None:
+        async with service.scope(TENANT_ZERO) as scope:
+            for account_config in service.config.accounts:
+                row = await scope.scalar(
+                    sa.select(m.Account).where(m.Account.name == account_config.name)
                 )
-                scope.add(row)
-                scope.flush()
-                click.echo(f"created account {row.name}")
-            else:
-                _reconcile(row, account_config, apply_changes=apply_changes)
-            _reconcile_capabilities(scope, row, account_config, apply_changes=apply_changes)
-        scope.commit()
+                if row is None:
+                    row = m.Account(
+                        name=account_config.name,
+                        host=account_config.host,
+                        port=account_config.port,
+                        use_ssl=account_config.use_ssl,
+                        username=account_config.login.username,
+                        password_url=account_config.login.password,
+                        cache_bodies=account_config.cache_bodies,
+                    )
+                    scope.add(row)
+                    await scope.flush()
+                    click.echo(f"created account {row.name}")
+                else:
+                    _reconcile(row, account_config, apply_changes=apply_changes)
+                await _reconcile_capabilities(
+                    scope, row, account_config, apply_changes=apply_changes
+                )
+            await scope.commit()
+
+    asyncio.run(go())
     service.close()
 
 
@@ -661,7 +696,7 @@ def _reconcile(row, account_config, *, apply_changes: bool) -> None:  # noqa: AN
             )
 
 
-def _reconcile_capabilities(scope, row, account_config, *, apply_changes: bool) -> None:  # noqa: ANN001
+async def _reconcile_capabilities(scope, row, account_config, *, apply_changes: bool) -> None:  # noqa: ANN001, E501
     """The declared half of the capability rows, which is not all of them.
 
     ``probe`` writes what a server offered into the same table with ``declared`` false, so
@@ -671,7 +706,7 @@ def _reconcile_capabilities(scope, row, account_config, *, apply_changes: bool) 
     wanted = set(account_config.caps)
     held = {
         c.name: c
-        for c in scope.scalars(
+        for c in await scope.all(
             sa.select(m.AccountCapability).where(m.AccountCapability.account_id == row.id)
         )
     }
@@ -715,39 +750,43 @@ def forget_account(ctx: click.Context, name: str) -> None:
             f"{name!r} is still named in the configuration, so `account seed` would put "
             "it back — take it out of the file first"
         )
-    with service.scope(TENANT_ZERO) as scope:
-        row = scope.scalar(sa.select(m.Account).where(m.Account.name == name))
-        if row is None:
-            raise click.ClickException(f"no account named {name!r}")
-        folders = scope.scalar(
-            sa.select(sa.func.count())
-            .select_from(m.Container)
-            .where(m.Container.account_id == row.id)
-        )
-        if folders:
-            raise click.ClickException(
-                f"{name!r} holds {folders} cached folder(s); forgetting it would leave "
-                "them behind, and nothing here removes them yet"
+
+    async def go() -> None:
+        async with service.scope(TENANT_ZERO) as scope:
+            row = await scope.scalar(sa.select(m.Account).where(m.Account.name == name))
+            if row is None:
+                raise click.ClickException(f"no account named {name!r}")
+            folders = await scope.scalar(
+                sa.select(sa.func.count())
+                .select_from(m.Container)
+                .where(m.Container.account_id == row.id)
             )
-        for producer in scope.scalars(
-            sa.select(m.Producer).where(m.Producer.current_account_id == row.id)
-        ):
-            # The preference goes, the producer stays: it is what "who accepted this"
-            # points at.
-            producer.current_account_id = None
-        for link in scope.scalars(
-            sa.select(m.GrantAccount).where(m.GrantAccount.account_id == row.id)
-        ):
-            scope.delete(link)
-        scope.audit(
-            "account_forgotten",
-            actor_kind="person",
-            subject_kind="account",
-            subject_id=row.id,
-            payload={"name": row.name, "host": row.host},
-        )
-        scope.delete(row)
-        scope.commit()
+            if folders:
+                raise click.ClickException(
+                    f"{name!r} holds {folders} cached folder(s); forgetting it would "
+                    "leave them behind, and nothing here removes them yet"
+                )
+            for producer in await scope.all(
+                sa.select(m.Producer).where(m.Producer.current_account_id == row.id)
+            ):
+                # The preference goes, the producer stays: it is what "who accepted this"
+                # points at.
+                producer.current_account_id = None
+            for link in await scope.all(
+                sa.select(m.GrantAccount).where(m.GrantAccount.account_id == row.id)
+            ):
+                await scope.delete(link)
+            await scope.audit(
+                "account_forgotten",
+                actor_kind="person",
+                subject_kind="account",
+                subject_id=row.id,
+                payload={"name": row.name, "host": row.host},
+            )
+            await scope.delete(row)
+            await scope.commit()
+
+    asyncio.run(go())
     click.echo(f"forgot {name}")
 
 

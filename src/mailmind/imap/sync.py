@@ -3,10 +3,15 @@
 The part that matters is not the fetching, it is what happens when identity breaks.  An
 IMAP folder can be recreated; when it is, every UID we remember means something else, and
 everything resting on those UIDs is dead rather than merely out of date.
+
+The orchestration here runs on the event loop; every blocking IMAP call is a dip into a
+thread via :func:`asyncio.to_thread`.  Only plain data crosses that line — never a scope,
+never a session.
 """
 
 from __future__ import annotations
 
+import asyncio
 import datetime as dt
 import hashlib
 from typing import Protocol
@@ -39,17 +44,17 @@ def flags_hash(flags: tuple[str, ...] | str) -> str:
     return hashlib.sha256(" ".join(sorted(flags)).encode()).hexdigest()[:32]
 
 
-def discover_containers(
+async def discover_containers(
     scope: TenantScope, account: m.Account, backend: MailBackend
 ) -> list[m.Container]:
     existing = {
         c.name: c
-        for c in scope.scalars(
+        for c in await scope.all(
             sa.select(m.Container).where(m.Container.account_id == account.id)
         )
     }
     out = []
-    for info in backend.list_containers():
+    for info in await asyncio.to_thread(backend.list_containers):
         container = existing.get(info.name)
         if container is None:
             container = m.Container(account_id=account.id, name=info.name)
@@ -59,7 +64,7 @@ def discover_containers(
         # un-discarded, because somebody has made it again and a cache that insisted
         # otherwise would be lying about a folder the person can see in their client.
         if not container.exists_on_server or container.discarded_at is not None:
-            scope.audit(
+            await scope.audit(
                 "container_adopted",
                 actor_kind="service",
                 subject_kind="container",
@@ -75,7 +80,7 @@ def discover_containers(
         container.special_use = info.special_use
         container.selectable = info.selectable
         out.append(container)
-    scope.flush()
+    await scope.flush()
     return out
 
 
@@ -98,7 +103,7 @@ class SyncProgress(Protocol):
     def messages_absorbed(self, count: int) -> None: ...
 
 
-def sync_container(
+async def sync_container(
     scope: TenantScope,
     account: m.Account,
     container: m.Container,
@@ -107,54 +112,58 @@ def sync_container(
     force_full: bool = False,
     progress: SyncProgress | None = None,
 ) -> SyncReport:
-    selected = backend.select(container.name, readonly=True)
+    selected = await asyncio.to_thread(backend.select, container.name, readonly=True)
 
     identity_broken = (
         container.uidvalidity is not None and selected.uidvalidity != container.uidvalidity
     )
     killed = 0
     if identity_broken:
-        killed = break_identity(scope, container, selected.uidvalidity)
+        killed = await break_identity(scope, container, selected.uidvalidity)
         force_full = True
 
     use_condstore = (
         not force_full
         and container.highestmodseq is not None
         and selected.highestmodseq is not None
-        and "CONDSTORE" in backend.capabilities()
+        and "CONDSTORE" in await asyncio.to_thread(backend.capabilities)
     )
 
     added = updated = 0
 
-    def absorb(infos: list[MessageInfo]) -> None:
+    async def absorb(infos: list[MessageInfo]) -> None:
         nonlocal added, updated
         for info in infos:
-            was_added = _absorb(scope, account, container, info)
+            was_added = await _absorb(scope, account, container, info)
             added += was_added
             updated += not was_added
         if progress is not None:
             progress.messages_absorbed(len(infos))
 
     if use_condstore:
-        changed = backend.fetch_changed_since(container.name, container.highestmodseq)
+        changed = await asyncio.to_thread(
+            backend.fetch_changed_since, container.name, container.highestmodseq
+        )
         full = False
         if progress is not None:
             progress.folder_started(container.name, len(changed))
-        absorb(changed)
+        await absorb(changed)
         present = None
     else:
         full = True
         # Asked for in batches so that progress is something that happens during a long
         # folder rather than after it. The UID list is wanted again below to see what
         # left, so it is fetched once and passed on.
-        present = backend.all_uids(container.name)
+        present = await asyncio.to_thread(backend.all_uids, container.name)
         if progress is not None:
             progress.folder_started(container.name, len(present))
         for start in range(0, len(present), FETCH_BATCH):
             batch = present[start : start + FETCH_BATCH]
-            absorb(backend.fetch_envelopes(container.name, batch))
+            await absorb(
+                await asyncio.to_thread(backend.fetch_envelopes, container.name, batch)
+            )
 
-    vanished = _mark_vanished(scope, container, backend, full=full, present=present)
+    vanished = await _mark_vanished(scope, container, backend, full=full, present=present)
 
     container.uidvalidity = selected.uidvalidity
     container.uidnext = selected.uidnext
@@ -174,7 +183,7 @@ def sync_container(
         suggestions_killed=killed,
         full=full,
     )
-    scope.audit(
+    await scope.audit(
         "container_synced",
         actor_kind="service",
         subject_kind="container",
@@ -184,7 +193,9 @@ def sync_container(
     return report
 
 
-def break_identity(scope: TenantScope, container: m.Container, new_uidvalidity: int) -> int:
+async def break_identity(
+    scope: TenantScope, container: m.Container, new_uidvalidity: int
+) -> int:
     """The folder is not the folder we remember.
 
     Everything cached about it is suspect, so the generation moves on, every placement
@@ -197,7 +208,7 @@ def break_identity(scope: TenantScope, container: m.Container, new_uidvalidity: 
     container.uidvalidity = new_uidvalidity
     container.highestmodseq = None
 
-    scope.execute(
+    await scope.execute(
         sa.update(m.Placement)
         .where(
             m.Placement.container_id == container.id,
@@ -208,13 +219,13 @@ def break_identity(scope: TenantScope, container: m.Container, new_uidvalidity: 
     )
 
     live = (m.SuggestionStatus.proposed, m.SuggestionStatus.accepted)
-    doomed = scope.scalars(
+    doomed = await scope.all(
         sa.select(m.Suggestion).where(
             m.Suggestion.source_container_id == container.id,
             m.Suggestion.premise_container_generation == old_generation,
             m.Suggestion.status.in_(live),
         )
-    ).all()
+    )
     for suggestion in doomed:
         suggestion.status = m.SuggestionStatus.stale
         suggestion.stale_detail = (
@@ -222,7 +233,7 @@ def break_identity(scope: TenantScope, container: m.Container, new_uidvalidity: 
             "the message this referred to can no longer be identified."
         )
 
-    scope.audit(
+    await scope.audit(
         "identity_broken",
         actor_kind="service",
         subject_kind="container",
@@ -236,7 +247,7 @@ def break_identity(scope: TenantScope, container: m.Container, new_uidvalidity: 
     return len(doomed)
 
 
-def _absorb(
+async def _absorb(
     scope: TenantScope, account: m.Account, container: m.Container, info: MessageInfo
 ) -> bool:
     """Fold one FETCH result into the cache.  Returns whether it was new here."""
@@ -245,11 +256,13 @@ def _absorb(
     # body is not a damaged message, and its parts are not knowable from here.
     parsed = parse_message(raw, headers_only=info.raw is None)
     # RFC822.SIZE, because `raw` here is usually the header block alone.
-    message, _ = cache.upsert_message(scope, account.id, parsed, size_bytes=info.size or None)
-    cache.index_message(scope, message)
-    cache.record_mechanical_assessment(scope, message, parsed)
+    message, _ = await cache.upsert_message(
+        scope, account.id, parsed, size_bytes=info.size or None
+    )
+    await cache.index_message(scope, message)
+    await cache.record_mechanical_assessment(scope, message, parsed)
 
-    placement = scope.scalar(
+    placement = await scope.scalar(
         sa.select(m.Placement).where(
             m.Placement.container_id == container.id,
             m.Placement.container_generation == container.generation,
@@ -270,11 +283,11 @@ def _absorb(
     placement.internaldate = info.internaldate
     placement.seen_at = dt.datetime.now(dt.UTC)
     placement.gone_at = None
-    scope.flush()
+    await scope.flush()
     return created
 
 
-def _mark_vanished(
+async def _mark_vanished(
     scope: TenantScope,
     container: m.Container,
     backend: MailBackend,
@@ -291,14 +304,16 @@ def _mark_vanished(
     actually use is how a moved message stays fresh forever, and a suggestion resting on
     it gets applied to a UID that now means something else.
     """
-    present = set(backend.all_uids(container.name) if present is None else present)
-    live = scope.scalars(
+    if present is None:
+        present = await asyncio.to_thread(backend.all_uids, container.name)
+    present = set(present)
+    live = await scope.all(
         sa.select(m.Placement).where(
             m.Placement.container_id == container.id,
             m.Placement.container_generation == container.generation,
             m.Placement.gone_at.is_(None),
         )
-    ).all()
+    )
     now = dt.datetime.now(dt.UTC)
     vanished = 0
     for placement in live:
@@ -308,7 +323,7 @@ def _mark_vanished(
     return vanished
 
 
-def fetch_and_cache_body(
+async def fetch_and_cache_body(
     scope: TenantScope,
     account: m.Account,
     container: m.Container,
@@ -318,16 +333,16 @@ def fetch_and_cache_body(
     budget_bytes: int,
 ) -> str:
     """Pull a body on demand, and recompute the mechanical findings now there is one."""
-    raw = backend.fetch_raw(container.name, placement.uid)
+    raw = await asyncio.to_thread(backend.fetch_raw, container.name, placement.uid)
     parsed = parse_message(raw)
-    message = scope.get(m.Message, placement.message_id)
-    cache.record_mechanical_assessment(scope, message, parsed)
+    message = await scope.get(m.Message, placement.message_id)
+    await cache.record_mechanical_assessment(scope, message, parsed)
     if account.cache_bodies:
-        cache.cache_body(scope, message, parsed)
+        await cache.cache_body(scope, message, parsed)
         # A preview, the attachments, and whether the MIME was actually broken: all three
         # are body questions, and a sync sees headers. Nothing used to answer them
         # afterwards either.
-        cache.refresh_from_body(scope, message, parsed)
-        scope.flush()
-        cache.evict_bodies(scope, budget_bytes)
+        await cache.refresh_from_body(scope, message, parsed)
+        await scope.flush()
+        await cache.evict_bodies(scope, budget_bytes)
     return parsed.body_text

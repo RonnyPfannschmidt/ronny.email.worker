@@ -18,7 +18,7 @@ from mailmind.db import models as m
 from mailmind.db.scope import TenantScope
 
 
-def known_sender(
+async def known_sender(
     scope: TenantScope, account_id: int, address: str, *, before_message_id: int
 ) -> bool:
     """Was an earlier message from this address already cached?
@@ -31,7 +31,7 @@ def known_sender(
     since would quietly delete the finding from under a reviewer.
     """
     return (
-        scope.scalar(
+        await scope.scalar(
             sa.select(sa.func.count())
             .select_from(m.Message)
             .where(
@@ -44,7 +44,7 @@ def known_sender(
     ) > 0
 
 
-def upsert_message(
+async def upsert_message(
     scope: TenantScope,
     account_id: int,
     parsed: ParsedMessage,
@@ -58,7 +58,7 @@ def upsert_message(
     the header block and not the message.
     """
     content_key = parsed.content_key()
-    message = scope.scalar(
+    message = await scope.scalar(
         sa.select(m.Message).where(
             m.Message.account_id == account_id, m.Message.content_key == content_key
         )
@@ -81,7 +81,7 @@ def upsert_message(
     message.preview = parsed.preview
     message.parse_status = m.ParseStatus(parsed.parse_status)
     message.parse_detail = parsed.parse_detail
-    scope.flush()
+    await scope.flush()
 
     if created:
         for role, address, display in parsed.addresses:
@@ -96,18 +96,18 @@ def upsert_message(
     return message, created
 
 
-def index_message(scope: TenantScope, message: m.Message) -> None:
+async def index_message(scope: TenantScope, message: m.Message) -> None:
     """Keep the FTS row in step.
 
     This is the one place raw SQL reaches the database, because FTS5 is not an ORM
     entity.  The tenant therefore travels as a bound parameter rather than through the
     loader criteria, and :func:`search_messages` filters on it explicitly.
     """
-    scope.session.execute(
+    await scope.session.execute(
         sa.text("DELETE FROM message_fts WHERE message_id = :mid AND tenant_id = :tid"),
         {"mid": message.id, "tid": scope.tenant_id},
     )
-    scope.session.execute(
+    await scope.session.execute(
         sa.text(
             "INSERT INTO message_fts (subject, from_text, preview, message_id, "
             "tenant_id, account_id) VALUES (:subject, :from_text, :preview, :mid, "
@@ -124,7 +124,7 @@ def index_message(scope: TenantScope, message: m.Message) -> None:
     )
 
 
-def search_messages(
+async def search_messages(
     scope: TenantScope,
     query: str,
     *,
@@ -142,10 +142,11 @@ def search_messages(
         return []
     params["limit"] = limit
     sql = f"SELECT message_id FROM message_fts WHERE {where} ORDER BY rank LIMIT :limit"
-    return [row[0] for row in scope.session.execute(sa.text(sql), params)]
+    result = await scope.session.execute(sa.text(sql), params)
+    return [row[0] for row in result]
 
 
-def count_search_messages(
+async def count_search_messages(
     scope: TenantScope, query: str, *, account_ids: set[int] | None = None
 ) -> int:
     """How many the search matched, which is not how many it returned.
@@ -157,7 +158,7 @@ def count_search_messages(
     if where is None:
         return 0
     sql = f"SELECT count(*) FROM message_fts WHERE {where}"
-    return int(scope.session.execute(sa.text(sql), params).scalar_one())
+    return int((await scope.session.execute(sa.text(sql), params)).scalar_one())
 
 
 #: The three FTS5 operators a person might reasonably type. Everything else in a query is
@@ -234,7 +235,7 @@ def _search_where(
     return where, params
 
 
-def record_mechanical_assessment(
+async def record_mechanical_assessment(
     scope: TenantScope, message: m.Message, parsed: ParsedMessage
 ) -> m.Assessment:
     """Replace this message's mechanical assessment with one computed from what we now have.
@@ -244,15 +245,15 @@ def record_mechanical_assessment(
     mechanical half, which cannot be argued with — a reviewer never sees an interpretation
     change underneath them.
     """
-    existing = scope.scalars(
+    existing = await scope.all(
         sa.select(m.Assessment).where(
             m.Assessment.subject_kind == m.SubjectKind.message,
             m.Assessment.subject_id == message.id,
             m.Assessment.origin == m.AssessmentOrigin.mechanical,
         )
-    ).all()
+    )
     for old in existing:
-        scope.session.delete(old)
+        await scope.delete(old)
 
     assessment = m.Assessment(
         subject_kind=m.SubjectKind.message,
@@ -260,13 +261,20 @@ def record_mechanical_assessment(
         origin=m.AssessmentOrigin.mechanical,
     )
     scope.add(assessment)
-    scope.flush()
+    await scope.flush()
 
+    # ``mechanical_findings`` takes a sync callback and only ever asks about the sender's
+    # address, so the one answer is fetched up front and the callback closes over it.
+    sender_known = (
+        await known_sender(
+            scope, message.account_id, parsed.from_address, before_message_id=message.id
+        )
+        if parsed.from_address
+        else False
+    )
     findings = mechanical_findings(
         parsed,
-        is_known_sender=lambda address: known_sender(
-            scope, message.account_id, address, before_message_id=message.id
-        ),
+        is_known_sender=lambda address: sender_known,
     )
     for finding in findings:
         scope.add(
@@ -281,8 +289,12 @@ def record_mechanical_assessment(
     return assessment
 
 
-def cache_body(scope: TenantScope, message: m.Message, parsed: ParsedMessage) -> m.MessageBody:
-    body = scope.scalar(sa.select(m.MessageBody).where(m.MessageBody.message_id == message.id))
+async def cache_body(
+    scope: TenantScope, message: m.Message, parsed: ParsedMessage
+) -> m.MessageBody:
+    body = await scope.scalar(
+        sa.select(m.MessageBody).where(m.MessageBody.message_id == message.id)
+    )
     if body is None:
         body = m.MessageBody(message_id=message.id)
         scope.add(body)
@@ -303,7 +315,9 @@ def cache_body(scope: TenantScope, message: m.Message, parsed: ParsedMessage) ->
     return body
 
 
-def refresh_from_body(scope: TenantScope, message: m.Message, parsed: ParsedMessage) -> None:
+async def refresh_from_body(
+    scope: TenantScope, message: m.Message, parsed: ParsedMessage
+) -> None:
     """Re-derive what only a body can settle, now that there is one.
 
     A sync sees headers: no preview, no attachments, and no way to tell a truncated
@@ -314,23 +328,23 @@ def refresh_from_body(scope: TenantScope, message: m.Message, parsed: ParsedMess
     message.parse_status = m.ParseStatus(parsed.parse_status)
     message.parse_detail = parsed.parse_detail
     message.has_attachments = bool(parsed.attachments)
-    index_message(scope, message)
+    await index_message(scope, message)
 
 
-def evict_bodies(scope: TenantScope, budget_bytes: int) -> int:
+async def evict_bodies(scope: TenantScope, budget_bytes: int) -> int:
     """Drop the least recently read bodies until the cache fits.  Returns rows removed."""
-    total = scope.scalar(
+    total = await scope.scalar(
         sa.select(sa.func.coalesce(sa.func.sum(m.MessageBody.bytes_stored), 0))
     )
     removed = 0
     if total <= budget_bytes:
         return 0
-    for body in scope.scalars(
+    for body in await scope.all(
         sa.select(m.MessageBody).order_by(m.MessageBody.last_read_at.asc())
     ):
         if total <= budget_bytes:
             break
         total -= body.bytes_stored
-        scope.session.delete(body)
+        await scope.delete(body)
         removed += 1
     return removed

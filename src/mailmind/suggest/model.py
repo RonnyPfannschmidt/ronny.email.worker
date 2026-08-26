@@ -82,9 +82,9 @@ def validate_container_name(name: str, delimiter: str | None) -> str:
     return name
 
 
-def _account_delimiter(scope: TenantScope, account: m.Account) -> str | None:
+async def _account_delimiter(scope: TenantScope, account: m.Account) -> str | None:
     """The hierarchy separator this account's server uses, as its folders report it."""
-    return scope.scalar(
+    return await scope.scalar(
         sa.select(m.Container.delimiter)
         .where(
             m.Container.account_id == account.id,
@@ -94,7 +94,7 @@ def _account_delimiter(scope: TenantScope, account: m.Account) -> str | None:
     )
 
 
-def resolve_target(
+async def resolve_target(
     scope: TenantScope, account: m.Account, name: str
 ) -> tuple[m.Container, bool]:
     """The container a move should land in, made if it is not there yet.
@@ -107,10 +107,10 @@ def resolve_target(
     Returns the container and whether it is one that does not exist yet, because the
     reviewer has to be told which.
     """
-    delimiter = _account_delimiter(scope, account)
+    delimiter = await _account_delimiter(scope, account)
     validate_container_name(name, delimiter)
 
-    existing = scope.scalar(
+    existing = await scope.scalar(
         sa.select(m.Container).where(
             m.Container.account_id == account.id, m.Container.name == name
         )
@@ -131,7 +131,7 @@ def resolve_target(
         exists_on_server=False,
     )
     scope.add(container)
-    scope.flush()
+    await scope.flush()
     return container, True
 
 
@@ -165,7 +165,7 @@ class Added:
         return {name: count for name, count in counts.items() if count}
 
 
-def resolve_query(
+async def resolve_query(
     scope: TenantScope, *, account: m.Account, query: str, max_size: int
 ) -> tuple[int, list[int]]:
     """Turn a search into the enumerated list a bundle is made of.  Once.
@@ -180,7 +180,7 @@ def resolve_query(
         raise ProposalRefused(
             f"{query!r} has nothing in it to search for, so it names no messages"
         )
-    matched = cache.count_search_messages(scope, query, account_ids={account.id})
+    matched = await cache.count_search_messages(scope, query, account_ids={account.id})
     if not matched:
         raise ProposalRefused(
             f"nothing in {account.name} matches {query!r}, so there is no bundle to review"
@@ -192,7 +192,7 @@ def resolve_query(
             "whole effect can be read"
         )
     # Cannot bite: the count above already refused anything larger.
-    found = cache.search_messages(scope, query, account_ids={account.id}, limit=max_size)
+    found = await cache.search_messages(scope, query, account_ids={account.id}, limit=max_size)
     return matched, found
 
 
@@ -207,7 +207,7 @@ def shown_through(bundle: m.Bundle) -> int:
     return max((s.id for s in bundle.suggestions), default=0)
 
 
-def _add_messages(
+async def _add_messages(
     scope: TenantScope,
     *,
     bundle: m.Bundle,
@@ -223,7 +223,12 @@ def _add_messages(
     part is simply not part of what the query named — and is counted, and said.
     """
     added = Added()
-    here = {s.message_id: s for s in bundle.suggestions if s.message_id is not None}
+    # An explicit query, not the relationship: on a bundle minted this session the
+    # collection is unloaded, and a lazy load on an AsyncSession raises.
+    existing = await scope.all(
+        sa.select(m.Suggestion).where(m.Suggestion.bundle_id == bundle.id)
+    )
+    here = {s.message_id: s for s in existing if s.message_id is not None}
     seen: set[int] = set()
     for message_id in message_ids:
         if message_id in seen:
@@ -240,7 +245,7 @@ def _add_messages(
                 added.excluded_here.append(message_id)
             continue
 
-        placement = _live_placement(scope, account, message_id)
+        placement = await _live_placement(scope, account, message_id)
         if placement is None:
             if assert_each:
                 raise ProposalRefused(
@@ -256,10 +261,11 @@ def _add_messages(
             added.already_in_target.append(message_id)
             continue
 
-        container = scope.get(m.Container, placement.container_id)
-        # Through the relationship rather than the session, so the collection this
-        # function has already read stays in step with what is being written to it.
-        bundle.suggestions.append(
+        container = await scope.get(m.Container, placement.container_id)
+        # By bundle_id rather than through the relationship: appending would first lazy-
+        # load the collection, which raises on an AsyncSession; the callers refresh the
+        # collection once the adding is done.
+        scope.add(
             m.Suggestion(
                 bundle_id=bundle.id,
                 message_id=message_id,
@@ -289,7 +295,7 @@ def _nothing_left_to_do(
     return f"none of the {matched} messages matching {query!r} can take part: {left_out}"
 
 
-def _record_query(
+async def _record_query(
     scope: TenantScope,
     bundle: m.Bundle,
     *,
@@ -307,8 +313,15 @@ def _record_query(
     ``payload`` is plain JSON rather than a mutable-tracked dict, so it is reassigned
     rather than appended to; appending would not be persisted.
     """
-    scope.flush()
-    ours = [s.id for s in bundle.suggestions if s.message_id in set(added.added)]
+    await scope.flush()
+    # By bundle_id, not the relationship: the collection has not been refreshed yet
+    # while the adding is still in flight, and a lazy load raises on an AsyncSession.
+    ours = await scope.all(
+        sa.select(m.Suggestion.id).where(
+            m.Suggestion.bundle_id == bundle.id,
+            m.Suggestion.message_id.in_(set(added.added)),
+        )
+    )
     entry = {
         "text": query,
         #: Whether this search grew a bundle somebody could already have read, as against
@@ -327,7 +340,7 @@ def _record_query(
     }
 
 
-def propose_bundle(
+async def propose_bundle(
     scope: TenantScope,
     *,
     producer: m.Producer,
@@ -391,10 +404,10 @@ def propose_bundle(
 
     target: m.Container | None = None
     if target_container_name is not None:
-        target, _ = resolve_target(scope, account, target_container_name)
+        target, _ = await resolve_target(scope, account, target_container_name)
         target_container_id = target.id
     elif target_container_id is not None:
-        target = scope.get(m.Container, target_container_id)
+        target = await scope.get(m.Container, target_container_id)
         if target is None or target.account_id != account.id:
             raise ProposalRefused("the target container is not part of this account")
         if target.discarded_at is not None:
@@ -406,7 +419,7 @@ def propose_bundle(
     # refuses without leaving an empty bundle behind.
     matched = 0
     if query is not None:
-        matched, message_ids = resolve_query(
+        matched, message_ids = await resolve_query(
             scope, account=account, query=query, max_size=max_size
         )
 
@@ -422,9 +435,12 @@ def propose_bundle(
         expires_at=dt.datetime.now(dt.UTC) + dt.timedelta(days=expiry_days),
     )
     scope.add(bundle)
-    scope.flush()
+    await scope.flush()
+    # A freshly flushed bundle has never loaded its relationships, and touching them
+    # later would emit a sync lazy load from async code.  Load them here, once.
+    await scope.session.refresh(bundle, ["suggestions", "target_container"])
 
-    added = _add_messages(
+    added = await _add_messages(
         scope,
         bundle=bundle,
         account=account,
@@ -434,7 +450,7 @@ def propose_bundle(
     if query is not None:
         if not added.added:
             raise ProposalRefused(_nothing_left_to_do(added, matched, query, target))
-        _record_query(
+        await _record_query(
             scope,
             bundle,
             query=query,
@@ -443,8 +459,8 @@ def propose_bundle(
             added=added,
             grew=False,
         )
-    scope.flush()
-    scope.audit(
+    await scope.flush()
+    await scope.audit(
         "bundle_proposed",
         actor_kind="producer",
         actor_id=producer.id,
@@ -458,10 +474,13 @@ def propose_bundle(
             "query": query,
         },
     )
+    # The items were inserted by bundle_id, which a loaded (or unloaded) collection does
+    # not see; refresh so everything reading this bundle in-session sees what it holds.
+    await scope.session.refresh(bundle, ["suggestions"])
     return bundle
 
 
-def add_to_bundle(
+async def add_to_bundle(
     scope: TenantScope,
     *,
     bundle: m.Bundle,
@@ -481,7 +500,7 @@ def add_to_bundle(
     # `proposed` in the database until somebody draws it.  Adding to that one would keep a
     # bundle a person once trusted alive with its contents replaced; refreshing closes it
     # first, and then the status check below says so.
-    staleness.refresh_bundle(scope, bundle)
+    await staleness.refresh_bundle(scope, bundle)
 
     if bundle.status is not m.BundleStatus.proposed:
         raise ProposalRefused(f"this bundle is {bundle.status.value} and cannot be added to")
@@ -493,13 +512,13 @@ def add_to_bundle(
             "nothing to add to it"
         )
 
-    account = scope.get(m.Account, bundle.account_id)
+    account = await scope.get(m.Account, bundle.account_id)
     if account.health is m.AccountHealth.down:
         raise ProposalRefused(
             f"account {account.name} is not reachable, so nothing can be proposed against it"
         )
 
-    matched, found = resolve_query(scope, account=account, query=query, max_size=max_size)
+    matched, found = await resolve_query(scope, account=account, query=query, max_size=max_size)
     holds = len([s for s in bundle.suggestions if s.message_id is not None])
     arriving = len(set(found) - {s.message_id for s in bundle.suggestions})
     if holds + arriving > max_size:
@@ -508,19 +527,22 @@ def add_to_bundle(
             f"{holds + arriving} is more than the {max_size} a single bundle may hold"
         )
 
-    added = _add_messages(
+    added = await _add_messages(
         scope, bundle=bundle, account=account, message_ids=found, assert_each=False
     )
     if not added.added:
         raise ProposalRefused(f"nothing matching {query!r} is missing from this bundle")
 
-    _record_query(
+    await _record_query(
         scope, bundle, query=query, producer=producer, matched=matched, added=added, grew=True
     )
-    scope.flush()
+    await scope.flush()
+    # Refresh: the new items were inserted by bundle_id and the loaded collection does
+    # not see them, so `items_now` below would otherwise count the bundle before it grew.
+    await scope.session.refresh(bundle, ["suggestions"])
     # `expires_at` is deliberately untouched.  The expiry is how long a proposal is worth
     # keeping for the person; an agent adding to it is not the person doing anything.
-    scope.audit(
+    await scope.audit(
         "bundle_grown",
         actor_kind="producer",
         actor_id=producer.id,
@@ -536,7 +558,7 @@ def add_to_bundle(
     return added
 
 
-def propose_discard(
+async def propose_discard(
     scope: TenantScope,
     *,
     producer: m.Producer,
@@ -576,14 +598,14 @@ def propose_discard(
         if container_id in seen:
             continue
         seen.add(container_id)
-        container = scope.get(m.Container, container_id)
+        container = await scope.get(m.Container, container_id)
         if container is None or container.account_id != account.id:
             raise ProposalRefused(f"folder {container_id} is not part of this account")
         wanted.append(container)
 
     going = {c.name for c in wanted}
     for container in wanted:
-        _refuse_undiscardable(scope, account, container, going)
+        await _refuse_undiscardable(scope, account, container, going)
 
     bundle = m.Bundle(
         account_id=account.id,
@@ -595,7 +617,7 @@ def propose_discard(
         expires_at=dt.datetime.now(dt.UTC) + dt.timedelta(days=expiry_days),
     )
     scope.add(bundle)
-    scope.flush()
+    await scope.flush()
 
     for container in wanted:
         scope.add(
@@ -606,8 +628,10 @@ def propose_discard(
                 premise_message_count=0,
             )
         )
-    scope.flush()
-    scope.audit(
+    await scope.flush()
+    # As in propose_bundle: load the collection now, while async IO is possible.
+    await scope.session.refresh(bundle, ["suggestions"])
+    await scope.audit(
         "bundle_proposed",
         actor_kind="producer",
         actor_id=producer.id,
@@ -621,7 +645,7 @@ def propose_discard(
     return bundle
 
 
-def _refuse_undiscardable(
+async def _refuse_undiscardable(
     scope: TenantScope, account: m.Account, container: m.Container, going: set[str]
 ) -> None:
     """Every reason a folder is not this service's to remove."""
@@ -635,14 +659,14 @@ def _refuse_undiscardable(
             "mail client and this service both rely on being there"
         )
 
-    held = staleness.live_message_count(scope, container)
+    held = await staleness.live_message_count(scope, container)
     if held:
         raise ProposalRefused(
             f"{container.name} holds {held} messages; only a folder holding nothing is "
             "discarded, because that is the only removal that cannot lose mail"
         )
 
-    children = _children_of(scope, account, container)
+    children = await _children_of(scope, account, container)
     outside = sorted(name for name in children if name not in going)
     if outside:
         raise ProposalRefused(
@@ -651,7 +675,9 @@ def _refuse_undiscardable(
         )
 
 
-def _children_of(scope: TenantScope, account: m.Account, container: m.Container) -> list[str]:
+async def _children_of(
+    scope: TenantScope, account: m.Account, container: m.Container
+) -> list[str]:
     """The folders sitting under this one, by name.
 
     Hierarchy in IMAP is a naming convention rather than a structure, so this is a prefix
@@ -661,13 +687,11 @@ def _children_of(scope: TenantScope, account: m.Account, container: m.Container)
     if not container.delimiter:
         return []
     prefix = container.name + container.delimiter
-    return list(
-        scope.scalars(
-            sa.select(m.Container.name).where(
-                m.Container.account_id == account.id,
-                m.Container.discarded_at.is_(None),
-                m.Container.name.startswith(prefix, autoescape=True),
-            )
+    return await scope.all(
+        sa.select(m.Container.name).where(
+            m.Container.account_id == account.id,
+            m.Container.discarded_at.is_(None),
+            m.Container.name.startswith(prefix, autoescape=True),
         )
     )
 
@@ -684,10 +708,10 @@ def _items(bundle: m.Bundle) -> tuple[str, str]:
     return STALE_WORDS.get(bundle.operation, MESSAGE_WORDS)
 
 
-def _live_placement(
+async def _live_placement(
     scope: TenantScope, account: m.Account, message_id: int
 ) -> m.Placement | None:
-    return scope.scalar(
+    return await scope.scalar(
         sa.select(m.Placement)
         .join(m.Container, m.Placement.container_id == m.Container.id)
         .where(
@@ -700,12 +724,12 @@ def _live_placement(
     )
 
 
-def exclude(scope: TenantScope, suggestion: m.Suggestion, reviewer: m.Producer) -> None:
+async def exclude(scope: TenantScope, suggestion: m.Suggestion, reviewer: m.Producer) -> None:
     """Drop one item before accepting the rest.  Re-scoping, not rejecting."""
     if suggestion.status is not m.SuggestionStatus.proposed:
         raise ProposalRefused("only a proposed item can be excluded")
     suggestion.status = m.SuggestionStatus.excluded
-    scope.audit(
+    await scope.audit(
         "suggestion_excluded",
         actor_kind="person",
         actor_id=reviewer.id,
@@ -714,7 +738,7 @@ def exclude(scope: TenantScope, suggestion: m.Suggestion, reviewer: m.Producer) 
     )
 
 
-def _refuse_unless_this_is_the_page_they_read(
+async def _refuse_unless_this_is_the_page_they_read(
     scope: TenantScope, bundle: m.Bundle, reviewer: m.Producer, reviewed_through: int
 ) -> None:
     """The premise of a review: nothing arrived after the page being accepted was drawn."""
@@ -729,7 +753,7 @@ def _refuse_unless_this_is_the_page_they_read(
     arrived = [s for s in bundle.suggestions if s.id > reviewed_through]
     if not arrived:
         return
-    scope.audit(
+    await scope.audit(
         "review_premise_moved",
         actor_kind="person",
         actor_id=reviewer.id,
@@ -747,7 +771,7 @@ def _refuse_unless_this_is_the_page_they_read(
     )
 
 
-def accept(
+async def accept(
     scope: TenantScope,
     bundle: m.Bundle,
     reviewer: m.Producer,
@@ -777,9 +801,9 @@ def accept(
 
     # Before the staleness refresh, so a bundle that both grew and lost something reports
     # the growth first; drawing the page again then shows both.
-    _refuse_unless_this_is_the_page_they_read(scope, bundle, reviewer, reviewed_through)
+    await _refuse_unless_this_is_the_page_they_read(scope, bundle, reviewer, reviewed_through)
 
-    staleness.refresh_bundle(scope, bundle)
+    await staleness.refresh_bundle(scope, bundle)
     if bundle.status is m.BundleStatus.stale:
         # Everything it referred to moved on, so refreshing closed it just now.  Say that,
         # rather than the older "every item has died", which read as a refusal to act on a
@@ -798,7 +822,7 @@ def accept(
             "review what changed and acknowledge it before accepting the rest"
         )
     if stale:
-        scope.audit(
+        await scope.audit(
             "stale_acknowledged",
             actor_kind="person",
             actor_id=reviewer.id,
@@ -817,7 +841,7 @@ def accept(
     bundle.status = m.BundleStatus.accepted
     bundle.decided_at = dt.datetime.now(dt.UTC)
     bundle.decided_by_id = reviewer.id
-    scope.audit(
+    await scope.audit(
         "bundle_accepted",
         actor_kind="person",
         actor_id=reviewer.id,
@@ -828,7 +852,7 @@ def accept(
     return accepted
 
 
-def reject(
+async def reject(
     scope: TenantScope, bundle: m.Bundle, reviewer: m.Producer, reason: str | None = None
 ) -> None:
     if bundle.status is not m.BundleStatus.proposed:
@@ -840,7 +864,7 @@ def reject(
     for suggestion in bundle.suggestions:
         if suggestion.status is m.SuggestionStatus.proposed:
             suggestion.status = m.SuggestionStatus.rejected
-    scope.audit(
+    await scope.audit(
         "bundle_rejected",
         actor_kind="person",
         actor_id=reviewer.id,
@@ -850,7 +874,9 @@ def reject(
     )
 
 
-def withdraw(scope: TenantScope, bundle: m.Bundle, producer: m.Producer, reason: str) -> None:
+async def withdraw(
+    scope: TenantScope, bundle: m.Bundle, producer: m.Producer, reason: str
+) -> None:
     """A producer taking back its own suggestion.  Never somebody else's."""
     if bundle.producer_id != producer.id:
         raise ProposalRefused("a bundle can only be withdrawn by the producer that made it")
@@ -861,7 +887,7 @@ def withdraw(scope: TenantScope, bundle: m.Bundle, producer: m.Producer, reason:
     for suggestion in bundle.suggestions:
         if suggestion.status is m.SuggestionStatus.proposed:
             suggestion.status = m.SuggestionStatus.withdrawn
-    scope.audit(
+    await scope.audit(
         "bundle_withdrawn",
         actor_kind="producer",
         actor_id=producer.id,
@@ -871,20 +897,20 @@ def withdraw(scope: TenantScope, bundle: m.Bundle, producer: m.Producer, reason:
     )
 
 
-def expire_due(scope: TenantScope, now: dt.datetime | None = None) -> int:
+async def expire_due(scope: TenantScope, now: dt.datetime | None = None) -> int:
     """Suggestions nobody gets to expire rather than accumulate forever."""
     now = now or dt.datetime.now(dt.UTC)
-    due = scope.scalars(
+    due = await scope.all(
         sa.select(m.Bundle).where(
             m.Bundle.status == m.BundleStatus.proposed, m.Bundle.expires_at <= now
         )
-    ).all()
+    )
     for bundle in due:
         bundle.status = m.BundleStatus.expired
         for suggestion in bundle.suggestions:
             if suggestion.status is m.SuggestionStatus.proposed:
                 suggestion.status = m.SuggestionStatus.expired
-        scope.audit(
+        await scope.audit(
             "bundle_expired",
             actor_kind="service",
             subject_kind="bundle",
