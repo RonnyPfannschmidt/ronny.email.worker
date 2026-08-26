@@ -778,7 +778,18 @@ def serve(ctx: click.Context, host: str | None, port: int | None) -> None:
     # endpoint builds its DNS-rebinding allow-list from the configured bind address, so
     # a service told to listen elsewhere would refuse the very Host it was serving.
     overrides = {key: value for key, value in (("bind", host), ("port", port)) if value}
-    service = _service(ctx.obj["config_path"], **overrides)
+    service = _service(ctx.obj["config_path"], needs_schema=False, **overrides)
+
+    from mailmind.db.migrate import schema_problem
+
+    problem = schema_problem(service.config.database_url)
+    if problem is not None:
+        # Not a crash: a supervisor restarting into a checkout that moved on would loop
+        # on an exit, and the person's browser would see nothing at all.  Hold the port
+        # with a page that says what to run, watch for the migration, and exit cleanly
+        # once it has happened so a `Restart=always` unit comes back as the real thing.
+        _hold_until_migrated(service, problem)
+        return
     session_key = mint_session_key()
     try:
         app = create_app(service, session_key=session_key)
@@ -811,6 +822,51 @@ def serve(ctx: click.Context, host: str | None, port: int | None) -> None:
     # /mcp gets a 307, which an MCP client is entitled to follow and may not.
     click.echo(f"MCP        {where}/mcp/", err=not a_terminal)
     uvicorn.run(app, host=service.config.bind, port=service.config.port)
+
+
+def _hold_until_migrated(service: Service, problem: str) -> None:
+    """Serve the not-operating page until `mailmindctl migrate` runs, then exit 0."""
+    import uvicorn
+
+    from mailmind.db.migrate import schema_problem
+    from mailmind.web.app import create_unavailable_app
+
+    click.secho(f"not operating: {problem}", fg="red", err=True)
+    click.echo(
+        f"holding http://{service.config.bind}:{service.config.port}/ with that answer; "
+        "this process exits once the migration has run",
+        err=True,
+    )
+    server = uvicorn.Server(
+        uvicorn.Config(
+            create_unavailable_app(problem),
+            host=service.config.bind,
+            port=service.config.port,
+            log_level="warning",
+            access_log=False,
+        )
+    )
+
+    async def hold() -> None:
+        async def watch() -> None:
+            while not server.should_exit:
+                await asyncio.sleep(5)
+                if await asyncio.to_thread(
+                    schema_problem, service.config.database_url
+                ) is None:
+                    server.should_exit = True
+
+        serving = asyncio.create_task(server.serve())
+        watching = asyncio.create_task(watch())
+        await serving
+        watching.cancel()
+        await asyncio.gather(watching, return_exceptions=True)
+
+    try:
+        asyncio.run(hold())
+    except KeyboardInterrupt:  # pragma: no cover - a person stopping it
+        raise SystemExit(130) from None
+    click.echo("the database is current now — exiting so a restart serves for real", err=True)
 
 
 if __name__ == "__main__":

@@ -54,6 +54,19 @@ def head_revision(url: str) -> str | None:
     return ScriptDirectory.from_config(alembic_config(url)).get_current_head()
 
 
+def schema_problem(url: str) -> str | None:
+    """Why this build cannot operate against this database, or None.
+
+    The non-raising shape of :func:`require_current_schema`, for callers that hold the
+    answer up rather than dying of it — the 503 mode, the runner's drift check.
+    """
+    try:
+        require_current_schema(url)
+    except SchemaBehind as exc:
+        return str(exc)
+    return None
+
+
 def require_current_schema(url: str) -> None:
     """Refuse to touch a database this code no longer matches.
 

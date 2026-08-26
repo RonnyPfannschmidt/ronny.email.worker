@@ -2342,3 +2342,19 @@ async def test_progress_reaches_the_page_as_a_turbo_stream(service):
         assert event.startswith("data: <turbo-stream")
         assert f'target="task-{task_id}"' in event
         assert "3/9" in event and "INBOX" in event
+
+
+def test_a_schema_problem_answers_every_surface_with_503_not_tracebacks(client):
+    """What the drift check buys at the page: one honest answer everywhere."""
+    service = client.app.state.task_runner.service
+    service.schema_problem = "this database is at 0006folder and this build needs 0007task"
+    try:
+        page = client.get("/")
+        assert page.status_code == 503
+        assert "0007task" in page.text
+        assert "mailmindctl migrate" in page.text
+        assert client.post("/accounts/choose", data={"account_id": "1"}).status_code == 503
+        assert client.get("/mcp/").status_code == 503, "machine paths say it too"
+    finally:
+        service.schema_problem = None
+    assert client.get("/").status_code == 200, "and it is only about the schema"

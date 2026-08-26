@@ -87,6 +87,38 @@ async def chosen_account(scope) -> m.Account | None:  # noqa: ANN001
     return await scope.scalar(sa.select(m.Account).order_by(m.Account.name))
 
 
+def unavailable_page(reason: str) -> HTMLResponse:
+    """What every request gets while the database and the code disagree.
+
+    Served without the session key on purpose: it holds no mail, only the fact that the
+    service cannot operate and the command that fixes it — and it has to be reachable to
+    say so, which is the whole point of not simply crashing.
+    """
+    return HTMLResponse(
+        "<h1>Not operating</h1><p>" + reason + "</p><p>Nothing has been touched. "
+        "Run <code>mailmindctl migrate</code> (with the service stopped, if one is "
+        "running) and start this again.</p>",
+        status_code=503,
+    )
+
+
+def create_unavailable_app(reason: str) -> FastAPI:
+    """The app `serve` binds when the schema is behind: one answer, every path.
+
+    No database, no runner, no MCP — a supervisor restarting into a behind checkout gets
+    a stable page that explains itself instead of a crash loop nobody can see.
+    """
+    app = FastAPI(title="mailmind (not operating)")
+
+    @app.api_route(
+        "/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH", "HEAD"]
+    )
+    async def everything(path: str):  # noqa: ANN202, ARG001
+        return unavailable_page(reason)
+
+    return app
+
+
 def csrf_token(session_key: str) -> str:
     """The per-session CSRF token, derived from the key so there is nothing new to store."""
     return hmac.new(session_key.encode(), b"csrf", hashlib.sha256).hexdigest()
@@ -425,6 +457,11 @@ def create_app(
 
     @app.middleware("http")
     async def security_headers(request: Request, call_next):  # noqa: ANN001, ANN202
+        if service.schema_problem is not None:
+            # The database moved under a live process.  Outermost, so every surface —
+            # machine paths, POSTs, all of it — says so, instead of tracebacks from
+            # queries the schema no longer matches.
+            return unavailable_page(service.schema_problem)
         response = await call_next(request)
         if not is_machine_path(request.url.path):
             response.headers["Content-Security-Policy"] = CSP

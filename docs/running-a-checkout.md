@@ -3,10 +3,26 @@
 For the latest rather than the last install, or because you are changing the code. Every
 shape here runs what is in the checkout, so `git pull` is the upgrade.
 
-`git pull` on a checkout that a service is running from changes the code under it. When
-the change includes a migration, every command except `migrate` refuses until the
-database catches up, and says so — which is better than the `no such column` traceback that
-taught us to add the check.
+`git pull` on a checkout that a service is running from changes the code under it. The
+running process is unaffected — its code is already loaded — and nothing here ever
+migrates on its own. What happens around a restart:
+
+- **`mailmindctl serve` started against a database that is behind** does not crash: it
+  holds the port with a 503 page naming both revisions and `mailmindctl migrate`, and
+  exits cleanly once the migration has run. Under `Restart=always` (systemd, podman)
+  that means a restart into a moved-on checkout shows a page saying what to do instead
+  of a crash loop nobody can see, and comes back as the real service by itself after
+  you migrate.
+- **A migration run while a service is live** is noticed within a minute: the service
+  stops working the queue and answers every request 503 with what happened, until it is
+  restarted. Still: stop the service first when you can.
+- **Every other command** refuses until the database catches up, and says so — which is
+  better than the `no such column` traceback that taught us to add the check.
+
+Restarting on code change stays the supervisor's job — `systemctl restart` after a
+pull, a systemd path unit, or `watchfiles 'uv run mailmindctl serve' src/` for a dev
+loop. mailmind's part is that no restart ever lands you in a crash loop or a quiet
+mismatch.
 
 **One-off, installing nothing:**
 

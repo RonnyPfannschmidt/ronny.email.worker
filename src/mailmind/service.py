@@ -70,6 +70,10 @@ class Service:
         self._registry_lock = threading.Lock()
         #: Set by the task runner at startup; a no-op until one is running.
         self.notify_tasks: Callable[[], None] = lambda: None
+        #: Why the service cannot operate, when it cannot — the runner's drift check
+        #: sets it if the database is migrated under a live process, and every request
+        #: then answers 503 with this text instead of a traceback from inside a sync.
+        self.schema_problem: str | None = None
 
     @asynccontextmanager
     async def scope(self, tenant_id: int = TENANT_ZERO) -> AsyncIterator[TenantScope]:

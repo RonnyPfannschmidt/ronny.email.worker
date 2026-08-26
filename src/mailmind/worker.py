@@ -20,6 +20,7 @@ import sqlalchemy as sa
 
 from mailmind import tasks, views
 from mailmind.db import models as m
+from mailmind.db.migrate import schema_problem
 from mailmind.imap import apply as applier
 from mailmind.imap import sync
 from mailmind.imap.backend import TRASH, MailboxUnhealthy
@@ -163,14 +164,28 @@ class TaskRunner:
             self._wakeup.set()
 
     async def _tick_if_due(self) -> None:
-        """Expiry and the staleness sweep, off the request path.
+        """Housekeeping, off the request path — and the schema drift check first.
 
-        These used to run in the queue GET, which made every page load a writer.
+        Expiry and the staleness sweep used to run in the queue GET, which made every
+        page load a writer.  The drift check catches a database migrated under a live
+        process: rather than `no such column` from inside a sync, every request starts
+        answering 503 with what happened, the dispatcher stops claiming, and a restart
+        is the way back.
         """
         now = asyncio.get_running_loop().time()
         if now - self._last_tick < self.tick_interval:
             return
         self._last_tick = now
+        problem = await asyncio.to_thread(
+            schema_problem, self.service.config.database_url
+        )
+        if problem is not None:
+            self.service.schema_problem = (
+                problem + " — the database changed under this running service; "
+                "restart it once the migration is done"
+            )
+            self._stopping.set()
+            return
         async with self.service.scope() as scope:
             await suggest.expire_due(scope)
             await staleness.sweep_queue(scope, None)

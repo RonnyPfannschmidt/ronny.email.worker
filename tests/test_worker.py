@@ -6,6 +6,8 @@ sleeping dispatcher, so nothing here waits on a clock.
 
 from __future__ import annotations
 
+import asyncio
+
 import pytest
 import sqlalchemy as sa
 
@@ -276,3 +278,21 @@ async def test_the_runner_dispatches_for_real_and_stops_cleanly(service, backend
         await runner.stop()
 
     assert len(backend.folders["Archive"].messages) == 1
+
+
+async def test_a_database_migrated_under_a_live_service_flips_it_to_not_operating(
+    service, backend
+):
+    """The drift check: rather than `no such column` from inside a sync, every request
+    starts answering 503 and the dispatcher stops claiming."""
+    from mailmind.db.migrate import downgrade_to
+
+    runner = worker.TaskRunner(service)
+    await asyncio.to_thread(downgrade_to, service.config.database_url, "0006folder")
+
+    await runner._tick_if_due()
+
+    assert service.schema_problem is not None
+    assert "0007task" in service.schema_problem
+    assert "restart" in service.schema_problem
+    assert runner._stopping.is_set(), "the dispatcher must stop claiming"
