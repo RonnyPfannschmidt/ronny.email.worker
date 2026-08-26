@@ -8,6 +8,7 @@ routes never consult a grant.
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import datetime as dt
 import hashlib
@@ -38,6 +39,7 @@ from mailmind.mcp import server as mcp_server
 from mailmind.service import Service
 from mailmind.suggest import model as suggest
 from mailmind.suggest import staleness
+from mailmind.worker import TaskRunner
 
 TEMPLATES = Jinja2Templates(directory=str(Path(__file__).parent / "templates"))
 
@@ -286,8 +288,27 @@ def create_app(
 
     changes = [Depends(csrf_required)]
 
+    #: One lifespan for both shapes: the task runner always, the MCP session manager
+    #: when the endpoint is mounted.  `mailmindctl mcp --serve` builds with
+    #: `with_mcp=False` and its embedded uvicorn runs this lifespan too, so background
+    #: work runs wherever a review UI does.
+    def lifespan_with(mcp_session_manager):  # noqa: ANN001, ANN202
+        @contextlib.asynccontextmanager
+        async def lifespan(the_app):  # noqa: ANN001, ANN202
+            runner = TaskRunner(service)
+            async with contextlib.AsyncExitStack() as stack:
+                if mcp_session_manager is not None:
+                    await stack.enter_async_context(mcp_session_manager.run())
+                tg = await stack.enter_async_context(asyncio.TaskGroup())
+                await runner.start(tg)
+                stack.push_async_callback(runner.stop)
+                the_app.state.task_runner = runner
+                yield
+
+        return lifespan
+
     if not with_mcp:
-        app = FastAPI(title="mailmind")
+        app = FastAPI(title="mailmind", lifespan=lifespan_with(None))
     else:
         public_url = oauth_issuer(service.config)
         mcp = mcp_server.build_server(service, public_url=public_url)
@@ -309,7 +330,7 @@ def create_app(
                 allowed_origins=origins,
             ),
         )
-        app = FastAPI(title="mailmind", lifespan=lambda _app: mcp.session_manager.run())
+        app = FastAPI(title="mailmind", lifespan=lifespan_with(mcp.session_manager))
         app.mount("/mcp", mcp_app if public_url else GrantMiddleware(mcp_app, service))
 
         # The SDK builds these routes too, but inside the app just mounted — so they would

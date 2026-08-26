@@ -291,11 +291,12 @@ async def _apply_one(
             target_name=target.name if target is not None else None,
             trash_name=trash_container.name if trash_container is not None else None,
         )
-    except MailboxUnhealthy as exc:
-        suggestion.status = m.SuggestionStatus.failed
-        return await _record(
-            scope, suggestion, precondition, precondition, m.ApplyOutcome.failed, str(exc)
-        )
+    except MailboxUnhealthy:
+        # The mailbox went away, which says nothing about this item.  Let it escape:
+        # the caller records the failure, everything already committed stays, this item
+        # and the rest stay accepted, and a retry picks up exactly here.  (Turning it
+        # into a failed *item* predates there being any way to retry.)
+        raise
 
     guarantee = m.Precondition(result.guarantee)
     if not result.changed:

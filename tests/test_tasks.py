@@ -41,18 +41,12 @@ async def test_asking_twice_is_the_same_ask(scope, world):
 
 async def test_claiming_is_fifo_and_respects_busy_lanes(scope, world):
     account = world["account"]
-    other = scope.add(
-        m.Account(name="other", host="h2", username="u2", password_url="env://Y")
-    )
+    other = scope.add(m.Account(name="other", host="h2", username="u2", password_url="env://Y"))
     await scope.flush()
 
     first, _ = await _sync_task(scope, world)
-    second, _ = await _sync_task(
-        scope, world, kind=m.TaskKind.apply_bundle, subject_id=999
-    )
-    elsewhere, _ = await _sync_task(
-        scope, world, account_id=other.id, subject_id=other.id
-    )
+    second, _ = await _sync_task(scope, world, kind=m.TaskKind.apply_bundle, subject_id=999)
+    elsewhere, _ = await _sync_task(scope, world, account_id=other.id, subject_id=other.id)
 
     claimed = await tasks.claim_next(scope, busy_accounts=set())
     assert claimed.id == first.id, "oldest first"
@@ -101,9 +95,7 @@ async def test_interrupted_work_requeues_and_stranded_bundles_get_a_task(scope, 
 
     # Rescuing again finds nothing stranded — the bundle has its task now.
     assert await tasks.rescue_accepted_bundles(scope) == 0
-    applies = await scope.all(
-        sa.select(m.Task).where(m.Task.kind == m.TaskKind.apply_bundle)
-    )
+    applies = await scope.all(sa.select(m.Task).where(m.Task.kind == m.TaskKind.apply_bundle))
     assert len(applies) == 1
 
 
