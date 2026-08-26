@@ -27,12 +27,27 @@ over an enumerated list of messages, with the summary and reason its producer wr
 ## A bundle
 
 The page shows the whole effect before anything happens — every message, where it is now,
-where it would go. Operations are `move`, `add_flag`, `remove_flag` and `delete`; delete
-moves to Trash, and nothing expunges, because mail has no undo.
+where it would go. Operations are `move`, `add_flag`, `remove_flag`, `delete` and
+`discard_container`; delete moves to Trash, and nothing expunges, because mail has no undo.
 
 You can accept, reject with a reason, exclude a single item that does not belong and accept
 the rest, or load a body for a message whose subject is not enough to decide on. An agent
 can withdraw its own bundle until somebody decides.
+
+## Bundles about folders
+
+A move can name a folder that does not exist yet. The page says so — *new folder, will be
+created* — and nothing has been made while it sits in the queue: accepting the move is what
+makes the folder, immediately before the first message goes into it. If it cannot be made,
+nothing moves and the bundle is still there to accept again.
+
+A `discard_container` bundle lists folders where the messages usually are, with what each
+holds and what sits under it. Only empty ones are ever offered, because an empty folder is
+the only thing here whose removal cannot lose mail — and each one is looked at again on the
+server just before it goes, so a folder that has since had mail arrive in it is left alone
+and says why. A whole branch can go in one bundle as long as the bundle holds every folder
+in it; they are removed deepest first. INBOX and the special folders — Sent, Drafts, Trash,
+Junk, Archive — are refused.
 
 Size is not what makes a bundle unreviewable — homogeneity is. A hundred messages moving to
 Archive is one decision shown a hundred times; a hundred messages each doing their own thing

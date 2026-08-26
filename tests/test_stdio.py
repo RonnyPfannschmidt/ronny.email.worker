@@ -152,7 +152,7 @@ def test_stdio_says_where_the_review_is_without_becoming_it(workspace):
         expected = f"http://127.0.0.1:{workspace['port']}/"
         assert expected in instructions, "the model was never told where to send anybody"
 
-        assert len(client.rpc("tools/list")["result"]["tools"]) == 12
+        assert len(client.rpc("tools/list")["result"]["tools"]) == 13
 
         proposed = client.call(
             "propose_bundle",
@@ -246,7 +246,7 @@ def test_serve_brings_the_review_ui_up_for_the_life_of_the_session(workspace):
 
         # Ask for one more response after the web server has handled requests, so the read
         # happens where anything it wrote would be sitting in the pipe ahead of the answer.
-        assert len(client.rpc("tools/list")["result"]["tools"]) == 12
+        assert len(client.rpc("tools/list")["result"]["tools"]) == 13
     finally:
         stderr = client.close()
 

@@ -269,6 +269,44 @@ class ImapBackend:
             return StoreResult(False, "best_effort", str(exc))
         return StoreResult(True, "best_effort")
 
+    def create_container(self, name: str) -> ContainerInfo:
+        try:
+            self._client.create_folder(name)
+        except IMAPClientError as exc:
+            # A server that already has it says NO, and says so in its own words — every
+            # server differently.  Rather than pattern-match prose, ask what is there: if
+            # the folder exists now, the call did its job whoever made it.
+            existing = self._find(name)
+            if existing is None:
+                raise MailboxUnhealthy(f"cannot create {name!r}: {exc}") from exc
+            return existing
+        try:
+            # A folder nothing is subscribed to is invisible in clients that honour
+            # subscriptions, which would make an accepted move look like it did nothing.
+            self._client.subscribe_folder(name)
+        except IMAPClientError:
+            # Subscription is a convenience, and a server that has no opinion about it
+            # has still made the folder.
+            pass
+        found = self._find(name)
+        if found is None:
+            raise MailboxUnhealthy(
+                f"the server accepted CREATE {name!r} and then did not list the folder"
+            )
+        return found
+
+    def delete_container(self, name: str) -> None:
+        try:
+            self._client.unsubscribe_folder(name)
+        except IMAPClientError:
+            pass
+        try:
+            self._client.delete_folder(name)
+        except IMAPClientError as exc:
+            raise MailboxUnhealthy(f"cannot delete {name!r}: {exc}") from exc
+        if self._selected == name:
+            self._selected = None
+
     def close(self) -> None:
         try:
             self._client.logout()
@@ -276,6 +314,19 @@ class ImapBackend:
             pass
 
     # ------------------------------------------------------------------ helpers
+
+    def _find(self, name: str) -> ContainerInfo | None:
+        """What the server lists under this name, if anything.
+
+        Asked after a CREATE rather than trusted from the name that was sent, because a
+        server may normalise it — a hierarchy separator that is not the one we used, a
+        namespace prefix it insists on — and the row should record the folder that exists
+        rather than the string we hoped for.
+        """
+        for info in self.list_containers():
+            if info.name == name:
+                return info
+        return None
 
     def _ensure_selected(self, container: str, *, readonly: bool = True) -> None:
         if self._selected != container or (self._readonly and not readonly):

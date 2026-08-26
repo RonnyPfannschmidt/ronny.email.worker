@@ -54,6 +54,23 @@ def discover_containers(
         if container is None:
             container = m.Container(account_id=account.id, name=info.name)
             scope.add(container)
+        # The server is listing it, so it is there — whoever put it there.  A row that
+        # said "proposed" is adopted rather than duplicated, and one we had discarded is
+        # un-discarded, because somebody has made it again and a cache that insisted
+        # otherwise would be lying about a folder the person can see in their client.
+        if not container.exists_on_server or container.discarded_at is not None:
+            scope.audit(
+                "container_adopted",
+                actor_kind="service",
+                subject_kind="container",
+                subject_id=container.id,
+                payload={
+                    "name": info.name,
+                    "was": "discarded" if container.discarded_at else "proposed",
+                },
+            )
+        container.exists_on_server = True
+        container.discarded_at = None
         container.delimiter = info.delimiter
         container.special_use = info.special_use
         container.selectable = info.selectable

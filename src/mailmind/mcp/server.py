@@ -320,6 +320,11 @@ def build_server(
 
         with scope() as s:
             container = _container(s, grant, container_id)
+            if not container.exists_on_server:
+                raise suggest.ProposalRefused(
+                    f"{container.name} is a folder some bundle has proposed and nobody "
+                    "has accepted yet, so there is nothing on the server to sync with"
+                )
             account = s.get(m.Account, container.account_id)
             with service.backend(account) as backend:
                 report = sync.sync_container(s, account, container, backend)
@@ -343,6 +348,7 @@ def build_server(
         summary: str,
         reason: str,
         target_container_id: int | None = None,
+        target_container_name: str | None = None,
         flag: str | None = None,
     ) -> dict:
         """Propose one change over a set of messages, for a person to review.
@@ -350,6 +356,12 @@ def build_server(
         ``operation`` is move, add_flag, remove_flag or delete. A bundle is homogeneous on
         purpose: it is what a person accepts or rejects as a unit, so its whole effect has
         to be readable at once. Delete moves to Trash; nothing here expunges.
+
+        A move may land somewhere that does not exist yet: give ``target_container_name``
+        instead of ``target_container_id`` and the folder is part of what is proposed. It
+        is not created now. The reviewer is shown that it would be made, and it is made
+        only if they accept — so accepting the move is what authorises the folder. Give
+        one or the other, never both.
 
         The premise of each item — where the message is and what state it is in — is
         recorded now and checked again before anything happens. If the mailbox moves on,
@@ -369,12 +381,59 @@ def build_server(
                     summary=summary,
                     reason=reason,
                     target_container_id=target_container_id,
+                    target_container_name=target_container_name,
                     flag=flag,
                     expiry_days=service.config.limits.bundle_expiry_days,
                     max_size=service.config.limits.max_bundle_size,
                 )
             except ValueError as exc:
                 raise suggest.ProposalRefused(f"unknown operation {operation!r}") from exc
+            s.commit()
+            return {
+                "bundle_id": bundle.id,
+                "status": bundle.status.value,
+                "items": len(bundle.suggestions),
+                "resource": f"mailmind://bundle/{bundle.id}",
+                "note": (
+                    "Awaiting review. Nothing has changed in the mailbox."
+                    + (f" Review it at {review_url}bundle/{bundle.id}" if review_url else "")
+                ),
+            }
+
+    @server.tool()
+    def propose_discard(
+        account_id: int,
+        container_ids: list[int],
+        summary: str,
+        reason: str,
+    ) -> dict:
+        """Propose getting rid of folders that hold nothing, for a person to review.
+
+        Only empty ones. A folder holding no mail is the one removal here that cannot lose
+        any, which is the whole reason this exists at all — and emptiness is checked now,
+        and again against the server immediately before each folder goes.
+
+        A folder with folders under it can go too, as long as this bundle also removes
+        every one of them: they are deleted deepest first, so the parent has become a leaf
+        by the time its turn comes. INBOX and the account's special folders — Sent,
+        Drafts, Trash, Junk, Archive — are refused.
+
+        Like every proposal here, this changes nothing. It goes into the review queue.
+        """
+        grant = _require(m.Capability.suggest)
+        with scope() as s:
+            account = _account(s, grant, account_id)
+            producer = s.get(m.Producer, grant["producer_id"])
+            bundle = suggest.propose_discard(
+                s,
+                producer=producer,
+                account=account,
+                container_ids=container_ids,
+                summary=summary,
+                reason=reason,
+                expiry_days=service.config.limits.bundle_expiry_days,
+                max_size=service.config.limits.max_bundle_size,
+            )
             s.commit()
             return {
                 "bundle_id": bundle.id,
@@ -619,6 +678,9 @@ def build_server(
                     "container_generation": suggestion.premise_container_generation,
                     "uid": suggestion.premise_uid,
                     "modseq": suggestion.premise_modseq,
+                    # Null on a message item and set on a folder one: what a discard rests
+                    # on is that the folder held nothing.
+                    "message_count": suggestion.premise_message_count,
                 },
             }
 

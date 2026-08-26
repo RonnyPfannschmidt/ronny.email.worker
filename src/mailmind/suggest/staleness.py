@@ -34,6 +34,9 @@ def check(scope: TenantScope, suggestion: m.Suggestion) -> Freshness:
     if container is None:
         return Freshness(False, "the folder this referred to is no longer known")
 
+    if suggestion.message_id is None:
+        return _check_container(scope, container, suggestion)
+
     if container.generation != suggestion.premise_container_generation:
         return Freshness(
             False,
@@ -70,6 +73,59 @@ def check(scope: TenantScope, suggestion: m.Suggestion) -> Freshness:
             f"(now: {placement.flags or 'none'})",
         )
     return FRESH
+
+
+def _check_container(
+    scope: TenantScope, container: m.Container, suggestion: m.Suggestion
+) -> Freshness:
+    """Is the folder still one there is any point discarding?
+
+    The premise a discard rests on is that the folder holds nothing.  Mail arriving in it
+    is exactly the change a person would want to hear about before the folder went away
+    with it — and it is the ordinary case, because a folder that looks abandoned is
+    precisely the kind a forgotten filter still delivers into.
+    """
+    if container.discarded_at is not None:
+        return Freshness(False, f"{container.name} is already gone")
+
+    if container.generation != suggestion.premise_container_generation:
+        # Deleted and remade under the same name while this waited.  Somebody wanted it,
+        # and it is not the folder that was proposed for removal.
+        return Freshness(
+            False,
+            f"{container.name} was recreated since this was proposed, so it is not the "
+            "folder this offered to remove",
+        )
+
+    held = live_message_count(scope, container)
+    if held:
+        return Freshness(
+            False,
+            f"{container.name} is no longer empty — {held} messages arrived in it after "
+            "this was proposed",
+        )
+    return FRESH
+
+
+def live_message_count(scope: TenantScope, container: m.Container) -> int:
+    """How much the cache believes this folder holds.
+
+    The cache, not the server: this is a premise, and a premise is what was believed when
+    the proposal was made.  The server is asked again at the moment of applying, which is
+    the check that actually protects anything.
+    """
+    return (
+        scope.scalar(
+            sa.select(sa.func.count())
+            .select_from(m.Placement)
+            .where(
+                m.Placement.container_id == container.id,
+                m.Placement.container_generation == container.generation,
+                m.Placement.gone_at.is_(None),
+            )
+        )
+        or 0
+    )
 
 
 def refresh_bundle(scope: TenantScope, bundle: m.Bundle) -> dict[int, Freshness]:

@@ -6,6 +6,11 @@ cannot reach here.  No row of 02's table has two of the three.
 
 Each operation declares how strong a guarantee it needs, and records what it actually
 got.  Those differ for MOVE, and the difference is reported rather than glossed over.
+
+Two of the operations here are about folders rather than mail: a move may have to make the
+folder it lands in, and a discard removes one that holds nothing.  Both go through review
+like everything else — this module is still reached only from the review flow, and there
+is still no way to it from the agent surface.
 """
 
 from __future__ import annotations
@@ -16,7 +21,7 @@ import sqlalchemy as sa
 
 from mailmind.db import models as m
 from mailmind.db.scope import TenantScope
-from mailmind.imap.backend import MailBackend, MailboxUnhealthy
+from mailmind.imap.backend import IdentityLost, MailBackend, MailboxUnhealthy, StoreResult
 from mailmind.imap.sync import flags_hash
 from mailmind.suggest import staleness
 
@@ -27,6 +32,9 @@ PRECONDITION = {
     m.Operation.remove_flag: m.Precondition.conditional,
     m.Operation.delete: m.Precondition.conditional,
     m.Operation.move: m.Precondition.best_effort,
+    # DELETE has no UNCHANGEDSINCE either.  The folder is looked at immediately before it
+    # goes, which is a narrower window and not a promise, and is reported as what it is.
+    m.Operation.discard_container: m.Precondition.best_effort,
 }
 
 
@@ -51,10 +59,15 @@ def apply_bundle(
             "suggestions are not applied against an account that is not healthy"
         )
 
+    ordered = _in_order(scope, bundle)
+    if ordered:
+        # Only once there is something to put in it.  A bundle whose every item died
+        # between acceptance and here should leave no trace, and a folder nothing was
+        # ever moved into is a trace.
+        _ensure_target_exists(scope, bundle, backend)
+
     attempts = []
-    for suggestion in bundle.suggestions:
-        if suggestion.status is not m.SuggestionStatus.accepted:
-            continue
+    for suggestion in ordered:
         attempts.append(
             _apply_one(scope, bundle, suggestion, backend, trash_container=trash_container)
         )
@@ -81,6 +94,73 @@ def apply_bundle(
         payload={"applied": applied, "attempted": len(attempts)},
     )
     return attempts
+
+
+def _in_order(scope: TenantScope, bundle: m.Bundle) -> list[m.Suggestion]:
+    """The accepted items, in the order they have to happen.
+
+    For everything but a discard the order is immaterial and this is the list as it
+    stands.  Discarding is different, because a bundle may hold a parent as long as it
+    also holds every child, and what a server does when asked to remove a folder that
+    still has folders under it is not settled — RFC 3501 lets it refuse, and lets it drop
+    the name and leave the children orphaned under it.  Both happen; Dovecot does the
+    second.
+
+    Deepest first sidesteps the question.  By the time the parent's turn comes, the
+    children that made it a parent are gone, and the two kinds of server behave the same.
+    """
+    accepted = [s for s in bundle.suggestions if s.status is m.SuggestionStatus.accepted]
+    if bundle.operation not in m.CONTAINER_OPERATIONS:
+        return accepted
+
+    def depth(suggestion: m.Suggestion) -> tuple[int, str]:
+        container = scope.get(m.Container, suggestion.source_container_id)
+        delimiter = container.delimiter
+        levels = container.name.count(delimiter) if delimiter else 0
+        return (-levels, container.name)
+
+    return sorted(accepted, key=depth)
+
+
+def _ensure_target_exists(scope: TenantScope, bundle: m.Bundle, backend: MailBackend) -> None:
+    """Make the folder the bundle is about to move mail into, if it is not there yet.
+
+    This is the moment the person's acceptance turns into a folder.  Nothing before it
+    asked the server for anything: the target has been a row saying "proposed" since the
+    bundle was made, precisely so that what the reviewer read and what happens here are
+    the same folder.
+
+    A refusal stops the whole bundle before a single message moves.  There is nowhere to
+    put them, and a half-applied bundle whose other half had nowhere to go is worse than
+    one that did nothing and said so.
+    """
+    target = bundle.target_container
+    if target is None or target.exists_on_server:
+        return
+
+    try:
+        info = backend.create_container(target.name)
+    except MailboxUnhealthy as exc:
+        raise NotApplicable(
+            f"the folder {target.name} could not be created: {exc}. Nothing was done to "
+            "the mailbox, and this bundle can be accepted again once that is sorted out."
+        ) from exc
+
+    # What the server made, not what was asked for: a server may normalise the name or
+    # impose its own separator, and the row should describe the folder that exists.
+    target.name = info.name
+    target.delimiter = info.delimiter
+    target.special_use = info.special_use
+    target.selectable = info.selectable
+    target.exists_on_server = True
+    target.discarded_at = None
+    scope.audit(
+        "container_created",
+        actor_kind="service",
+        subject_kind="container",
+        subject_id=target.id,
+        payload={"name": target.name, "bundle_id": bundle.id},
+    )
 
 
 def _apply_one(
@@ -110,7 +190,7 @@ def _apply_one(
 
     source = scope.get(m.Container, suggestion.source_container_id)
 
-    if suggestion.premise_modseq is None:
+    if suggestion.message_id is not None and suggestion.premise_modseq is None:
         # Without CONDSTORE the premise is only a flag fingerprint, and the cache it was
         # checked against may be older than the mailbox.  Looking at the server directly
         # narrows the window; it does not close it, which is why the guarantee reported
@@ -194,6 +274,8 @@ def _perform(bundle, suggestion, backend, source, trash_container):  # noqa: ANN
             target.name,
             expected_modseq=suggestion.premise_modseq,
         )
+    if bundle.operation is m.Operation.discard_container:
+        return _discard(backend, source)
     if bundle.operation is m.Operation.delete:
         # Deleting is moving to Trash, and nothing more: no \Deleted, no expunge.  01
         # says mail has no undo, and this is the one place that could prove it.
@@ -209,8 +291,64 @@ def _perform(bundle, suggestion, backend, source, trash_container):  # noqa: ANN
     raise NotApplicable(f"unsupported operation {bundle.operation}")
 
 
+def _discard(backend: MailBackend, container: m.Container) -> StoreResult:
+    """Remove a folder, having just made sure there is nothing in it.
+
+    This is the second check for a discard, and it goes to the server.  The first one
+    asked the cache, which can be older than the mailbox — and the gap between them is
+    exactly where a forgotten filter drops mail into a folder that looked abandoned.
+    """
+    if not container.exists_on_server:
+        # Proposed and never made: the bundle that would have created it was never
+        # accepted, or this is the same bundle undoing its own idea.  Nothing to ask the
+        # server for, and the folder is gone in the only sense it ever existed.
+        return StoreResult(True, "best_effort", "the folder had never been made")
+
+    try:
+        selected = backend.select(container.name, readonly=True)
+    except IdentityLost:
+        return StoreResult(
+            False, "best_effort", f"{container.name} is already gone from the server"
+        )
+
+    if selected.message_count:
+        return StoreResult(
+            False,
+            "best_effort",
+            f"{container.name} now holds {selected.message_count} messages, so it is no "
+            "longer a folder whose removal cannot lose mail",
+        )
+
+    # Asked again per folder rather than once per bundle, because the deletions in this
+    # bundle are themselves changing the answer as they land.
+    children = sorted(
+        info.name
+        for info in backend.list_containers()
+        if container.delimiter and info.name.startswith(container.name + container.delimiter)
+    )
+    if children:
+        return StoreResult(
+            False,
+            "best_effort",
+            f"{container.name} still has folders under it: {', '.join(children)}",
+        )
+
+    backend.delete_container(container.name)
+    return StoreResult(True, "best_effort")
+
+
 def _update_cache(scope: TenantScope, bundle, suggestion, resulting_uid) -> None:  # noqa: ANN001
     """Reflect what we just did, so the next staleness check does not see our own change."""
+    if bundle.operation is m.Operation.discard_container:
+        container = scope.get(m.Container, suggestion.source_container_id)
+        # Marked, not deleted: this suggestion still points at the row, and so may older
+        # placements.  A reviewer reading what happened deserves a folder with a date on
+        # it rather than a dangling id.
+        container.discarded_at = dt.datetime.now(dt.UTC)
+        container.exists_on_server = False
+        container.message_count = 0
+        return
+
     placement = scope.scalar(
         sa.select(m.Placement).where(
             m.Placement.container_id == suggestion.source_container_id,

@@ -242,6 +242,7 @@ AGENT_TOOLS = {
     "summarize_lists",
     "request_sync",
     "propose_bundle",
+    "propose_discard",
     "add_assessment",
     "withdraw_bundle",
 }
@@ -628,6 +629,97 @@ def _propose(agent: Agent) -> dict:
     )
 
 
+def test_an_agent_can_file_into_a_folder_that_does_not_exist_yet(client, backend):
+    """The folder is part of the proposal, not something done on the way to making one."""
+    agent = Agent(client)
+    account = agent.call("list_accounts")[0]
+    containers = {c["name"]: c for c in agent.call("list_containers", account_id=account["id"])}
+    messages = agent.call(
+        "list_messages",
+        container_id=containers["INBOX"]["id"],
+        from_address="news@list.example",
+    )["messages"]
+
+    result = agent.call(
+        "propose_bundle",
+        account_id=account["id"],
+        operation="move",
+        message_ids=[msg["message_id"] for msg in messages],
+        target_container_name="Lists/example",
+        summary="Newsletter issues",
+        reason="Bulk mail with a List-Id",
+    )
+
+    assert result["status"] == "proposed"
+    assert "Nothing has changed" in result["note"]
+    # The whole point: proposing a folder is not making one.
+    assert "Lists/example" not in backend.folders
+
+    listed = {c["name"]: c for c in agent.call("list_containers", account_id=account["id"])}
+    assert listed["Lists/example"]["exists_on_server"] is False
+    assert listed["INBOX"]["exists_on_server"] is True
+
+
+def test_an_agent_can_propose_discarding_an_empty_folder_and_nothing_happens(
+    client, service, backend
+):
+    backend.add_folder("Old")
+    with service.scope() as scope:
+        account_row = scope.scalar(sa.select(m.Account))
+        sync.discover_containers(scope, account_row, backend)
+        scope.commit()
+
+    agent = Agent(client)
+    account = agent.call("list_accounts")[0]
+    containers = {c["name"]: c for c in agent.call("list_containers", account_id=account["id"])}
+
+    result = agent.call(
+        "propose_discard",
+        account_id=account["id"],
+        container_ids=[containers["Old"]["id"]],
+        summary="One empty leftover",
+        reason="Nothing has ever been filed in it",
+    )
+
+    assert result["status"] == "proposed"
+    assert result["items"] == 1
+    assert "Nothing has changed" in result["note"]
+    assert "Old" in backend.folders
+
+    bundle = agent.read(result["resource"])
+    assert bundle["operation"] == "discard_container"
+    assert bundle["items"][0]["container"] == "Old"
+    assert bundle["items"][0]["message_id"] is None
+
+    item = agent.read(f"mailmind://suggestion/{bundle['items'][0]['suggestion_id']}")
+    assert item["premise"]["message_count"] == 0
+    assert item["premise"]["uid"] is None
+
+
+def test_an_agent_cannot_sync_a_folder_that_is_only_proposed(client):
+    agent = Agent(client)
+    account = agent.call("list_accounts")[0]
+    containers = {c["name"]: c for c in agent.call("list_containers", account_id=account["id"])}
+    messages = agent.call(
+        "list_messages",
+        container_id=containers["INBOX"]["id"],
+        from_address="news@list.example",
+    )["messages"]
+    agent.call(
+        "propose_bundle",
+        account_id=account["id"],
+        operation="move",
+        message_ids=[msg["message_id"] for msg in messages],
+        target_container_name="Lists/example",
+        summary="s",
+        reason="r",
+    )
+    listed = {c["name"]: c for c in agent.call("list_containers", account_id=account["id"])}
+
+    with pytest.raises(Exception, match="nothing on the server"):
+        agent.call("request_sync", container_id=listed["Lists/example"]["id"])
+
+
 def test_proposing_changes_nothing_and_says_so(client, backend):
     result = _propose(Agent(client))
     assert result["status"] == "proposed"
@@ -691,6 +783,67 @@ def test_the_review_page_shows_the_effect_and_names_the_self_assessment(client):
     # 02's rule, stated where it cannot be enforced.
     assert "same\n  producer that proposed this" in page or "same" in page
     assert "opencode" in page
+
+
+def test_the_review_page_says_a_folder_would_be_made_before_anything_moves(client, backend):
+    agent = Agent(client)
+    account = agent.call("list_accounts")[0]
+    containers = {c["name"]: c for c in agent.call("list_containers", account_id=account["id"])}
+    messages = agent.call(
+        "list_messages",
+        container_id=containers["INBOX"]["id"],
+        from_address="news@list.example",
+    )["messages"]
+    proposed = agent.call(
+        "propose_bundle",
+        account_id=account["id"],
+        operation="move",
+        message_ids=[msg["message_id"] for msg in messages],
+        target_container_name="Lists/example",
+        summary="Newsletter issues",
+        reason="Bulk mail with a List-Id",
+    )
+
+    page = client.get(f"/bundle/{proposed['bundle_id']}").text
+    assert "Lists/example" in page
+    assert "does not exist yet" in page, "the reviewer has to be told what they are making"
+
+    response = as_a_person(
+        client, f"/bundle/{proposed['bundle_id']}/accept", follow_redirects=True
+    )
+    assert response.status_code == 200
+    assert "Lists/example" in backend.folders
+    assert len(backend.folders["Lists/example"].messages) == len(messages)
+
+
+def test_a_discard_is_reviewed_and_accepted_like_anything_else(client, service, backend):
+    backend.add_folder("Old")
+    with service.scope() as scope:
+        sync.discover_containers(scope, scope.scalar(sa.select(m.Account)), backend)
+        scope.commit()
+
+    agent = Agent(client)
+    account = agent.call("list_accounts")[0]
+    containers = {c["name"]: c for c in agent.call("list_containers", account_id=account["id"])}
+    proposed = agent.call(
+        "propose_discard",
+        account_id=account["id"],
+        container_ids=[containers["Old"]["id"]],
+        summary="One empty leftover",
+        reason="Nothing has ever been filed in it",
+    )
+
+    page = client.get(f"/bundle/{proposed['bundle_id']}").text
+    assert "Old" in page
+    assert "cannot lose mail" in page, "why an empty folder is the only one offered"
+    assert "Old" in backend.folders, "reading the page changes nothing"
+
+    response = as_a_person(
+        client, f"/bundle/{proposed['bundle_id']}/accept", follow_redirects=True
+    )
+    assert response.status_code == 200
+    assert "Old" not in backend.folders
+    assert "applied" in response.text
 
 
 def test_accepting_in_the_ui_actually_moves_the_mail(client, backend):

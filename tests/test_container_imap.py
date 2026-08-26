@@ -328,3 +328,144 @@ def test_a_conditional_store_refuses_when_the_message_moved_on(backend, seeded, 
     assert result.guarantee == "conditional"
     current = {e.uid: e for e in backend.fetch_envelopes("INBOX", [uid])}[uid]
     assert r"\Flagged" not in current.flags, "the server acted despite UNCHANGEDSINCE"
+
+
+# ------------------------------------------------------------- making and unmaking
+
+
+@pytest.fixture
+def delimiter(backend) -> str:
+    """The hierarchy separator this server uses, which is not a constant.
+
+    Dovecot here says ``.`` and refuses a name holding ``/`` outright; other servers say
+    ``/``.  Nothing in mailmind assumes one — a container carries the delimiter its
+    server reported — so nothing in this file may assume one either.
+    """
+    for info in backend.list_containers():
+        if info.delimiter:
+            return info.delimiter
+    pytest.skip("this server reports no hierarchy delimiter")
+
+
+@pytest.fixture
+def scratch_folders(out_of_band, delimiter):
+    """Names this test owns, gone before and after whatever it does with them."""
+    deep = f"mmtest{delimiter}deep"
+    names = [f"{deep}{delimiter}inner", deep, "mmtest", "mmtest-adopted", "mmtest-üñïçøde"]
+
+    def wipe() -> None:
+        for name in names:
+            if out_of_band.folder_exists(name):
+                out_of_band.delete_folder(name)
+
+    wipe()
+    yield names
+    wipe()
+
+
+def test_a_folder_is_made_and_the_server_lists_it(backend, scratch_folders, out_of_band):
+    info = backend.create_container("mmtest")
+
+    assert info.name == "mmtest"
+    assert out_of_band.folder_exists("mmtest")
+    assert "mmtest" in [c.name for c in backend.list_containers()]
+    # Made, and subscribed to: a folder no client is subscribed to is one the person
+    # cannot see, which would make an accepted move look like it did nothing.
+    assert "mmtest" in [name for _flags, _delim, name in out_of_band.list_sub_folders()]
+
+
+def test_making_a_folder_that_is_already_there_is_a_success(backend, scratch_folders):
+    first = backend.create_container("mmtest")
+    # Whoever made it, the folder exists afterwards, which is the whole of what was asked.
+    second = backend.create_container("mmtest")
+    assert first.name == second.name == "mmtest"
+
+
+def test_a_folder_made_by_another_client_is_found_rather_than_refused(
+    backend, scratch_folders, out_of_band
+):
+    out_of_band.create_folder("mmtest-adopted")
+    info = backend.create_container("mmtest-adopted")
+    assert info.name == "mmtest-adopted"
+
+
+def test_a_name_that_needs_utf7_survives_the_round_trip(backend, scratch_folders):
+    """IMAP folder names are modified UTF-7 on the wire, and the row stores what came
+    back — so a name this service cannot read back is one it cannot later delete."""
+    info = backend.create_container("mmtest-üñïçøde")
+    assert info.name == "mmtest-üñïçøde"
+    assert "mmtest-üñïçøde" in [c.name for c in backend.list_containers()]
+
+    backend.delete_container("mmtest-üñïçøde")
+    assert "mmtest-üñïçøde" not in [c.name for c in backend.list_containers()]
+
+
+def test_an_empty_folder_is_deleted(backend, scratch_folders, out_of_band):
+    backend.create_container("mmtest")
+    assert backend.select("mmtest", readonly=True).message_count == 0
+
+    backend.delete_container("mmtest")
+    assert not out_of_band.folder_exists("mmtest")
+
+
+def test_deepest_first_removes_a_branch_whatever_the_server_does_about_parents(
+    backend, scratch_folders, delimiter
+):
+    """The order the applier uses, against a server rather than against an assumption.
+
+    What a server does when asked to delete a folder that still has folders under it is
+    not settled: RFC 3501 lets it refuse, and lets it remove the name and leave the
+    children where they are.  The Dovecot this runs against does the second — the parent
+    vanishes from LIST and the child is still selectable underneath a name that is no
+    longer there.  Neither outcome is one to build on, which is why the applier orders
+    deepest first and checks for children itself rather than letting DELETE decide.
+
+    So this asserts the property that holds on both kinds of server: in the applier's
+    order, the whole branch goes.
+    """
+    deep = f"mmtest{delimiter}deep"
+    backend.create_container("mmtest")
+    backend.create_container(deep)
+
+    backend.delete_container(deep)
+    backend.delete_container("mmtest")
+
+    remaining = [c.name for c in backend.list_containers() if c.name.startswith("mmtest")]
+    assert remaining == []
+
+
+def test_what_this_server_does_to_a_parent_deleted_first(
+    backend, scratch_folders, delimiter, out_of_band
+):
+    """Recorded, not required.
+
+    This is the behaviour the applier refuses to depend on, and a target that changes its
+    mind about it should say so here rather than by surprising somebody's mailbox.
+    """
+    from mailmind.imap.backend import MailboxUnhealthy
+
+    deep = f"mmtest{delimiter}deep"
+    backend.create_container("mmtest")
+    backend.create_container(deep)
+
+    try:
+        backend.delete_container("mmtest")
+    except MailboxUnhealthy:
+        # A server that refuses.  The child is untouched and both are still there.
+        assert out_of_band.folder_exists(deep)
+        assert out_of_band.folder_exists("mmtest")
+        return
+
+    # A server that allows it, and leaves the child orphaned — which is why a bundle may
+    # only remove a parent when it removes every child too.
+    assert out_of_band.folder_exists(deep), "the child was taken with the parent"
+
+
+def test_a_move_into_a_folder_that_was_just_made_lands(backend, seeded, scratch_folders):
+    backend.create_container("mmtest")
+    uid = seeded["newsletter"]
+
+    result = backend.move("INBOX", uid, "mmtest")
+
+    assert result.changed
+    assert backend.select("mmtest", readonly=True).message_count == 1

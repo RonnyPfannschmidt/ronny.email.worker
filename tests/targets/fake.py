@@ -58,6 +58,14 @@ class FakeBackend:
         self.writable = True
         self.reachable = True
         self.closed = False
+        #: What was created and deleted, in order.  The order is the point for a discard
+        #: bundle: a parent may only go after the children that made it a parent.
+        self.created: list[str] = []
+        self.deleted: list[str] = []
+        #: Names the server will not make.  Every server has some — a namespace it does
+        #: not let you write in, a character it will not take — and none of them announce
+        #: which in advance.
+        self.refuse_create: set[str] = set()
 
     # ------------------------------------------------------------------ seeding
 
@@ -107,6 +115,14 @@ class FakeBackend:
             internaldate=message.internaldate,
             modseq=target.highestmodseq,
         )
+
+    def out_of_band_create(self, name: str, *, special_use: str | None = None) -> None:
+        """Somebody made the folder in their own client before we got to it."""
+        self.add_folder(name, special_use=special_use)
+
+    def out_of_band_delete(self, name: str) -> None:
+        """Somebody removed the folder before we got to it."""
+        self.folders.pop(name, None)
 
     def force_uidvalidity_change(self, container: str) -> None:
         """The folder was recreated.  Every UID we remember now means something else."""
@@ -254,6 +270,38 @@ class FakeBackend:
             "best_effort",
             resulting_uid=new_uid if "UIDPLUS" in self._caps else None,
         )
+
+    def create_container(self, name: str) -> ContainerInfo:
+        self._check_writable()
+        if name in self.refuse_create:
+            raise MailboxUnhealthy(f"cannot create {name!r}: the server said no")
+        if name not in self.folders:
+            self.add_folder(name)
+        self.created.append(name)
+        folder = self.folders[name]
+        return ContainerInfo(name=folder.name, delimiter="/", special_use=folder.special_use)
+
+    def delete_container(self, name: str) -> None:
+        self._check_writable()
+        folder = self._folder(name)
+        # Both refusals a real server makes, so that the applier's ordering and its
+        # emptiness check are tested against something that actually says no.
+        if folder.messages:
+            raise MailboxUnhealthy(
+                f"cannot delete {name!r}: it holds {len(folder.messages)} messages"
+            )
+        # Stricter than the Dovecot the container tier runs against, deliberately.  RFC
+        # 3501 lets a server go either way and that one removes the parent and leaves the
+        # children orphaned, so order does not matter there and a test against it cannot
+        # tell whether the applier bothers to sort.  Refusing here is what gives
+        # deepest-first ordering teeth, and the applier has to work against both.
+        children = [f for f in self.folders if f.startswith(name + "/")]
+        if children:
+            raise MailboxUnhealthy(
+                f"cannot delete {name!r}: it still has {len(children)} folders under it"
+            )
+        del self.folders[name]
+        self.deleted.append(name)
 
     def close(self) -> None:
         self.closed = True

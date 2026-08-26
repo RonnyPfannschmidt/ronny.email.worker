@@ -13,6 +13,7 @@ import sqlalchemy as sa
 from mailmind.db import cache
 from mailmind.db import models as m
 from mailmind.db.scope import TenantScope
+from mailmind.suggest import staleness
 
 
 def live_placements(container_id: int | None = None):
@@ -85,13 +86,21 @@ def containers(scope: TenantScope, account_id: int) -> list[dict]:
             "special_use": c.special_use,
             "cached_messages": counts.get(c.id, 0),
             "server_message_count": c.message_count,
+            # A folder some bundle has proposed and nobody has accepted yet.  Shown
+            # rather than hidden, so a second bundle can file into the same one — and
+            # marked, so nothing mistakes it for a folder that is actually there.
+            "exists_on_server": c.exists_on_server,
             "last_synced": c.last_incremental_sync_at.isoformat()
             if c.last_incremental_sync_at
             else None,
         }
         for c in scope.scalars(
             sa.select(m.Container)
-            .where(m.Container.account_id == account_id, m.Container.selectable.is_(True))
+            .where(
+                m.Container.account_id == account_id,
+                m.Container.selectable.is_(True),
+                m.Container.discarded_at.is_(None),
+            )
             .order_by(m.Container.name)
         )
     ]
@@ -341,6 +350,9 @@ def bundle_summaries(
             "operation": b.operation.value,
             "flag": b.flag,
             "target_container": b.target_container.name if b.target_container else None,
+            "target_is_new": bool(
+                b.target_container and not b.target_container.exists_on_server
+            ),
             "producer": b.producer.name,
             "item_count": len(b.suggestions),
             "stale_count": sum(
@@ -354,6 +366,40 @@ def bundle_summaries(
     ]
 
 
+def _folder_item(scope: TenantScope, suggestion: m.Suggestion) -> dict:
+    """An item that names a folder instead of a message.
+
+    What a reviewer needs of a folder is what a discard turns on: how much it holds and
+    what sits under it.  Both are read fresh from the cache rather than taken from the
+    premise, because the difference between them is the change the reviewer is owed.
+    """
+    container = suggestion.source_container
+    prefix = container.name + container.delimiter if container.delimiter else None
+    children = (
+        scope.scalars(
+            sa.select(m.Container.name).where(
+                m.Container.account_id == container.account_id,
+                m.Container.discarded_at.is_(None),
+                m.Container.name.startswith(prefix, autoescape=True),
+            )
+        ).all()
+        if prefix
+        else []
+    )
+    return {
+        "suggestion_id": suggestion.id,
+        "message_id": None,
+        "container_id": container.id,
+        "container": container.name,
+        "cached_messages": staleness.live_message_count(scope, container),
+        "children": sorted(children),
+        "exists_on_server": container.exists_on_server,
+        "status": suggestion.status.value,
+        "stale_detail": suggestion.stale_detail,
+        "assessment": [],
+    }
+
+
 def bundle_detail(scope: TenantScope, bundle_id: int) -> dict:
     bundle = scope.get(m.Bundle, bundle_id)
     if bundle is None:
@@ -361,6 +407,9 @@ def bundle_detail(scope: TenantScope, bundle_id: int) -> dict:
 
     items = []
     for suggestion in bundle.suggestions:
+        if suggestion.message_id is None:
+            items.append(_folder_item(scope, suggestion))
+            continue
         message = suggestion.message
         items.append(
             {
@@ -397,6 +446,9 @@ def bundle_detail(scope: TenantScope, bundle_id: int) -> dict:
         "operation": bundle.operation.value,
         "flag": bundle.flag,
         "target_container": bundle.target_container.name if bundle.target_container else None,
+        "target_is_new": bool(
+            bundle.target_container and not bundle.target_container.exists_on_server
+        ),
         "producer": bundle.producer.name,
         "summary": bundle.summary,
         "reason": bundle.reason,

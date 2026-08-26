@@ -384,6 +384,16 @@ class Container(Base, TenantScoped):
     last_full_sync_at: Mapped[dt.datetime | None] = mapped_column(default=None)
     last_incremental_sync_at: Mapped[dt.datetime | None] = mapped_column(default=None)
 
+    #: False while a folder has been proposed and not yet made.  A bundle may name a
+    #: folder that does not exist; the row is written when it is proposed so the target
+    #: is an ordinary container everywhere — the FK, the review page, the unique name —
+    #: and the server is only asked for it when the move is accepted.
+    exists_on_server: Mapped[bool] = mapped_column(default=True)
+    #: Set when this service deleted the folder.  Marked rather than deleted, because
+    #: placements and suggestions still point here and a dangling reference tells the
+    #: reviewer nothing.
+    discarded_at: Mapped[dt.datetime | None] = mapped_column(default=None)
+
     account: Mapped[Account] = relationship(back_populates="containers")
 
     __table_args__ = (sa.UniqueConstraint("account_id", "name"),)
@@ -544,6 +554,16 @@ class Operation(enum.Enum):
     add_flag = "add_flag"
     remove_flag = "remove_flag"
     delete = "delete"
+    #: Get rid of a folder that holds nothing.  The only deletion here that cannot lose
+    #: mail, which is the whole of why it is allowed: 01 says mail has no undo, and an
+    #: empty folder is the one thing whose removal has nothing to undo.
+    discard_container = "discard_container"
+
+
+#: Operations whose items name a folder rather than a message.  A suggestion under one of
+#: these has no ``message_id`` and no ``premise_uid``; what it remembers instead is that
+#: the container held nothing.
+CONTAINER_OPERATIONS = frozenset({Operation.discard_container})
 
 
 class BundleStatus(enum.Enum):
@@ -638,24 +658,39 @@ class SuggestionStatus(enum.Enum):
 
 
 class Suggestion(Base, TenantScoped):
-    """One operation over one message, and what it was computed against.
+    """One operation over one message — or over one folder — and what it was computed
+    against.
 
     The premise columns are the whole point of the row.  They are checked twice — before
     the bundle is shown and again immediately before this item is applied — because both
     gaps are real, and the second is the dangerous one, a person having already said yes.
+
+    There are two shapes of premise, and a row is exactly one of them.  A message item
+    remembers where the message was: a UID under a generation, and the state it was in.
+    A folder item — an item of a bundle whose operation is in
+    :data:`CONTAINER_OPERATIONS` — has no message and no UID; what it remembers is that
+    :attr:`source_container_id` held nothing.  Reusing the row rather than inventing a
+    second table is what makes accept, exclude, reject, expire, the apply attempt and the
+    review table work for folders without a line of new code in any of them.
     """
 
     __tablename__ = "suggestion"
 
     id: Mapped[int] = mapped_column(primary_key=True)
     bundle_id: Mapped[int] = mapped_column(sa.ForeignKey("bundle.id"))
-    message_id: Mapped[int] = mapped_column(sa.ForeignKey("message.id"))
+    #: Null on a folder item.  There is no message.
+    message_id: Mapped[int | None] = mapped_column(sa.ForeignKey("message.id"), default=None)
+    #: Where the message is now, or — on a folder item — the folder itself.
     source_container_id: Mapped[int] = mapped_column(sa.ForeignKey("container.id"))
 
     premise_container_generation: Mapped[int] = mapped_column()
-    premise_uid: Mapped[int] = mapped_column(sa.BigInteger)
+    #: Null on a folder item.
+    premise_uid: Mapped[int | None] = mapped_column(sa.BigInteger, default=None)
     premise_modseq: Mapped[int | None] = mapped_column(sa.BigInteger, default=None)
     premise_flags_hash: Mapped[str] = mapped_column(sa.String(64), default="")
+    #: The folder-item premise: how much the container held when this was proposed, which
+    #: is nought or it would not have been proposed.  Null on a message item.
+    premise_message_count: Mapped[int | None] = mapped_column(default=None)
 
     status: Mapped[SuggestionStatus] = mapped_column(
         _enum(SuggestionStatus, "suggestion_status"),
@@ -667,10 +702,17 @@ class Suggestion(Base, TenantScoped):
     stale_detail: Mapped[str | None] = mapped_column(sa.Text, default=None)
 
     bundle: Mapped[Bundle] = relationship(back_populates="suggestions")
-    message: Mapped[Message] = relationship()
+    message: Mapped[Message | None] = relationship()
     source_container: Mapped[Container] = relationship()
 
-    __table_args__ = (sa.UniqueConstraint("bundle_id", "message_id"),)
+    __table_args__ = (
+        sa.UniqueConstraint("bundle_id", "message_id"),
+        sa.CheckConstraint(
+            "(message_id IS NOT NULL AND premise_uid IS NOT NULL) "
+            "OR (message_id IS NULL AND premise_message_count IS NOT NULL)",
+            name="ck_suggestion_premise_shape",
+        ),
+    )
 
 
 # ----------------------------------------------------------------------- assessments

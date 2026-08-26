@@ -136,4 +136,27 @@ class MailBackend(Protocol):
         expected_flags: tuple[str, ...] | None = None,
     ) -> StoreResult: ...
 
+    def create_container(self, name: str) -> ContainerInfo:
+        """Make a folder, and say what the server made.
+
+        A name is not a folder: servers normalise, impose their own hierarchy separator,
+        and sometimes decline outright.  What comes back is what is actually there, so the
+        caller records that rather than the name it asked for.
+
+        Making one that is already there is a success.  The point of the call is that the
+        folder exists afterwards, and racing somebody's mail client to create it is not a
+        failure of anything.
+        """
+        ...
+
+    def delete_container(self, name: str) -> None:
+        """Get rid of a folder.
+
+        Only ever called on one holding nothing — which is checked here, immediately
+        before, and is what makes this the one deletion in the service that cannot lose
+        mail.  A server that refuses raises :class:`MailboxUnhealthy` carrying what it
+        said; there is no partial outcome to report.
+        """
+        ...
+
     def close(self) -> None: ...

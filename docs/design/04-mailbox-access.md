@@ -25,11 +25,25 @@ turns out to be missing is a loud failure, not a quiet downgrade.
 
 ## Operations
 
-Flag, move, label, delete. Create or edit a draft. Nothing else — sending is not here.
+Flag, move, label, delete. Create or edit a draft. Make a container, and remove an empty one.
+Nothing else — sending is not here.
 
 Each operation says how strong a guarantee it needs. Some must fail rather than act if the
 message changed underneath; some can accept a weaker promise, but then they have to *say* they
 did rather than claim a guarantee they did not get.
+
+The two container operations are not a separate kind of authority. A move may name a container
+that does not exist, and making it is part of applying that move — so what authorises the
+container is the same acceptance that authorises the mail going into it. Removing one is only
+offered while it holds nothing, which is what makes it the one removal here that cannot lose
+mail; emptiness is a premise like any other, and it is checked again against the server
+immediately before the container goes.
+
+What a server does when asked to remove a container that still has containers under it is not
+settled — RFC 3501 lets it refuse, and lets it drop the name and leave the children orphaned.
+Both have been seen. So this is not something to build on: a bundle removes a branch deepest
+first and checks for children itself, rather than letting the answer depend on which server it
+is talking to.
 
 ## When a connection is unwell
 
