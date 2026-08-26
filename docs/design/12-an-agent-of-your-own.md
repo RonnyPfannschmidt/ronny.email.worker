@@ -49,7 +49,7 @@ producer that then proposes acting on it.
 
 ## What the surface gives you
 
-Twelve tools, nine that look and three that say, plus six resources and three prompts;
+Fifteen tools, ten that look and five that say, plus six resources and three prompts;
 [the reference](../reference/mcp.md) is the list, and [Connecting an agent](../connecting.md)
 has what to build into an agent from the start.
 

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import contextlib
 import datetime as dt
 import hashlib
 import json
@@ -30,6 +31,7 @@ from mailmind.imap.capabilities import probe_account
 from mailmind.mcp import oauth
 from mailmind.mcp import server as mcp_server
 from mailmind.service import Service, hash_token
+from mailmind.suggest import model as suggest
 from mailmind.web import app as app_module
 from mailmind.web.app import SESSION_KEY_PARAM, create_app, csrf_token, is_machine_path
 from tests.corpus import CORPUS
@@ -254,9 +256,37 @@ def accepting(client: TestClient, bundle_id: int, **kwargs):  # noqa: ANN201
     shown = re.search(r'name="reviewed_through" value="(\d+)"', page)
     data = {"reviewed_through": shown.group(1) if shown else "0"}
     data.update(kwargs.pop("data", {}))
-    return as_a_person(
+    response = as_a_person(
         client, f"/bundle/{bundle_id}/accept", data=data, follow_redirects=True, **kwargs
     )
+    settle(client)
+    return response
+
+
+def settle(client: TestClient, timeout: float = 10.0) -> None:
+    """Wait for the app's own runner to work the queue dry.
+
+    Accepting enqueues; the lifespan's dispatcher applies. Tests that assert the effect
+    wait for the queue rather than sleeping a guess.
+    """
+    import time
+
+    service = client.app.state.task_runner.service
+
+    async def live() -> int:
+        async with service.scope() as scope:
+            return await scope.scalar(
+                sa.select(sa.func.count())
+                .select_from(m.Task)
+                .where(m.Task.status.in_((m.TaskStatus.queued, m.TaskStatus.running)))
+            )
+
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if asyncio.run(live()) == 0:
+            return
+        time.sleep(0.02)
+    raise AssertionError("the task queue never went quiet")
 
 
 # ------------------------------------------------------------------ the surface
@@ -275,6 +305,7 @@ AGENT_TOOLS = {
     "summarize_senders",
     "summarize_lists",
     "request_sync",
+    "task_status",
     "propose_bundle",
     "add_to_bundle",
     "propose_discard",
@@ -1408,8 +1439,9 @@ def test_a_sync_that_dies_partway_keeps_the_folders_it_finished(tmp_path):
 
     with opened(create_app(service, session_key=SESSION_KEY)) as client:
         died = as_a_person(client, f"/accounts/{account_id}/sync")
-    # The person pressed a button, so what comes back is a page, not a stack trace.
-    assert died.status_code < 400
+        # The person pressed a button, so what comes back is a page, not a stack trace.
+        assert died.status_code < 400
+        settle(client)
 
     async def _check(scope):
         account = await scope.get(m.Account, account_id)
@@ -1464,7 +1496,10 @@ def test_a_mailbox_that_cannot_be_reached_says_so_on_the_page(tmp_path):
     with opened(create_app(service, session_key=SESSION_KEY)) as client:
         pressed = as_a_person(client, f"/accounts/{account_id}/sync", follow_redirects=True)
         assert pressed.status_code == 200, "a mailbox being down is not a bug in the request"
-        assert "Hostname mismatch" in pressed.text, "the page does not say what went wrong"
+        settle(client)
+        # The failure is the sync task's now; the page shows it where the button is.
+        page = client.get("/accounts").text
+        assert "Hostname mismatch" in page, "the page does not say what went wrong"
 
     async def _account(scope):
         return await scope.get(m.Account, account_id)
@@ -1608,6 +1643,7 @@ def test_a_framework_fetch_from_our_own_page_gets_through(client, backend):
         data={"_csrf": CSRF, "reviewed_through": shown.group(1) if shown else "0"},
     )
     assert response.status_code < 400
+    settle(client)
     assert len(backend.folders["Archive"].messages) == 1
 
 
@@ -2114,3 +2150,195 @@ def test_a_stale_consent_request_cannot_be_answered(client, service):
 
     assert client.get(f"/consent?request={request_id}").status_code == 404
     assert oauth.REQUEST_TTL > dt.timedelta(0)
+
+
+# ------------------------------------------------------------- background tasks
+
+
+def _stranded_accepted(client, *, with_failed_task: bool) -> tuple[int, int | None]:
+    """An accepted bundle whose apply has not happened — with or without a failed task.
+
+    Built directly rather than through the routes, so the live dispatcher (which only
+    claims *queued* tasks) leaves the state alone while the page renders.
+    """
+    service = client.app.state.task_runner.service
+    proposed = _propose(Agent(client))
+
+    async def _work(scope):
+        bundle = await scope.get(m.Bundle, proposed["bundle_id"])
+        reviewer_row = await scope.scalar(
+            sa.select(m.Producer).where(m.Producer.kind == m.ProducerKind.person)
+        )
+        if reviewer_row is None:
+            reviewer_row = scope.add(m.Producer(kind=m.ProducerKind.person, name="reviewer"))
+            await scope.flush()
+        await suggest.accept(
+            scope,
+            bundle,
+            reviewer_row,
+            reviewed_through=suggest.shown_through(bundle),
+        )
+        task_id = None
+        if with_failed_task:
+            task = m.Task(
+                kind=m.TaskKind.apply_bundle,
+                status=m.TaskStatus.failed,
+                account_id=bundle.account_id,
+                subject_id=bundle.id,
+                error="the mailbox went away mid-apply",
+            )
+            scope.add(task)
+            await scope.flush()
+            task_id = task.id
+        await scope.commit()
+        return proposed["bundle_id"], task_id
+
+    return scoped(service, _work)
+
+
+def test_an_accepted_bundle_is_visible_on_the_queue_not_invisible(client):
+    """The stuck-state hole, closed at the page: accepted work has a section of its own."""
+    bundle_id, task_id = _stranded_accepted(client, with_failed_task=True)
+    page = client.get("/").text
+    assert "Being applied" in page
+    assert f"/bundle/{bundle_id}" in page
+    assert "the mailbox went away mid-apply" in page, "the failure is shown, not hidden"
+    assert f"/task/{task_id}/retry" in page, "and there is a way to try again"
+
+
+def test_the_bundle_page_shows_the_apply_and_retry_finishes_it(client, backend):
+    bundle_id, task_id = _stranded_accepted(client, with_failed_task=True)
+    page = client.get(f"/bundle/{bundle_id}").text
+    assert "being applied" in page.lower()
+    assert "the mailbox went away mid-apply" in page
+
+    response = as_a_person(client, f"/task/{task_id}/retry", follow_redirects=True)
+    assert response.status_code == 200
+    settle(client)
+    assert len(backend.folders["Archive"].messages) == 1
+    assert "applied" in client.get(f"/bundle/{bundle_id}").text
+
+
+def test_a_failed_body_fetch_is_shown_next_to_the_button(client):
+    """The silent contextlib.suppress hole, closed on the page."""
+    service = client.app.state.task_runner.service
+    proposed = _propose(Agent(client))
+
+    async def _work(scope):
+        bundle = await scope.get(m.Bundle, proposed["bundle_id"])
+        suggestion = sorted(bundle.suggestions, key=lambda s: s.id)[0]
+        task = m.Task(
+            kind=m.TaskKind.fetch_body,
+            status=m.TaskStatus.failed,
+            account_id=bundle.account_id,
+            subject_id=suggestion.message_id,
+            payload={"bundle_id": bundle.id},
+            error="the server closed the connection",
+        )
+        scope.add(task)
+        await scope.commit()
+
+    scoped(service, _work)
+    page = client.get(f"/bundle/{proposed['bundle_id']}").text
+    assert "the server closed the connection" in page
+    assert "retry" in page
+
+
+def test_request_sync_and_task_status_carry_the_work_to_its_result(client):
+    """The agent's shape of the same queue: enqueue, poll, read the report."""
+    agent = Agent(client)
+    account = agent.call("list_accounts")[0]
+    containers = {c["name"]: c for c in agent.call("list_containers", account_id=account["id"])}
+    asked = agent.call("request_sync", container_id=containers["INBOX"]["id"])
+    assert asked["status"] in ("queued", "running")
+    assert "task_id" in asked
+
+    settle(client)
+    outcome = agent.call("task_status", task_id=asked["task_id"])
+    assert outcome["status"] == "done"
+    assert outcome["result"]["folders"] == 1
+
+    joined = agent.call("request_sync", container_id=containers["INBOX"]["id"])
+    settle(client)
+    assert joined["coalesced"] is False, "a finished sync does not satisfy a fresh ask"
+
+
+def test_request_body_becomes_a_task_and_then_the_body(client):
+    agent = Agent(client)
+    account = agent.call("list_accounts")[0]
+    containers = {c["name"]: c for c in agent.call("list_containers", account_id=account["id"])}
+    listed = agent.call("list_messages", container_id=containers["INBOX"]["id"], limit=1)
+    message_id = listed["messages"][0]["message_id"]
+
+    first = agent.call("request_body", message_id=message_id)
+    assert "task_id" in first and first["status"] in ("queued", "running")
+    settle(client)
+    again = agent.call("request_body", message_id=message_id)
+    assert again.get("body"), "once cached, the body is the answer"
+
+
+async def test_progress_reaches_the_page_as_a_turbo_stream(service):
+    """One event off the wire: the SSE endpoint speaks <turbo-stream>.
+
+    Driven at the ASGI level: TestClient buffers whole responses, so an endless stream
+    can never be read through it — here the raw response messages are read until the
+    first event and the request is cancelled, which is also what a closing tab does.
+    """
+    app = create_app(service, session_key=SESSION_KEY)
+
+    async with app.router.lifespan_context(app):
+        # A running task the dispatcher will not touch (it only claims queued ones).
+        async with service.scope() as scope:
+            account = await scope.scalar(sa.select(m.Account))
+            task = m.Task(
+                kind=m.TaskKind.sync_account,
+                status=m.TaskStatus.running,
+                account_id=account.id,
+                subject_id=account.id,
+                progress_done=3,
+                progress_total=9,
+                progress_note="INBOX",
+            )
+            scope.add(task)
+            await scope.commit()
+            task_id = task.id
+
+        messages: asyncio.Queue = asyncio.Queue()
+
+        async def receive():  # noqa: ANN202
+            await asyncio.sleep(3600)
+
+        async def send(message):  # noqa: ANN001, ANN202
+            await messages.put(message)
+
+        scope_dict = {
+            "type": "http",
+            "method": "GET",
+            "path": "/events",
+            "raw_path": b"/events",
+            "query_string": b"",
+            "headers": [
+                (b"host", b"127.0.0.1:8765"),
+                (b"cookie", f"mailmind_session={SESSION_KEY}".encode()),
+            ],
+            "scheme": "http",
+            "server": ("127.0.0.1", 8765),
+            "client": ("127.0.0.1", 1234),
+        }
+        request = asyncio.ensure_future(app(scope_dict, receive, send))
+        try:
+            start = await asyncio.wait_for(messages.get(), timeout=10)
+            assert start["type"] == "http.response.start" and start["status"] == 200
+            body = b""
+            while b"</turbo-stream>" not in body:
+                chunk = await asyncio.wait_for(messages.get(), timeout=10)
+                body += chunk.get("body", b"")
+        finally:
+            request.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await request
+
+        event = body.decode()
+        assert event.startswith("data: <turbo-stream")
+        assert f'target="task-{task_id}"' in event
+        assert "3/9" in event and "INBOX" in event

@@ -31,5 +31,7 @@
   <input type="hidden" name="_csrf" value="{{ csrf }}">
     <button>sync now</button>
   </form>
+  {% set task = sync_tasks.get(row.account.id) if sync_tasks is defined else None %}
+  {% if task %}{% include "_task.html" %}{% endif %}
 {% endfor %}
 {% endblock %}

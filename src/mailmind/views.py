@@ -392,6 +392,42 @@ async def proposed_counts(scope: TenantScope) -> dict[int, int]:
     return dict(rows)
 
 
+async def task_summaries(
+    scope: TenantScope,
+    account_ids: set[int] | None,
+    *,
+    kinds: list[m.TaskKind] | None = None,
+    live_only: bool = False,
+) -> list[dict]:
+    """Task rows the pages render: what runs, how far along, and what failed."""
+    stmt = sa.select(m.Task)
+    if account_ids is not None:
+        stmt = stmt.where(m.Task.account_id.in_(account_ids or {-1}))
+    if kinds is not None:
+        stmt = stmt.where(m.Task.kind.in_(kinds))
+    if live_only:
+        stmt = stmt.where(m.Task.status.in_((m.TaskStatus.queued, m.TaskStatus.running)))
+    rows = await scope.all(stmt.order_by(m.Task.id.desc()))
+    return [task_view(t) for t in rows]
+
+
+def task_view(task: m.Task) -> dict:
+    return {
+        "id": task.id,
+        "kind": task.kind.value,
+        "status": task.status.value,
+        "account_id": task.account_id,
+        "subject_id": task.subject_id,
+        "done": task.progress_done,
+        "total": task.progress_total,
+        "note": task.progress_note,
+        "error": task.error,
+        "result": task.result,
+        "created_at": task.created_at.isoformat(),
+        "finished_at": task.finished_at.isoformat() if task.finished_at else None,
+    }
+
+
 async def _folder_item(scope: TenantScope, suggestion: m.Suggestion) -> dict:
     """An item that names a folder instead of a message.
 

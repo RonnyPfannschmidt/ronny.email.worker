@@ -28,12 +28,9 @@ from mcp.server.auth.provider import construct_redirect_uri
 from mcp.server.transport_security import TransportSecuritySettings
 from starlette.middleware.base import BaseHTTPMiddleware
 
-from mailmind import views
+from mailmind import tasks, views
 from mailmind.config import check_exposure, is_wildcard, oauth_issuer
 from mailmind.db import models as m
-from mailmind.imap import apply as applier
-from mailmind.imap import sync
-from mailmind.imap.backend import TRASH, MailboxUnhealthy
 from mailmind.mcp import oauth
 from mailmind.mcp import server as mcp_server
 from mailmind.service import Service
@@ -452,6 +449,94 @@ def create_app(
             "waiting": await views.proposed_counts(scope),
         }
 
+    def task_fragment(task: dict, *, streaming: bool) -> str:
+        """One task's row, as Turbo will swap it: same template for route and stream."""
+        return TEMPLATES.env.get_template("_task.html").render(
+            task=task, csrf=form_token, streaming=streaming
+        )
+
+    @app.get("/task/{task_id}/fragment", response_class=HTMLResponse)
+    async def task_fragment_page(task_id: int):  # noqa: ANN202
+        async with service.scope() as scope:
+            task = await scope.get(m.Task, task_id)
+            if task is None:
+                return HTMLResponse("no such task", status_code=404)
+            return HTMLResponse(task_fragment(views.task_view(task), streaming=False))
+
+    @app.post("/task/{task_id}/retry", dependencies=changes)
+    async def retry_task(task_id: int):  # noqa: ANN202
+        """Ask again.  Only a failed task; coalescing makes double-clicks harmless."""
+        target = "/"
+        async with service.scope() as scope:
+            task = await scope.get(m.Task, task_id)
+            if task is not None and task.status is m.TaskStatus.failed:
+                if task.kind is m.TaskKind.apply_bundle:
+                    bundle = await scope.get(m.Bundle, task.subject_id)
+                    target = f"/bundle/{task.subject_id}"
+                    if bundle is None or bundle.status is not m.BundleStatus.accepted:
+                        return RedirectResponse(target, status_code=303)
+                elif task.kind is m.TaskKind.fetch_body:
+                    target = f"/bundle/{task.payload.get('bundle_id', '')}" or "/"
+                elif task.kind in (m.TaskKind.sync_account, m.TaskKind.sync_container):
+                    target = "/accounts"
+                await tasks.enqueue(
+                    scope,
+                    kind=task.kind,
+                    account_id=task.account_id,
+                    subject_id=task.subject_id,
+                    payload=dict(task.payload),
+                    requested_by=(await reviewer(scope)).id,
+                )
+                await scope.commit()
+        service.notify_tasks()
+        return RedirectResponse(target, status_code=303)
+
+    @app.get("/events")
+    async def events(request: Request):  # noqa: ANN202
+        """Progress, pushed: each event is a <turbo-stream> replacing one task's row.
+
+        A terminal transition also sends a page refresh, so the surroundings — the
+        attempts table, the queue's sections — catch up without anybody polling.
+        """
+        from fastapi.responses import StreamingResponse
+
+        runner = getattr(request.app.state, "task_runner", None)
+
+        def as_event(view: dict) -> str:
+            body = task_fragment(view, streaming=True).replace("\n", " ")
+            return (
+                'data: <turbo-stream action="replace" '
+                f'target="task-{view["id"]}"><template>{body}</template>'
+                "</turbo-stream>\n\n"
+            )
+
+        async def stream():  # noqa: ANN202
+            if runner is None:
+                return
+            queue = runner.hub.subscribe()
+            try:
+                # Catch up first: a page that opens the stream mid-run gets the current
+                # state now rather than at the next change.
+                async with service.scope() as scope:
+                    live_now = await views.task_summaries(scope, None, live_only=True)
+                for view in live_now:
+                    yield as_event(view)
+                while True:
+                    task_id = await queue.get()
+                    async with service.scope() as scope:
+                        task = await scope.get(m.Task, task_id)
+                        if task is None:
+                            continue
+                        view = views.task_view(task)
+                    live = view["status"] in ("queued", "running")
+                    yield as_event(view)
+                    if not live:
+                        yield 'data: <turbo-stream action="refresh"></turbo-stream>\n\n'
+            finally:
+                runner.hub.unsubscribe(queue)
+
+        return StreamingResponse(stream(), media_type="text/event-stream")
+
     # -------------------------------------------------------------- the queue
 
     @app.get("/", response_class=HTMLResponse)
@@ -483,7 +568,28 @@ def create_app(
                     account_ids=here,
                 )
             )[:10]
-            return render(request, "queue.html", bundles=bundles, recent=recent, **header)
+            applying = await views.bundle_summaries(
+                scope, [m.BundleStatus.accepted], account_ids=here
+            )
+            waiting_ids = {b["bundle_id"] for b in applying}
+            apply_tasks = {
+                task["subject_id"]: task
+                for task in await views.task_summaries(
+                    scope, here, kinds=[m.TaskKind.apply_bundle]
+                )
+                if task["subject_id"] in waiting_ids
+            }
+            live = any(task["status"] in ("queued", "running") for task in apply_tasks.values())
+            return render(
+                request,
+                "queue.html",
+                bundles=bundles,
+                recent=recent,
+                applying=applying,
+                apply_tasks=apply_tasks,
+                live_tasks=live,
+                **header,
+            )
 
     @app.get("/bundle/{bundle_id}", response_class=HTMLResponse)
     async def bundle_page(request: Request, bundle_id: int, error: str | None = None):  # noqa: ANN202
@@ -508,12 +614,28 @@ def create_app(
                         "text": (body.text_plain or body.text_from_html or "")[:4000],
                         "links": body.links.get("links", [])[:40],
                     }
+            apply_task = None
+            for task in await views.task_summaries(
+                scope, None, kinds=[m.TaskKind.apply_bundle]
+            ):
+                if task["subject_id"] == bundle_id:
+                    apply_task = task
+                    break
+            fetch_tasks = {}
+            for task in await views.task_summaries(scope, None, kinds=[m.TaskKind.fetch_body]):
+                fetch_tasks.setdefault(task["subject_id"], task)
+            live = (
+                apply_task is not None and apply_task["status"] in ("queued", "running")
+            ) or any(task["status"] in ("queued", "running") for task in fetch_tasks.values())
             return render(
                 request,
                 "bundle.html",
                 bundle=detail,
                 bodies=bodies,
                 error=error,
+                apply_task=apply_task,
+                fetch_tasks=fetch_tasks,
+                live_tasks=live,
                 **await chrome(scope),
             )
 
@@ -525,17 +647,16 @@ def create_app(
             )
             if placement is not None:
                 container = await scope.get(m.Container, placement.container_id)
-                account = await scope.get(m.Account, container.account_id)
-                with contextlib.suppress(Exception), service.backend(account) as backend:
-                    await sync.fetch_and_cache_body(
-                        scope,
-                        account,
-                        container,
-                        placement,
-                        backend,
-                        budget_bytes=service.config.limits.body_cache_bytes,
-                    )
+                await tasks.enqueue(
+                    scope,
+                    kind=m.TaskKind.fetch_body,
+                    account_id=container.account_id,
+                    subject_id=message_id,
+                    payload={"bundle_id": bundle_id},
+                    requested_by=(await reviewer(scope)).id,
+                )
                 await scope.commit()
+        service.notify_tasks()
         return RedirectResponse(f"/bundle/{bundle_id}#m{message_id}", status_code=303)
 
     @app.post("/bundle/{bundle_id}/exclude/{suggestion_id}", dependencies=changes)
@@ -582,27 +703,18 @@ def create_app(
                 await scope.commit()
                 return _back(bundle_id, str(exc))
 
-            account = await scope.get(m.Account, bundle.account_id)
-            trash = await scope.scalar(
-                sa.select(m.Container).where(
-                    m.Container.account_id == account.id,
-                    m.Container.special_use == TRASH,
-                )
+            # The accept is recorded; the mailbox work is the runner's.  The page shows
+            # the apply as it runs, and a failure is a row with a retry — not a stuck
+            # invisible bundle.
+            await tasks.enqueue(
+                scope,
+                kind=m.TaskKind.apply_bundle,
+                account_id=bundle.account_id,
+                subject_id=bundle.id,
+                requested_by=(await reviewer(scope)).id,
             )
-            try:
-                async with service.backend(account) as backend:
-                    await applier.apply_bundle(
-                        scope, bundle, backend, trash_container=trash, checkpoint=scope.commit
-                    )
-            except applier.NotApplicable as exc:
-                await scope.commit()
-                return _back(bundle_id, str(exc))
-            except MailboxUnhealthy as exc:
-                # The accept stands and is recorded; what failed is reaching the mailbox.
-                note_unhealthy(scope, account, exc)
-                await scope.commit()
-                return _back(bundle_id, str(exc))
             await scope.commit()
+        service.notify_tasks()
         return _back(bundle_id, None)
 
     @app.post("/bundle/{bundle_id}/reject", dependencies=changes)
@@ -640,7 +752,21 @@ def create_app(
                         ),
                     }
                 )
-            return render(request, "accounts.html", rows=rows, **await chrome(scope))
+            sync_tasks = {}
+            for task in await views.task_summaries(
+                scope, None, kinds=[m.TaskKind.sync_account]
+            ):
+                sync_tasks.setdefault(task["account_id"], task)
+            return render(
+                request,
+                "accounts.html",
+                rows=rows,
+                sync_tasks=sync_tasks,
+                live_tasks=any(
+                    task["status"] in ("queued", "running") for task in sync_tasks.values()
+                ),
+                **await chrome(scope),
+            )
 
     @app.post("/accounts/choose", dependencies=changes)
     async def choose_account(account_id: int = Form()):  # noqa: ANN202
@@ -661,20 +787,15 @@ def create_app(
         async with service.scope() as scope:
             account = await scope.get(m.Account, account_id)
             if account is not None:
-                try:
-                    async with service.backend(account) as backend:
-                        for container in await sync.discover_containers(
-                            scope, account, backend
-                        ):
-                            if container.selectable:
-                                await sync.sync_container(scope, account, container, backend)
-                                # Per folder: see the same commit in `mailmindctl sync`.
-                                await scope.commit()
-                except MailboxUnhealthy as exc:
-                    # A mailbox that cannot be reached is news about the mailbox, not a
-                    # failure of this request. The page it returns to shows what happened.
-                    note_unhealthy(scope, account, exc)
+                await tasks.enqueue(
+                    scope,
+                    kind=m.TaskKind.sync_account,
+                    account_id=account.id,
+                    subject_id=account.id,
+                    requested_by=(await reviewer(scope)).id,
+                )
                 await scope.commit()
+        service.notify_tasks()
         return RedirectResponse("/accounts", status_code=303)
 
     # ------------------------------------------------------------- letting an agent in
@@ -862,19 +983,6 @@ def create_app(
         return RedirectResponse("/agents", status_code=303)
 
     return app
-
-
-def note_unhealthy(scope, account, exc: Exception) -> None:  # noqa: ANN001
-    """Write down that the mailbox could not be reached, where the person will see it.
-
-    The accounts page already renders ``health`` and ``health_detail``, so a mailbox that
-    has stopped answering says so there rather than in a log nobody is reading — and an
-    account that is not ``ok`` is one no suggestion is applied against, which is the
-    behaviour wanted while it is broken.
-    """
-    account.health = m.AccountHealth.down
-    account.health_detail = str(exc)
-    account.health_checked_at = dt.datetime.now(dt.UTC)
 
 
 async def _record_refusal(service: Service, request: Request, problem: str) -> None:

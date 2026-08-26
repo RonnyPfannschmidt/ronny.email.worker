@@ -104,6 +104,10 @@ Whatever the client, four things carry:
   appear. What it looks at is subjects, senders and previews — and a preview exists only
   once something has fetched that message's body, so a folder nobody has opened is
   searchable by who wrote it and what it is called, not yet by what it says.
+- **Syncing and body fetches are background tasks.** `request_sync` and `request_body`
+  enqueue work and answer with a `task_id`; poll `task_status` until it is `done` (the
+  sync's report, or the message once its body is cached) or `failed` (the error).
+  Asking again while one runs joins it rather than stacking another.
 - **Summarise before enumerating.** `summarize_senders` answers in one call what listing
   thousands of messages would. Every observation is capped by `max_messages_per_request`
   and comes back in one envelope — `returned`, `total_matching`, `truncated`, `note` — so

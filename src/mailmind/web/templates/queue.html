@@ -35,6 +35,28 @@
 </table>
 {% endif %}
 
+{% if applying %}
+<h2>Being applied</h2>
+<table>
+  <tr><th>What is happening</th><th>Messages</th><th>Progress</th><th></th></tr>
+  {% for b in applying %}
+  <tr>
+    <td class="effect">
+      {{ b.operation }}{% if b.flag %} {{ b.flag }}{% endif %}
+      {% if b.target_container %}<span class="arrow">&rarr;</span>{{ b.target_container }}{% endif %}
+    </td>
+    <td>{{ b.item_count }}</td>
+    <td>
+      {% set task = apply_tasks.get(b.bundle_id) %}
+      {% if task %}{% include "_task.html" %}{% else %}
+      <span class="muted small">waiting for the runner</span>{% endif %}
+    </td>
+    <td><a href="/bundle/{{ b.bundle_id }}">detail</a></td>
+  </tr>
+  {% endfor %}
+</table>
+{% endif %}
+
 {% if recent %}
 <h2>Recently decided</h2>
 <table class="small">

@@ -66,9 +66,7 @@ def upgrade() -> None:
         sa.Column("result", sa.JSON(), nullable=False),
         sa.Column("error", sa.Text(), nullable=True),
         sa.Column("attempts", sa.Integer(), nullable=False),
-        sa.Column(
-            "requested_by", sa.Integer(), sa.ForeignKey("producer.id"), nullable=True
-        ),
+        sa.Column("requested_by", sa.Integer(), sa.ForeignKey("producer.id"), nullable=True),
         sa.Column("created_at", sa.DateTime(), nullable=False),
         sa.Column("started_at", sa.DateTime(), nullable=True),
         sa.Column("finished_at", sa.DateTime(), nullable=True),

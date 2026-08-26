@@ -5,6 +5,9 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>{% block title %}mailmind{% endblock %}</title>
 <script src="/static/turbo.js" defer></script>
+{% if live_tasks is defined and live_tasks %}
+<noscript><meta http-equiv="refresh" content="5"></noscript>
+{% endif %}
 {% block head %}{% endblock %}
 <style>
 :root { color-scheme: light dark; --line:#0002; --warn:#b45309; --bad:#b91c1c; --ok:#15803d; }
@@ -37,6 +40,10 @@ details summary { cursor: pointer; }
 </style>
 </head>
 <body>
+{% if live_tasks is defined and live_tasks %}
+{# Turbo's own custom element: opens an EventSource and applies the streams it sends. #}
+<turbo-stream-source src="/events"></turbo-stream-source>
+{% endif %}
 <nav class="small">
   <a href="/">review queue</a><a href="/accounts">accounts</a><a href="/agents">agents</a>
   {% if current_account %}

@@ -31,8 +31,14 @@ where it would go. Operations are `move`, `add_flag`, `remove_flag`, `delete` an
 `discard_container`; delete moves to Trash, and nothing expunges, because mail has no undo.
 
 You can accept, reject with a reason, exclude a single item that does not belong and accept
-the rest, or load a body for a message whose subject is not enough to decide on. An agent
-can withdraw its own bundle until somebody decides.
+the rest, or ask for a body to be fetched for a message whose subject is not enough to
+decide on. An agent can withdraw its own bundle until somebody decides.
+
+Accepting hands the work to a background runner: the queue gains a **Being applied**
+section, the bundle page shows progress as it runs, and a failure — an unreachable
+mailbox, most often — is shown where it happened with a retry button, instead of a
+change that silently never lands. The same goes for **sync now** and body fetches; a
+sync's progress streams to the page while it runs.
 
 ## Bundles about folders
 

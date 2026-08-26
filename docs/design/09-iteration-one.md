@@ -11,7 +11,7 @@ accepting the results in a small web UI.
 One process. `/mcp` is a streamable-HTTP MCP endpoint; everything else is the review UI.
 SQLite behind both. `mailmindctl` migrates, seeds, probes, syncs and serves.
 
-An agent gets twelve tools — nine that look, three that say — and six resources. There
+An agent gets fifteen tools — ten that look, five that say — and six resources. There
 is no tool that applies anything ([the security model](../security-model.md) has what
 makes that structural); a test asserts the applier is imported nowhere on the agent side.
 

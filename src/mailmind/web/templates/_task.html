@@ -1,0 +1,22 @@
+{# One task's row: what runs, how far along, what failed. Swapped in place over SSE. #}
+<div id="task-{{ task.id }}" class="task small">
+  {% if task.status == "queued" %}
+    <span class="muted">waiting to start</span>
+  {% elif task.status == "running" %}
+    {% set verb = {"apply_bundle": "applying", "sync_account": "syncing",
+                   "sync_container": "syncing", "fetch_body": "fetching"}[task.kind] %}
+    <span>{{ verb }} — {{ task.done }}{% if task.total %}/{{ task.total }}{% endif %}
+      {%- if task.note %} · {{ task.note }}{% endif %}</span>
+    {% if task.total %}<progress value="{{ task.done }}" max="{{ task.total }}"></progress>{% endif %}
+  {% elif task.status == "failed" %}
+    <div class="banner error">
+      {{ task.error }}
+      <form method="post" action="/task/{{ task.id }}/retry" class="inline">
+        <input type="hidden" name="_csrf" value="{{ csrf }}">
+        <button>retry</button>
+      </form>
+    </div>
+  {% else %}
+    <span class="ok">done{% if task.result.note %} — {{ task.result.note }}{% endif %}</span>
+  {% endif %}
+</div>

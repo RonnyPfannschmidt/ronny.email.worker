@@ -159,10 +159,16 @@ that still has something below it.</p>
         <p class="small muted">Nothing above was fetched from the network. Remote images
         are not loaded: loading one tells the sender the mail was read.</p>
       {% else %}
-        <form method="post" action="/bundle/{{ bundle.bundle_id }}/body/{{ item.message_id }}">
-  <input type="hidden" name="_csrf" value="{{ csrf }}">
-          <button>fetch the body from the server</button>
-        </form>
+        {% set task = fetch_tasks.get(item.message_id) if fetch_tasks is defined else None %}
+        {% if task and task.status in ("queued", "running") %}
+          {% include "_task.html" %}
+        {% else %}
+          <form method="post" action="/bundle/{{ bundle.bundle_id }}/body/{{ item.message_id }}">
+            <input type="hidden" name="_csrf" value="{{ csrf }}">
+            <button>fetch the body from the server</button>
+          </form>
+          {% if task and task.status == "failed" %}{% include "_task.html" %}{% endif %}
+        {% endif %}
       {% endif %}
     </details>
   </td></tr>
@@ -216,6 +222,12 @@ message was untouched between the check and the change — it does not mean it w
     <button>Reject</button>
   </form>
 </div>
+{% elif bundle.status == "accepted" %}
+<div class="banner">
+  Accepted — being applied to the mailbox now. Nothing here needs you until it finishes.
+</div>
+{% if apply_task %}{% set task = apply_task %}{% include "_task.html" %}{% else %}
+<p class="small muted">waiting for the runner</p>{% endif %}
 {% elif bundle.status == "stale" %}
 <p class="small warn">
   Every message this referred to moved on before anybody decided, so there is nothing left

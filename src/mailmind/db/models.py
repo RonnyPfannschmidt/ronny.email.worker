@@ -877,9 +877,7 @@ class Task(Base, TenantScoped):
     result: Mapped[dict[str, Any]] = mapped_column(default=dict)
     error: Mapped[str | None] = mapped_column(sa.Text, default=None)
     attempts: Mapped[int] = mapped_column(default=0)
-    requested_by: Mapped[int | None] = mapped_column(
-        sa.ForeignKey("producer.id"), default=None
-    )
+    requested_by: Mapped[int | None] = mapped_column(sa.ForeignKey("producer.id"), default=None)
     created_at: Mapped[dt.datetime] = mapped_column(default=utcnow)
     started_at: Mapped[dt.datetime | None] = mapped_column(default=None)
     finished_at: Mapped[dt.datetime | None] = mapped_column(default=None)

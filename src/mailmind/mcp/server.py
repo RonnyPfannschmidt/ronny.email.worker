@@ -99,6 +99,23 @@ async def _message(scope: TenantScope, grant: dict[str, Any], message_id: int) -
     return message
 
 
+def _task_answer(task: m.Task, created: bool) -> dict:
+    """A background task, as a tool answers it: state now, result when there is one."""
+    return {
+        "task_id": task.id,
+        "status": task.status.value,
+        "coalesced": not created,
+        "progress": {
+            "done": task.progress_done,
+            "total": task.progress_total,
+            "note": task.progress_note,
+        },
+        "error": task.error,
+        "result": task.result,
+        "note": "Call again to see progress; the work happens in the background.",
+    }
+
+
 def _query_record(bundle: m.Bundle) -> dict[str, Any]:
     """What the last search on this bundle found, and what it left out.
 
@@ -288,30 +305,37 @@ def build_server(
 
     @server.tool()
     async def request_body(message_id: int) -> dict:
-        """Fetch and cache a message body from the server, then return it."""
+        """Ask for a message body to be fetched and cached; call again for the result.
+
+        Fetching is a background task now: the first call enqueues (or joins) it and
+        answers with the task's state; once the task is done, the answer is the message
+        with its body.  Idempotent — call it until the body arrives.
+        """
         grant = _require(m.Capability.observe)
-        from mailmind.imap import sync
+        from mailmind import tasks
 
         async with scope() as s:
-            await _message(s, grant, message_id)
+            message = await _message(s, grant, message_id)
+            if await s.scalar(
+                sa.select(m.MessageBody).where(m.MessageBody.message_id == message_id)
+            ):
+                return await views.message_detail(s, message_id, include_body=True)
             placement = await s.scalar(
                 views.live_placements().where(m.Placement.message_id == message_id)
             )
             if placement is None:
                 raise NotPermitted(f"no message {message_id}")
-            container = await s.get(m.Container, placement.container_id)
-            account = await s.get(m.Account, container.account_id)
-            async with service.backend(account) as backend:
-                await sync.fetch_and_cache_body(
-                    s,
-                    account,
-                    container,
-                    placement,
-                    backend,
-                    budget_bytes=service.config.limits.body_cache_bytes,
-                )
+            task, created = await tasks.enqueue(
+                s,
+                kind=m.TaskKind.fetch_body,
+                account_id=message.account_id,
+                subject_id=message_id,
+                requested_by=grant["producer_id"],
+            )
+            answer = _task_answer(task, created)
             await s.commit()
-            return await views.message_detail(s, message_id, include_body=True)
+        service.notify_tasks()
+        return answer
 
     @server.tool()
     async def summarize_senders(container_id: int, limit: int = 100) -> dict:
@@ -343,9 +367,14 @@ def build_server(
 
     @server.tool()
     async def request_sync(container_id: int) -> dict:
-        """Bring the cache up to date with the server. Observation, not a change."""
+        """Ask for the cache to catch up with the server; call again for the outcome.
+
+        Syncing is a background task now: this enqueues (or joins) one for the folder
+        and answers with the task's state and progress.  Once done, the answer carries
+        the sync's report as ``result``.  Observation, not a change — and idempotent.
+        """
         grant = _require(m.Capability.observe)
-        from mailmind.imap import sync
+        from mailmind import tasks
 
         async with scope() as s:
             container = await _container(s, grant, container_id)
@@ -354,18 +383,31 @@ def build_server(
                     f"{container.name} is a folder some bundle has proposed and nobody "
                     "has accepted yet, so there is nothing on the server to sync with"
                 )
-            account = await s.get(m.Account, container.account_id)
-            async with service.backend(account) as backend:
-                report = await sync.sync_container(s, account, container, backend)
+            task, created = await tasks.enqueue(
+                s,
+                kind=m.TaskKind.sync_container,
+                account_id=container.account_id,
+                subject_id=container_id,
+                requested_by=grant["producer_id"],
+            )
+            answer = _task_answer(task, created)
             await s.commit()
-            return {
-                "container": report.container,
-                "added": report.added,
-                "updated": report.updated,
-                "vanished": report.vanished,
-                "identity_broken": report.identity_broken,
-                "suggestions_killed": report.suggestions_killed,
-            }
+        service.notify_tasks()
+        return answer
+
+    @server.tool()
+    async def task_status(task_id: int) -> dict:
+        """How a background task from request_sync or request_body is doing.
+
+        Read-only.  Poll this with the ``task_id`` those tools answered with; ``done``
+        carries the result, ``failed`` the error.
+        """
+        grant = _require(m.Capability.observe)
+        async with scope() as s:
+            task = await s.get(m.Task, task_id)
+            if task is None or task.account_id not in grant["account_ids"]:
+                raise NotPermitted(f"no task {task_id}")
+            return _task_answer(task, created=False)
 
     # ---------------------------------------------------------------------- say
 

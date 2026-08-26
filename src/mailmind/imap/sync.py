@@ -387,9 +387,7 @@ async def sync_account(
     ``should_stop`` is checked between folders; a stopped sync keeps everything it
     committed.
     """
-    folders = [
-        c for c in await discover_containers(scope, account, backend) if c.selectable
-    ]
+    folders = [c for c in await discover_containers(scope, account, backend) if c.selectable]
     reports: list[SyncReport] = []
     for container in folders:
         if should_stop is not None and should_stop():
