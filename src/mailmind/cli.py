@@ -767,9 +767,33 @@ def forget_account(ctx: click.Context, name: str) -> None:
 @main.command()
 @click.option("--host", default=None)
 @click.option("--port", default=None, type=int)
+@click.option(
+    "--watch",
+    is_flag=True,
+    help="exit cleanly when the source changes, so a supervisor restarts into the edit",
+)
+@click.option(
+    "--watch-path",
+    "watch_paths",
+    multiple=True,
+    type=click.Path(exists=True),
+    help="what --watch watches; default: the mailmind package, pyproject.toml and uv.lock",
+)
 @click.pass_context
-def serve(ctx: click.Context, host: str | None, port: int | None) -> None:
-    """Run the review UI and the MCP endpoint."""
+def serve(
+    ctx: click.Context,
+    host: str | None,
+    port: int | None,
+    watch: bool,
+    watch_paths: tuple[str, ...],
+) -> None:
+    """Run the review UI and the MCP endpoint.
+
+    ``--watch`` is the editable-install service loop: the process itself never reloads
+    anything — it exits 0 on a source change and lets the supervisor restart it, so
+    there is exactly one restarter and ``uv run`` re-syncs dependencies on the way back
+    up. Pairs with ``Restart=always``; see integrations/mailmind.service.
+    """
     import uvicorn
 
     from mailmind.web.app import create_app, mint_session_key
@@ -788,7 +812,7 @@ def serve(ctx: click.Context, host: str | None, port: int | None) -> None:
         # on an exit, and the person's browser would see nothing at all.  Hold the port
         # with a page that says what to run, watch for the migration, and exit cleanly
         # once it has happened so a `Restart=always` unit comes back as the real thing.
-        _hold_until_migrated(service, problem)
+        _hold_until_migrated(service, problem, watch=watch, watch_paths=watch_paths)
         return
     session_key = mint_session_key()
     try:
@@ -821,10 +845,65 @@ def serve(ctx: click.Context, host: str | None, port: int | None) -> None:
     # The trailing slash is not decoration: the endpoint is mounted at /mcp/ and a POST to
     # /mcp gets a 307, which an MCP client is entitled to follow and may not.
     click.echo(f"MCP        {where}/mcp/", err=not a_terminal)
-    uvicorn.run(app, host=service.config.bind, port=service.config.port)
+    server = uvicorn.Server(
+        uvicorn.Config(app, host=service.config.bind, port=service.config.port)
+    )
+    asyncio.run(_serve_watched(server, watch=watch, watch_paths=watch_paths))
+    raise SystemExit(0)
 
 
-def _hold_until_migrated(service: Service, problem: str) -> None:
+def _watched_paths(named: tuple[str, ...]) -> list[Path]:
+    """What an edit to "the server" means: the package, and what pins its dependencies.
+
+    The package directory carries everything that ships — code, templates, static,
+    migrations. pyproject.toml and uv.lock are watched when a checkout root is found
+    above the package, because ``uv run`` re-syncs from them at the next start.
+    """
+    if named:
+        return [Path(path) for path in named]
+    import mailmind
+
+    package = Path(mailmind.__file__).resolve().parent
+    paths = [package]
+    for root in package.parents:
+        if (root / "pyproject.toml").exists():
+            paths.append(root / "pyproject.toml")
+            if (root / "uv.lock").exists():
+                paths.append(root / "uv.lock")
+            break
+    return paths
+
+
+async def _watch_and_exit(server, watch_paths: tuple[str, ...]) -> None:  # noqa: ANN001
+    """Exit-on-change: the process is disposable, the supervisor is the restarter."""
+    import watchfiles
+
+    paths = _watched_paths(watch_paths)
+    async for changes in watchfiles.awatch(*paths):
+        names = sorted({Path(changed).name for _, changed in changes})
+        click.echo(
+            f"source changed ({', '.join(names[:5])}) — exiting so the supervisor "
+            "restarts into the edit",
+            err=True,
+        )
+        server.should_exit = True
+        return
+
+
+async def _serve_watched(server, *, watch: bool, watch_paths: tuple[str, ...]) -> None:  # noqa: ANN001
+    if not watch:
+        await server.serve()
+        return
+    serving = asyncio.create_task(server.serve())
+    watching = asyncio.create_task(_watch_and_exit(server, watch_paths))
+    await serving
+    watching.cancel()
+    await asyncio.gather(watching, return_exceptions=True)
+
+
+def _hold_until_migrated(
+    service: Service, problem: str, *, watch: bool = False, watch_paths: tuple[str, ...] = ()
+) -> None:
     """Serve the not-operating page until `mailmindctl migrate` runs, then exit 0."""
     import uvicorn
 
@@ -848,19 +927,25 @@ def _hold_until_migrated(service: Service, problem: str) -> None:
     )
 
     async def hold() -> None:
-        async def watch() -> None:
+        async def until_migrated() -> None:
             while not server.should_exit:
                 await asyncio.sleep(5)
-                if await asyncio.to_thread(
-                    schema_problem, service.config.database_url
-                ) is None:
+                if (
+                    await asyncio.to_thread(schema_problem, service.config.database_url)
+                    is None
+                ):
                     server.should_exit = True
 
         serving = asyncio.create_task(server.serve())
-        watching = asyncio.create_task(watch())
+        watchers = [asyncio.create_task(until_migrated())]
+        if watch:
+            # The way out may be an edit rather than a migration — a wrong revision,
+            # a broken migration file — so a source change restarts this too.
+            watchers.append(asyncio.create_task(_watch_and_exit(server, watch_paths)))
         await serving
-        watching.cancel()
-        await asyncio.gather(watching, return_exceptions=True)
+        for watcher in watchers:
+            watcher.cancel()
+        await asyncio.gather(*watchers, return_exceptions=True)
 
     try:
         asyncio.run(hold())

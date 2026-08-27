@@ -19,10 +19,22 @@ migrates on its own. What happens around a restart:
 - **Every other command** refuses until the database catches up, and says so — which is
   better than the `no such column` traceback that taught us to add the check.
 
-Restarting on code change stays the supervisor's job — `systemctl restart` after a
-pull, a systemd path unit, or `watchfiles 'uv run mailmindctl serve' src/` for a dev
-loop. mailmind's part is that no restart ever lands you in a crash loop or a quiet
-mismatch.
+**`serve --watch` is the editable-install service loop.** The process never reloads
+anything in place: it exits 0 when the package source, `pyproject.toml` or `uv.lock`
+changes, and the supervisor restarts it — one restarter, and `uv run` re-syncs
+dependencies on the way back up. `integrations/mailmind.service` is a ready systemd
+user unit with `Restart=always` and backoff:
+
+```
+cp integrations/mailmind.service ~/.config/systemd/user/   # adjust the two paths
+systemctl --user daemon-reload && systemctl --user enable --now mailmind
+```
+
+Edit the server, save, and the unit is serving your edit a couple of seconds later; a
+crash retries with backoff; a schema change shows the migrate page until you run
+`mailmindctl migrate` and then comes back by itself. Without systemd, the same flag
+works under any supervisor that restarts on exit — or run
+`watchfiles 'uv run mailmindctl serve' src/` in a terminal for a foreground loop.
 
 **One-off, installing nothing:**
 

@@ -1,0 +1,32 @@
+# mailmind as a systemd user unit, running from a checkout (an editable install).
+#
+#   cp integrations/mailmind.service ~/.config/systemd/user/
+#   systemctl --user daemon-reload && systemctl --user enable --now mailmind
+#
+# One restarter, on purpose: the process exits 0 when it should be replaced — its own
+# source changed (--watch), or a behind database was migrated — and `Restart=always`
+# brings it back. `uv run` re-syncs dependencies from uv.lock on the way up, so a pull
+# that changed them heals at the next restart too. A database that needs migrating is a
+# 503 page naming `mailmindctl migrate`, never a crash loop; a crash proper is retried
+# with backoff below.
+#
+# The review key is written to a file only you can read; the journal gets its path.
+# `mailmindctl review --open` follows it.
+
+[Unit]
+Description=mailmind — review UI and MCP endpoint, from a checkout
+
+[Service]
+# Adjust both paths. WorkingDirectory is the checkout; the config path is absolute
+# because nothing here should depend on where the process happens to start.
+WorkingDirectory=%h/Projects/RonnyPfannschmidt/ronny.email.worker
+Environment=MAILMIND_CONFIG=%h/.config/mailmind/mailmind.toml
+ExecStart=/usr/bin/env uv run mailmindctl serve --watch
+Restart=always
+RestartSec=2
+# Repeated failures back off rather than hammer (systemd >= 254; harmless to drop).
+RestartSteps=5
+RestartMaxDelaySec=60
+
+[Install]
+WantedBy=default.target

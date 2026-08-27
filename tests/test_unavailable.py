@@ -86,3 +86,50 @@ def test_serve_against_a_behind_database_holds_a_page_and_exits_once_migrated(tm
         if proc.poll() is None:
             proc.kill()
             proc.wait(timeout=10)
+
+
+def test_serve_watch_exits_cleanly_when_the_source_changes(tmp_path):
+    """`--watch` is exit-on-change: one restarter (the supervisor), one clean exit."""
+    db = tmp_path / "mm.db"
+    upgrade_to_head(f"sqlite:///{db}")
+    port = _free_port()
+    config = tmp_path / "mailmind.toml"
+    config.write_text(CONFIG.format(db=db, port=port))
+    watched = tmp_path / "src"
+    watched.mkdir()
+    (watched / "server.py").write_text("before\n")
+
+    proc = subprocess.Popen(
+        [
+            sys.executable,
+            "-m",
+            "mailmind.cli",
+            "--config",
+            str(config),
+            "serve",
+            "--watch",
+            "--watch-path",
+            str(watched),
+        ],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        deadline = time.monotonic() + 20
+        while time.monotonic() < deadline:
+            try:
+                status, _ = _get(f"http://127.0.0.1:{port}/")
+                break
+            except OSError:
+                assert proc.poll() is None, proc.stderr.read()
+                time.sleep(0.1)
+        assert status == 401, "serving (the login page), not crashed"
+
+        (watched / "server.py").write_text("after — the edit being fixed\n")
+        assert proc.wait(timeout=30) == 0, "a source change is a clean exit, not a crash"
+        assert "restarts into the edit" in proc.stderr.read()
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait(timeout=10)

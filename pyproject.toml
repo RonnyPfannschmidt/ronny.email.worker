@@ -25,6 +25,9 @@ dependencies = [
     "click>=8.1",
     # For the sync display: 187 folders is a long silence otherwise.
     "rich>=13",
+    # For `serve --watch`: exit cleanly when the source changes, so a supervisor
+    # restarts into the edit. The same watcher uvicorn's own --reload uses.
+    "watchfiles>=0.24",
 ]
 
 [project.scripts]

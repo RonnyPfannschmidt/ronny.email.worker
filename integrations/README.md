@@ -9,6 +9,7 @@ gets and what it does not.
 |---|---|
 | [`opencode.json`](opencode.json) | opencode, current config schema (`mcp.servers`) |
 | [`mcp-servers.json`](mcp-servers.json) | the `mcpServers` shape: Claude Desktop, Claude Code's `.mcp.json`, VS Code, and most others |
+| [`mailmind.service`](mailmind.service) | a systemd user unit serving from a checkout, restarting on your edits |
 
 ## Where they go
 
