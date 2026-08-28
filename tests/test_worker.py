@@ -337,3 +337,22 @@ async def test_the_dispatcher_survives_a_locked_database(service, backend, monke
 
     assert calls >= 2, "the first, failing pass was retried"
     assert len(backend.folders["Archive"].messages) == 1
+
+
+async def test_a_bug_in_the_dispatcher_fails_the_whole_service_not_half(
+    service, backend, monkeypatch
+):
+    """A database error retries; anything else must not linger as a half-dead app."""
+    async def broken(scope, *, busy_accounts):
+        raise ValueError("a genuine bug, not weather")
+
+    monkeypatch.setattr(worker.tasks, "claim_next", broken)
+    pulled_the_plug = asyncio.Event()
+    monkeypatch.setattr(worker, "_shut_the_whole_service_down", pulled_the_plug.set)
+
+    runner = worker.TaskRunner(service, poll_interval=0.05)
+    async with asyncio.TaskGroup() as tg:
+        await runner.start(tg)
+        service.notify_tasks()
+        await asyncio.wait_for(pulled_the_plug.wait(), timeout=10)
+        await runner.stop()

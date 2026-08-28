@@ -15,6 +15,7 @@ from __future__ import annotations
 import asyncio
 import datetime as dt
 import logging
+import signal
 import traceback
 
 import sqlalchemy as sa
@@ -32,6 +33,17 @@ from mailmind.suggest import staleness
 INTERRUPTED = "interrupted by shutdown"
 
 log = logging.getLogger("mailmind.worker")
+
+
+def _shut_the_whole_service_down() -> None:
+    """Fail whole, never half.
+
+    A bug escaping the dispatcher used to cancel the lifespan, which killed the MCP
+    session manager while uvicorn kept serving pages — the worst state, because it looks
+    alive.  A graceful SIGTERM takes everything down together: lanes requeue their work,
+    the exit is visible, and a supervisor restarts it.  (Seam for tests.)
+    """
+    signal.raise_signal(signal.SIGTERM)
 
 
 class Hub:
@@ -149,15 +161,29 @@ class TaskRunner:
         cancels the lifespan — which tears the MCP session manager down while uvicorn
         keeps serving, and the service is half-dead until a restart.  That happened: a
         `database is locked` from a claim colliding with a long sync transaction took
-        the whole background system with it.  So: one pass, one try, and any failure is
-        a logged wait-and-retry rather than an unwinding.
+        the whole background system with it.  Two failures, two answers: a database
+        error is expected weather under SQLite — one writer, long transactions — and is
+        a logged retry; anything else is a bug, and a bug shuts the whole service down
+        rather than half of it.
         """
         while not self._stopping.is_set():
             try:
                 claimed = await self._one_pass()
-            except Exception:
-                log.exception("dispatch pass failed; retrying in %ss", self.poll_interval)
+            except sa.exc.OperationalError as exc:
+                # The claim lost a busy_timeout race with a long write (a first sync of
+                # a big folder, most likely).  Transient by construction: retry.
+                log.warning(
+                    "dispatch pass failed on the database (%s); retrying in %ss",
+                    exc,
+                    self.poll_interval,
+                )
                 claimed = None
+            except Exception:
+                log.critical(
+                    "dispatch pass hit a bug; shutting the service down whole", exc_info=True
+                )
+                _shut_the_whole_service_down()
+                return
             if claimed:
                 continue
             try:
