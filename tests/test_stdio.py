@@ -49,7 +49,19 @@ def workspace(tmp_path):
     db = tmp_path / "mm.db"
     url = f"sqlite:///{db}"
     upgrade_to_head(url)
-    sessions = make_sessionmaker(create_engine_async(url))
+    engine = create_engine_async(url)
+    sessions = make_sessionmaker(engine)
+
+    def on_own_loop(main):  # noqa: ANN001, ANN202
+        """asyncio.run with the pool handed back — its connections belong to the loop."""
+
+        async def go():  # noqa: ANN202
+            try:
+                return await main
+            finally:
+                await engine.dispose()
+
+        return asyncio.run(go())
 
     async def seed() -> dict:
         async with tenant_scope(sessions, 0) as scope:
@@ -82,7 +94,7 @@ def workspace(tmp_path):
                 "message": message.id,
             }
 
-    ids = asyncio.run(seed())
+    ids = on_own_loop(seed())
 
     # A port nothing is on, so "the UI is advertised here" and "this process is not
     # listening here" can both be asserted against the same number.
@@ -92,7 +104,14 @@ def workspace(tmp_path):
 
     config = tmp_path / "mailmind.toml"
     config.write_text(CONFIG.format(db=db, port=port))
-    return {"config": config, "url": url, "sessions": sessions, "port": port, **ids}
+    return {
+        "config": config,
+        "url": url,
+        "sessions": sessions,
+        "on_own_loop": on_own_loop,
+        "port": port,
+        **ids,
+    }
 
 
 class StdioClient:
@@ -357,7 +376,7 @@ def test_stdio_reuses_the_named_producer_s_grant_rather_than_widening_it(workspa
             scope.add(m.GrantAccount(grant_id=grant.id, account_id=workspace["account"]))
             await scope.commit()
 
-    asyncio.run(narrow_grant())
+    workspace["on_own_loop"](narrow_grant())
 
     client = StdioClient(workspace["config"], "--producer", "narrow")
     try:
@@ -395,7 +414,7 @@ def test_stdio_reuses_the_named_producer_s_grant_rather_than_widening_it(workspa
         async with tenant_scope(workspace["sessions"], 0) as scope:
             return len(await scope.all(sa.select(m.Grant)))
 
-    assert asyncio.run(count_grants()) == 1, (
+    assert workspace["on_own_loop"](count_grants()) == 1, (
         "a second grant was minted instead of the narrow one reused"
     )
 
@@ -434,7 +453,7 @@ def test_stdio_mints_a_grant_that_cannot_be_used_over_http(workspace):
             )
             assert minted.payload["transport"] == "stdio"
 
-    asyncio.run(check())
+    workspace["on_own_loop"](check())
 
 
 #: How to get at the spawn command in each shipped configuration.

@@ -139,6 +139,12 @@ async def sync_container(
             was_added = await _absorb(scope, account, container, info)
             added += was_added
             updated += not was_added
+        # Per batch, so no transaction outlives one round trip's worth of rows.  The
+        # folder's watermarks move only at the end, so a run cut short re-syncs from the
+        # old ones and absorbing again is an upsert — nothing is lost or doubled.  A
+        # whole first-sync folder in one transaction used to hold SQLite's write lock
+        # for minutes, which is what everything else then timed out against.
+        await scope.commit()
         if progress is not None:
             progress.messages_absorbed(len(infos))
 

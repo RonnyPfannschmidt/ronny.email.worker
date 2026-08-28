@@ -21,7 +21,7 @@ def database_url(tmp_path) -> str:
 
 
 @pytest.fixture
-def sessions(database_url):
+async def sessions(database_url):
     """A database built by running the migrations.
 
     Not by ``create_all``: a second way of building the schema is a second definition of
@@ -30,7 +30,10 @@ def sessions(database_url):
     runs on.  It also means every test run exercises the migration.
     """
     upgrade_to_head(database_url)
-    return make_sessionmaker(create_engine_async(database_url))
+    engine = create_engine_async(database_url)
+    yield make_sessionmaker(engine)
+    # Pooled connections belong to this test's loop; hand them back before it goes.
+    await engine.dispose()
 
 
 @pytest.fixture

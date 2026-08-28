@@ -191,7 +191,11 @@ async def _close_if_nothing_survived(scope: TenantScope, bundle: m.Bundle) -> No
     )
 
 
-async def sweep_queue(scope: TenantScope, account_ids: set[int] | None = None) -> int:
+async def sweep_queue(
+    scope: TenantScope,
+    account_ids: set[int] | None = None,
+    checkpoint=None,  # noqa: ANN001 - async () -> None, usually scope.commit
+) -> int:
     """Refresh every bundle still awaiting review, and return how many closed.
 
     Drawing the queue is the moment somebody is about to act on it, so it is also the
@@ -211,4 +215,6 @@ async def sweep_queue(scope: TenantScope, account_ids: set[int] | None = None) -
         await refresh_bundle(scope, bundle)
         if bundle.status is m.BundleStatus.stale:
             closed += 1
+        if checkpoint is not None:
+            await checkpoint()
     return closed

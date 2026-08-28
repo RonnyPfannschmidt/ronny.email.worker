@@ -205,20 +205,26 @@ def build_server(
         grant = _grant()
         return service.scope(grant["tenant_id"])
 
+    def reading():
+        """Observation's scope: begun DEFERRED, so a listing neither waits on a long
+        sync nor makes one wait.  Writing on it raises — which is the point."""
+        grant = _grant()
+        return service.scope(grant["tenant_id"], readonly=True)
+
     # ------------------------------------------------------------------ observe
 
     @server.tool()
     async def list_accounts() -> list[dict]:
         """The mail accounts this grant covers. There may be none."""
         grant = _require(m.Capability.observe)
-        async with scope() as s:
+        async with reading() as s:
             return await views.accounts(s, allowed=grant["account_ids"])
 
     @server.tool()
     async def list_containers(account_id: int) -> list[dict]:
         """Folders in an account, with how much of each is cached."""
         grant = _require(m.Capability.observe)
-        async with scope() as s:
+        async with reading() as s:
             await _account(s, grant, account_id)
             return await views.containers(s, account_id)
 
@@ -243,7 +249,7 @@ def build_server(
         """
         grant = _require(m.Capability.observe)
         cap = service.config.limits.max_messages_per_request
-        async with scope() as s:
+        async with reading() as s:
             await _container(s, grant, container_id)
             return await views.messages(
                 s,
@@ -274,7 +280,7 @@ def build_server(
         says how many matched.
         """
         grant = _require(m.Capability.observe)
-        async with scope() as s:
+        async with reading() as s:
             if account_id is not None:
                 await _account(s, grant, account_id)
             return await views.search(
@@ -295,7 +301,7 @@ def build_server(
         to render it — a remote image would tell the sender the mail had been read.
         """
         grant = _require(m.Capability.observe)
-        async with scope() as s:
+        async with reading() as s:
             await _message(s, grant, message_id)
             detail = await views.message_detail(s, message_id, include_body=include_body)
             detail["content_warning"] = (
@@ -349,7 +355,7 @@ def build_server(
         """
         grant = _require(m.Capability.observe)
         cap = service.config.limits.max_messages_per_request
-        async with scope() as s:
+        async with reading() as s:
             await _container(s, grant, container_id)
             return await views.summarize_senders(s, container_id, limit=min(limit, cap))
 
@@ -361,7 +367,7 @@ def build_server(
         """
         grant = _require(m.Capability.observe)
         cap = service.config.limits.max_messages_per_request
-        async with scope() as s:
+        async with reading() as s:
             await _container(s, grant, container_id)
             return await views.summarize_lists(s, container_id, limit=min(limit, cap))
 
@@ -403,7 +409,7 @@ def build_server(
         carries the result, ``failed`` the error.
         """
         grant = _require(m.Capability.observe)
-        async with scope() as s:
+        async with reading() as s:
             task = await s.get(m.Task, task_id)
             if task is None or task.account_id not in grant["account_ids"]:
                 raise NotPermitted(f"no task {task_id}")
@@ -762,14 +768,14 @@ def build_server(
     async def accounts_resource() -> list[dict]:
         """The accounts this grant covers."""
         grant = _require(m.Capability.observe)
-        async with scope() as s:
+        async with reading() as s:
             return await views.accounts(s, allowed=grant["account_ids"])
 
     @server.resource("mailmind://bundles/open", mime_type="application/json")
     async def open_bundles() -> list[dict]:
         """Bundles awaiting review."""
         grant = _require(m.Capability.suggest)
-        async with scope() as s:
+        async with reading() as s:
             return await views.bundle_summaries(
                 s, [m.BundleStatus.proposed], account_ids=grant["account_ids"]
             )
@@ -783,7 +789,7 @@ def build_server(
         and this side of it is not settled.
         """
         grant = _require(m.Capability.suggest)
-        async with scope() as s:
+        async with reading() as s:
             rows = await views.bundle_summaries(
                 s,
                 [
@@ -803,7 +809,7 @@ def build_server(
     async def bundle_resource(bundle_id: str) -> dict:
         """One bundle: its whole effect, item by item, with premise state."""
         grant = _require(m.Capability.suggest)
-        async with scope() as s:
+        async with reading() as s:
             await _bundle(s, grant, int(bundle_id))
             detail = await views.bundle_detail(s, int(bundle_id))
             detail.pop("decision_reason", None)
@@ -813,7 +819,7 @@ def build_server(
     async def suggestion_resource(suggestion_id: str) -> dict:
         """One item of one bundle."""
         grant = _require(m.Capability.suggest)
-        async with scope() as s:
+        async with reading() as s:
             suggestion = await s.get(m.Suggestion, int(suggestion_id))
             if suggestion is None:
                 raise NotPermitted(f"no suggestion {suggestion_id}")
@@ -839,7 +845,7 @@ def build_server(
     async def containers_resource(account_id: str) -> list[dict]:
         """Folders of one account."""
         grant = _require(m.Capability.observe)
-        async with scope() as s:
+        async with reading() as s:
             await _account(s, grant, int(account_id))
             return await views.containers(s, int(account_id))
 

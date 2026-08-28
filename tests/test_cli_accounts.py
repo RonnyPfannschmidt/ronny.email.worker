@@ -9,8 +9,6 @@ review UI forever.
 
 from __future__ import annotations
 
-import asyncio
-
 import sqlalchemy as sa
 from click.testing import CliRunner
 
@@ -85,7 +83,7 @@ def scoped(service, work):  # noqa: ANN001, ANN201
         async with service.scope(TENANT_ZERO) as scope:
             return await work(scope)
 
-    return asyncio.run(go())
+    return service.run(go())
 
 
 def test_list_says_which_account_the_configuration_no_longer_asks_for(tmp_path):

@@ -181,7 +181,7 @@ def make_grant(
             await scope.commit()
             click.echo(f"grant {grant.id} for {producer} over {len(accounts)} account(s)")
 
-    asyncio.run(go())
+    service.run(go())
     click.echo(f"\n  {token}\n")
     click.echo("This is shown once. Give it to the agent as a bearer token.")
 
@@ -217,7 +217,7 @@ def probe(ctx: click.Context) -> None:
             await scope.commit()
         return diverged
 
-    raise SystemExit(1 if asyncio.run(go()) else 0)
+    raise SystemExit(1 if service.run(go()) else 0)
 
 
 @contextlib.contextmanager
@@ -375,7 +375,7 @@ def sync(ctx: click.Context, account_name: str | None, force_full: bool) -> None
                             progress=display,
                         )
 
-    asyncio.run(go())
+    service.run(go())
     service.close()
 
 
@@ -388,11 +388,11 @@ def status(ctx: click.Context) -> None:
     service = _service(ctx.obj["config_path"])
 
     async def go() -> None:
-        async with service.scope(TENANT_ZERO) as scope:
+        async with service.scope(TENANT_ZERO, readonly=True) as scope:
             bundles = await views.bundle_summaries(scope, [m.BundleStatus.proposed])
             click.echo(json.dumps(bundles, indent=2))
 
-    asyncio.run(go())
+    service.run(go())
 
 
 @main.command("mcp")
@@ -550,7 +550,7 @@ def mcp_stdio(
     else:
         click.echo(f"review UI  {review_url} — `mailmindctl serve` runs it", err=True)
     try:
-        asyncio.run(run())
+        service.run(run())
     except KeyboardInterrupt:  # pragma: no cover - the client closing the pipe
         pass
     finally:
@@ -577,7 +577,7 @@ def list_accounts(ctx: click.Context) -> None:
 
     async def go() -> None:
         chosen: set[int]
-        async with service.scope(TENANT_ZERO) as scope:
+        async with service.scope(TENANT_ZERO, readonly=True) as scope:
             chosen = {
                 p.current_account_id
                 for p in await scope.all(sa.select(m.Producer))
@@ -602,7 +602,7 @@ def list_accounts(ctx: click.Context) -> None:
                     f"{row.health.value}  {folders} folder(s){trailer}"
                 )
 
-    asyncio.run(go())
+    service.run(go())
 
 
 @account.command("seed")
@@ -649,7 +649,7 @@ def seed_accounts(ctx: click.Context, apply_changes: bool) -> None:
                 )
             await scope.commit()
 
-    asyncio.run(go())
+    service.run(go())
     service.close()
 
 
@@ -760,7 +760,7 @@ def forget_account(ctx: click.Context, name: str) -> None:
             await scope.delete(row)
             await scope.commit()
 
-    asyncio.run(go())
+    service.run(go())
     click.echo(f"forgot {name}")
 
 
@@ -930,10 +930,7 @@ def _hold_until_migrated(
         async def until_migrated() -> None:
             while not server.should_exit:
                 await asyncio.sleep(5)
-                if (
-                    await asyncio.to_thread(schema_problem, service.config.database_url)
-                    is None
-                ):
+                if await asyncio.to_thread(schema_problem, service.config.database_url) is None:
                     server.should_exit = True
 
         serving = asyncio.create_task(server.serve())

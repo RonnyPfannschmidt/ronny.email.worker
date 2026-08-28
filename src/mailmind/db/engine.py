@@ -57,9 +57,17 @@ def _install_sqlite_listeners(engine: Engine) -> None:
 
         ``BEGIN IMMEDIATE`` makes them queue instead: the second transaction waits for
         the first (up to ``busy_timeout``) and then reads what it actually committed.
-        Serialising a single-user local service costs nothing that matters.
+        Serialising the *writers* of a single-user local service costs nothing that
+        matters — but only the writers.  Under WAL a reader needs no lock at all, so a
+        read-only scope (the queue page, the agent's listings) begins DEFERRED and
+        neither waits on a long sync nor makes anybody wait; the scope layer refuses to
+        flush writes on one, so mislabeling is loud rather than a quiet return of the
+        lost-update race.
         """
-        connection.exec_driver_sql("BEGIN IMMEDIATE")
+        if connection.get_execution_options().get("mailmind_readonly", False):
+            connection.exec_driver_sql("BEGIN DEFERRED")
+        else:
+            connection.exec_driver_sql("BEGIN IMMEDIATE")
 
 
 def create_engine_async(url: str, *, echo: bool = False) -> AsyncEngine:
@@ -69,9 +77,12 @@ def create_engine_async(url: str, *, echo: bool = False) -> AsyncEngine:
     :func:`create_engine` sets them — one place would be better, and is where this and
     that share their listeners.
     """
-    # NullPool: a pooled aiosqlite connection is bound to the event loop that created
-    # it, and this engine outlives loops — fixtures, `asyncio.run` CLI commands and the
-    # serving loop would otherwise trade poisoned connections through the pool.
-    engine = create_async_engine(async_url(url), echo=echo, poolclass=sa.pool.NullPool)
+    # Pooled: opening a SQLite connection is a file open, three PRAGMAs and an
+    # aiosqlite thread, and paying that per transaction was the operational mistake
+    # NullPool used to make here.  The price of the pool is that an aiosqlite
+    # connection is bound to the event loop that created it — so every place that owns
+    # a loop end (`Service.run`, the app lifespan, test fixtures) disposes the engine
+    # before the loop goes, and the pool refills lazily on the next one.
+    engine = create_async_engine(async_url(url), echo=echo)
     _install_sqlite_listeners(engine.sync_engine)
     return engine

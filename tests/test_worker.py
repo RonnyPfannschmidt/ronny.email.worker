@@ -62,7 +62,8 @@ async def service(tmp_path, backend):
         for container in await sync.discover_containers(scope, account, backend):
             await sync.sync_container(scope, account, container, backend)
         await scope.commit()
-    return service
+    yield service
+    await service.dispose()
 
 
 async def _accepted_bundle(service, names=("newsletter",)) -> tuple[int, int]:
@@ -343,6 +344,7 @@ async def test_a_bug_in_the_dispatcher_fails_the_whole_service_not_half(
     service, backend, monkeypatch
 ):
     """A database error retries; anything else must not linger as a half-dead app."""
+
     async def broken(scope, *, busy_accounts):
         raise ValueError("a genuine bug, not weather")
 

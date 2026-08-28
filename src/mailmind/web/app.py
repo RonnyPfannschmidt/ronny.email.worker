@@ -110,9 +110,7 @@ def create_unavailable_app(reason: str) -> FastAPI:
     """
     app = FastAPI(title="mailmind (not operating)")
 
-    @app.api_route(
-        "/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH", "HEAD"]
-    )
+    @app.api_route("/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH", "HEAD"])
     async def everything(path: str):  # noqa: ANN202, ARG001
         return unavailable_page(reason)
 
@@ -329,6 +327,10 @@ def create_app(
                 if mcp_session_manager is not None:
                     await stack.enter_async_context(mcp_session_manager.run())
                 tg = await stack.enter_async_context(asyncio.TaskGroup())
+                # LIFO: the runner stops first, then the pool is handed back — a
+                # pooled aiosqlite connection belongs to this loop and must not
+                # outlive it.
+                stack.push_async_callback(service.engine.dispose)
                 await runner.start(tg)
                 stack.push_async_callback(runner.stop)
                 the_app.state.task_runner = runner
@@ -494,7 +496,7 @@ def create_app(
 
     @app.get("/task/{task_id}/fragment", response_class=HTMLResponse)
     async def task_fragment_page(task_id: int):  # noqa: ANN202
-        async with service.scope() as scope:
+        async with service.scope(readonly=True) as scope:
             task = await scope.get(m.Task, task_id)
             if task is None:
                 return HTMLResponse("no such task", status_code=404)
@@ -554,13 +556,13 @@ def create_app(
             try:
                 # Catch up first: a page that opens the stream mid-run gets the current
                 # state now rather than at the next change.
-                async with service.scope() as scope:
+                async with service.scope(readonly=True) as scope:
                     live_now = await views.task_summaries(scope, None, live_only=True)
                 for view in live_now:
                     yield as_event(view)
                 while True:
                     task_id = await queue.get()
-                    async with service.scope() as scope:
+                    async with service.scope(readonly=True) as scope:
                         task = await scope.get(m.Task, task_id)
                         if task is None:
                             continue
@@ -578,7 +580,7 @@ def create_app(
 
     @app.get("/", response_class=HTMLResponse)
     async def queue(request: Request):  # noqa: ANN202
-        async with service.scope() as scope:
+        async with service.scope(readonly=True) as scope:
             await suggest.expire_due(scope)
             header = await chrome(scope)
             current = header["current_account"]
@@ -772,7 +774,7 @@ def create_app(
 
     @app.get("/accounts", response_class=HTMLResponse)
     async def accounts_page(request: Request):  # noqa: ANN202
-        async with service.scope() as scope:
+        async with service.scope(readonly=True) as scope:
             rows = []
             for account in await scope.all(sa.select(m.Account)):
                 caps = await scope.all(
@@ -968,7 +970,7 @@ def create_app(
     @app.get("/agents", response_class=HTMLResponse)
     async def agents_page(request: Request):  # noqa: ANN202
         """What has been let in, and the button that takes it back."""
-        async with service.scope() as scope:
+        async with service.scope(readonly=True) as scope:
             names = {a["id"]: a["name"] for a in await views.accounts(scope)}
             clients = {
                 c.client_id: c.client_name for c in await scope.all(sa.select(m.OAuthClient))

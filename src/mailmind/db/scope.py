@@ -41,6 +41,18 @@ class Unscoped(Exception):
     """A session reached the database without a tenant bound to it."""
 
 
+class ReadOnlyScope(Exception):
+    """A scope opened for reading tried to write.
+
+    Read-only scopes begin DEFERRED and take no write lock, which is only safe if they
+    truly do not write — so a write on one is refused here, loudly, instead of quietly
+    reintroducing the lost-update race the IMMEDIATE transactions exist to prevent."""
+
+
+#: Key marking a session as read-only in ``Session.info``.
+READONLY_KEY = "mailmind_readonly"
+
+
 @event.listens_for(Session, "do_orm_execute")
 def _apply_tenant_criteria(state: Any) -> None:
     if state.is_column_load or state.is_relationship_load:
@@ -71,6 +83,8 @@ def _apply_tenant_criteria(state: Any) -> None:
 
 @event.listens_for(Session, "before_flush")
 def _stamp_tenant(session: Session, flush_context: Any, instances: Any) -> None:
+    if session.info.get(READONLY_KEY) and (session.new or session.dirty or session.deleted):
+        raise ReadOnlyScope("this scope was opened readonly; open a writing scope for changes")
     tenant_id = session.info.get(TENANT_KEY)
     if tenant_id is None:
         return
@@ -169,7 +183,15 @@ class TenantScope:
         return event_row
 
 
-def make_sessionmaker(engine: AsyncEngine) -> async_sessionmaker[AsyncSession]:
+def make_sessionmaker(
+    engine: AsyncEngine, *, readonly: bool = False
+) -> async_sessionmaker[AsyncSession]:
+    if readonly:
+        return async_sessionmaker(
+            engine.execution_options(mailmind_readonly=True),
+            expire_on_commit=False,
+            info={READONLY_KEY: True},
+        )
     return async_sessionmaker(engine, expire_on_commit=False)
 
 

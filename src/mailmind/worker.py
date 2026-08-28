@@ -226,9 +226,7 @@ class TaskRunner:
         if now - self._last_tick < self.tick_interval:
             return
         self._last_tick = now
-        problem = await asyncio.to_thread(
-            schema_problem, self.service.config.database_url
-        )
+        problem = await asyncio.to_thread(schema_problem, self.service.config.database_url)
         if problem is not None:
             self.service.schema_problem = (
                 problem + " — the database changed under this running service; "
@@ -238,7 +236,8 @@ class TaskRunner:
             return
         async with self.service.scope() as scope:
             await suggest.expire_due(scope)
-            await staleness.sweep_queue(scope, None)
+            await scope.commit()
+            await staleness.sweep_queue(scope, None, checkpoint=scope.commit)
             await scope.commit()
 
 

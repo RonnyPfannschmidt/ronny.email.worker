@@ -64,6 +64,8 @@ class Service:
         self.config = config or load_config()
         self.engine = create_engine_async(self.config.database_url)
         self.sessions = make_sessionmaker(self.engine)
+        #: The same pool, begun DEFERRED: reads that neither wait on a sync nor block it.
+        self.readers = make_sessionmaker(self.engine, readonly=True)
         self._backend_factory = backend_factory or _real_backend
         self._backends: dict[str, MailBackend] = {}
         self._backend_locks: dict[str, asyncio.Lock] = {}
@@ -76,9 +78,31 @@ class Service:
         self.schema_problem: str | None = None
 
     @asynccontextmanager
-    async def scope(self, tenant_id: int = TENANT_ZERO) -> AsyncIterator[TenantScope]:
-        async with tenant_scope(self.sessions, tenant_id) as scope:
+    async def scope(
+        self, tenant_id: int = TENANT_ZERO, *, readonly: bool = False
+    ) -> AsyncIterator[TenantScope]:
+        sessions = self.readers if readonly else self.sessions
+        async with tenant_scope(sessions, tenant_id) as scope:
             yield scope
+
+    def run(self, main):  # noqa: ANN001, ANN201
+        """``asyncio.run`` with the pool disposed before the loop goes.
+
+        A pooled aiosqlite connection belongs to the loop that made it, so everything
+        that runs this service on a loop of its own — a CLI command, a test helper —
+        goes through here and hands the pool back clean.
+        """
+
+        async def go():  # noqa: ANN202
+            try:
+                return await main
+            finally:
+                await self.engine.dispose()
+
+        return asyncio.run(go())
+
+    async def dispose(self) -> None:
+        await self.engine.dispose()
 
     @asynccontextmanager
     async def backend(self, account: m.Account) -> AsyncIterator[MailBackend]:

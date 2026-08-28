@@ -50,7 +50,7 @@ def scoped(service, work):
         async with service.scope() as scope:
             return await work(scope)
 
-    return asyncio.run(go())
+    return service.run(go())
 
 
 @pytest.fixture
@@ -283,7 +283,7 @@ def settle(client: TestClient, timeout: float = 10.0) -> None:
 
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
-        if asyncio.run(live()) == 0:
+        if service.run(live()) == 0:
             return
         time.sleep(0.02)
     raise AssertionError("the task queue never went quiet")
