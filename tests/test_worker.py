@@ -296,3 +296,44 @@ async def test_a_database_migrated_under_a_live_service_flips_it_to_not_operatin
     assert "0007task" in service.schema_problem
     assert "restart" in service.schema_problem
     assert runner._stopping.is_set(), "the dispatcher must stop claiming"
+
+
+async def test_the_dispatcher_survives_a_locked_database(service, backend, monkeypatch):
+    """The half-dead server bug: a claim colliding with a long write transaction raised
+    `database is locked` out of the dispatcher, whose death cancelled the lifespan and
+    tore the MCP session manager down while uvicorn kept serving.  A failed pass is a
+    logged retry now, never an unwinding."""
+    bundle_id, _ = await _accepted_bundle(service)
+
+    real = tasks.claim_next
+    calls = 0
+
+    async def flaky(scope, *, busy_accounts):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise sa.exc.OperationalError(
+                "BEGIN IMMEDIATE", None, Exception("database is locked")
+            )
+        return await real(scope, busy_accounts=busy_accounts)
+
+    monkeypatch.setattr(worker.tasks, "claim_next", flaky)
+
+    runner = worker.TaskRunner(service, poll_interval=0.05)
+    async with asyncio.TaskGroup() as tg:
+        await runner.start(tg)
+        service.notify_tasks()
+
+        async def applied() -> None:
+            while True:
+                async with service.scope() as scope:
+                    bundle = await scope.get(m.Bundle, bundle_id)
+                    if bundle.status is m.BundleStatus.applied:
+                        return
+                await asyncio.sleep(0.02)
+
+        await asyncio.wait_for(applied(), timeout=10)
+        await runner.stop()
+
+    assert calls >= 2, "the first, failing pass was retried"
+    assert len(backend.folders["Archive"].messages) == 1

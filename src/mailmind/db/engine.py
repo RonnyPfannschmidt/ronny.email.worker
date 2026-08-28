@@ -35,7 +35,13 @@ def _install_sqlite_listeners(engine: Engine) -> None:
         # Composite and ordinary foreign keys are both off by default in SQLite.
         cursor.execute("PRAGMA foreign_keys=ON")
         cursor.execute("PRAGMA journal_mode=WAL")
-        cursor.execute("PRAGMA busy_timeout=5000")
+        # 15s, not 5: writers are serialized on purpose (BEGIN IMMEDIATE below), and a
+        # first sync of a long folder legitimately holds the lock for a while — a waiter
+        # that gives up at 5s turns that into `database is locked` errors in whatever
+        # else was running.  Waiting is the correct behaviour for a single-user service;
+        # the follow-up that shrinks the waits themselves is committing long syncs in
+        # smaller pieces.
+        cursor.execute("PRAGMA busy_timeout=15000")
         cursor.close()
 
     @sa.event.listens_for(engine, "begin")

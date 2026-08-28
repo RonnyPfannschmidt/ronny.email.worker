@@ -670,11 +670,21 @@ def build_server(
         title="Sort out a mailbox",
         description="Work through a long untended folder and propose what to do with it.",
     )
-    async def triage_mailbox(container_id: int, what_matters: str = "") -> str:
-        """The order that survives a real mailbox, which is not the obvious order."""
+    async def triage_mailbox(container_id: str = "", what_matters: str = "") -> str:
+        """The order that survives a real mailbox, which is not the obvious order.
+
+        Arguments are strings because MCP prompt arguments are strings, and a client
+        may hand over a placeholder it never substituted — opencode sends the literal
+        ``$1`` — which is worth an instruction rather than a validation traceback.
+        """
+        where = (
+            f"container {container_id}"
+            if container_id.strip().isdigit()
+            else "the container you are working in (`list_containers` names them)"
+        )
         return (
             f"{_GROUND_RULES}\n\n"
-            f"Sort out container {container_id}.\n\n"
+            f"Sort out {where}.\n\n"
             "Work in this order, because the mailbox is bigger than your context:\n"
             "1. `summarize_senders` and `summarize_lists` first. One call each answers "
             "what enumerating thousands of messages would, and tells you the shape of the "
@@ -701,12 +711,16 @@ def build_server(
         title="Look at a message",
         description="Read one message carefully and say what is true about it.",
     )
-    async def assess_message(message_id: int) -> str:
+    async def assess_message(message_id: str = "") -> str:
         """Reading without acting, which is the half 02 wants kept separate."""
         return (
             f"{_GROUND_RULES}\n\n"
-            f"Look at message {message_id} with `get_message`, and `request_body` if you "
-            "need what is inside it.\n\n"
+            + (
+                f"Look at message {message_id} with `get_message`"
+                if message_id.strip().isdigit()
+                else "Look at the message in question with `get_message`"
+            )
+            + ", and `request_body` if you need what is inside it.\n\n"
             "The service has already computed what can be decided without a model — a "
             "display name naming a different address, characters that do not render, a "
             "link whose text disagrees with its target, unparseable MIME, a sender never "

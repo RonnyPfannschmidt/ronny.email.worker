@@ -2358,3 +2358,23 @@ def test_a_schema_problem_answers_every_surface_with_503_not_tracebacks(client):
     finally:
         service.schema_problem = None
     assert client.get("/").status_code == 200, "and it is only about the schema"
+
+
+def test_a_prompt_given_an_unsubstituted_placeholder_still_answers(client):
+    """opencode sends the literal `$1` when its prompt-argument UI is skipped; MCP
+    prompt arguments are strings anyway. An instruction comes back, not a traceback."""
+    agent = Agent(client)
+    answer = agent._post(
+        "prompts/get",
+        {"name": "triage_mailbox", "arguments": {"container_id": "$1"}},
+    )
+    assert "error" not in answer, answer
+    text = answer["result"]["messages"][0]["content"]["text"]
+    assert "list_containers" in text, "it says how to find the real id"
+    assert "$1" not in text
+
+    numbered = agent._post(
+        "prompts/get",
+        {"name": "triage_mailbox", "arguments": {"container_id": "3"}},
+    )
+    assert "container 3" in numbered["result"]["messages"][0]["content"]["text"]

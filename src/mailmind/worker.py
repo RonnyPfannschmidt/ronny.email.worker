@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import asyncio
 import datetime as dt
+import logging
 import traceback
 
 import sqlalchemy as sa
@@ -29,6 +30,8 @@ from mailmind.suggest import model as suggest
 from mailmind.suggest import staleness
 
 INTERRUPTED = "interrupted by shutdown"
+
+log = logging.getLogger("mailmind.worker")
 
 
 class Hub:
@@ -118,12 +121,17 @@ class TaskRunner:
 
     async def start(self, tg: asyncio.TaskGroup) -> None:
         self.service.notify_tasks = self._wakeup.set
-        async with self.service.scope() as scope:
-            requeued = await tasks.requeue_interrupted(scope)
-            rescued = await tasks.rescue_accepted_bundles(scope)
-            await scope.commit()
-        if requeued or rescued:
-            self._wakeup.set()
+        try:
+            async with self.service.scope() as scope:
+                requeued = await tasks.requeue_interrupted(scope)
+                rescued = await tasks.rescue_accepted_bundles(scope)
+                await scope.commit()
+            if requeued or rescued:
+                self._wakeup.set()
+        except Exception:
+            # A busy database at startup is not a reason to have no service; the first
+            # dispatch pass claims whatever this would have queued anyway.
+            log.exception("startup recovery failed; the dispatcher will retry")
         self._tg = tg
         self._dispatching = tg.create_task(self._dispatch())
 
@@ -135,19 +143,22 @@ class TaskRunner:
             await asyncio.gather(*self._lanes.values(), return_exceptions=True)
 
     async def _dispatch(self) -> None:
+        """The loop that must not die.
+
+        It runs as a child of the lifespan's TaskGroup, so an exception escaping here
+        cancels the lifespan — which tears the MCP session manager down while uvicorn
+        keeps serving, and the service is half-dead until a restart.  That happened: a
+        `database is locked` from a claim colliding with a long sync transaction took
+        the whole background system with it.  So: one pass, one try, and any failure is
+        a logged wait-and-retry rather than an unwinding.
+        """
         while not self._stopping.is_set():
-            await self._tick_if_due()
-            claimed = None
-            async with self.service.scope() as scope:
-                claimed = await tasks.claim_next(scope, busy_accounts=set(self._lanes))
-                if claimed is not None:
-                    task_id, account_id = claimed.id, claimed.account_id
-                    await scope.commit()
-            if claimed is not None:
-                self.hub.publish(task_id)
-                self._lanes[account_id] = self._tg.create_task(
-                    self._run_one(task_id, account_id)
-                )
+            try:
+                claimed = await self._one_pass()
+            except Exception:
+                log.exception("dispatch pass failed; retrying in %ss", self.poll_interval)
+                claimed = None
+            if claimed:
                 continue
             try:
                 async with asyncio.timeout(self.poll_interval):
@@ -155,6 +166,19 @@ class TaskRunner:
             except TimeoutError:
                 pass
             self._wakeup.clear()
+
+    async def _one_pass(self) -> bool:
+        """Housekeeping if due, then claim at most one task.  True if one was claimed."""
+        await self._tick_if_due()
+        async with self.service.scope() as scope:
+            claimed = await tasks.claim_next(scope, busy_accounts=set(self._lanes))
+            if claimed is None:
+                return False
+            task_id, account_id = claimed.id, claimed.account_id
+            await scope.commit()
+        self.hub.publish(task_id)
+        self._lanes[account_id] = self._tg.create_task(self._run_one(task_id, account_id))
+        return True
 
     async def _run_one(self, task_id: int, account_id: int) -> None:
         try:
