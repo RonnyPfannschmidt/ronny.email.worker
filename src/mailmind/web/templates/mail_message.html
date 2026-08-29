@@ -1,0 +1,67 @@
+{% extends "base.html" %}
+{% block title %}{{ message.subject or "message" }} — mailmind{% endblock %}
+{% block content %}
+<h1>{{ message.subject or "(no subject)" }}</h1>
+
+{% if error %}<div class="banner error">{{ error }}</div>{% endif %}
+
+<p class="small muted">
+  {{ message.from_display_name or "" }} &lt;{{ message.from_address or "—" }}&gt; ·
+  {{ message.date | when }}
+  {% if container %} · in <a href="/mail/{{ container.id }}">{{ container.name }}</a>{% endif %}
+  {% if message.flags %} · {{ message.flags | join(" ") }}{% endif %}
+</p>
+
+{% for assessment in message.assessment %}
+  {% for f in assessment.findings %}
+  <span class="finding {{ f["class"] }}">{{ f.detail }}</span>
+  {% endfor %}
+{% endfor %}
+
+{% if message.body and message.body.text %}
+<div class="body">{{ message.body.text }}</div>
+{% if message.body.links %}
+<details>
+  <summary class="small">{{ message.body.links | length }} links</summary>
+  <table class="links">
+    {% for link in message.body.links %}
+    <tr><td>{{ link.text }}</td><td class="muted">{{ link.target }}</td></tr>
+    {% endfor %}
+  </table>
+</details>
+{% endif %}
+{% if message.body.attachments %}
+<p class="small muted">
+  Attachments: {% for a in message.body.attachments %}{{ a.filename or a.content_type }}{{ ", " if not loop.last }}{% endfor %}
+  — named, not fetched. Open them in your own client.
+</p>
+{% endif %}
+{% else %}
+<form method="post" action="/mail/message/{{ message.message_id }}/body">
+  <input type="hidden" name="_csrf" value="{{ csrf }}">
+  <button>fetch the text</button>
+  <span class="small muted">Only the text parts, and no remote content is ever loaded.</span>
+</form>
+{% if fetch %}{% set task = fetch %}{% include "_task.html" %}{% endif %}
+{% endif %}
+
+{% if container %}
+<form method="post" action="/mail/{{ container.id }}/file">
+  <input type="hidden" name="_csrf" value="{{ csrf }}">
+  <input type="hidden" name="message_id" value="{{ message.message_id }}">
+  <div class="actions">
+    <label>move it to
+      <select name="target_container_id">
+        <option value="">— an existing folder —</option>
+        {% for row in folders if row.folder and row.folder.id != container.id %}
+        <option value="{{ row.folder.id }}">{{ ("&nbsp;&nbsp;" * row.depth) | safe }}{{ row.label }}{% if not row.folder.exists_on_server %} (to be made){% endif %}</option>
+        {% endfor %}
+      </select>
+    </label>
+    <label>or a new one <input name="target_container_name" placeholder="Archive/2026"></label>
+    <button name="operation" value="move">propose the move</button>
+    <button name="operation" value="delete">propose deleting it</button>
+  </div>
+</form>
+{% endif %}
+{% endblock %}

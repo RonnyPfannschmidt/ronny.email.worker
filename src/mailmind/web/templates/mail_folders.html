@@ -1,0 +1,35 @@
+{% extends "base.html" %}
+{% block title %}mail — mailmind{% endblock %}
+{% block content %}
+<h1>Mail</h1>
+
+{% if not current_account %}
+  <p class="muted">No account yet. <a href="/accounts">Add one</a>.</p>
+{% elif not tree %}
+  <p class="muted">Nothing synced in {{ current_account.name }} yet —
+    <a href="/accounts">sync it</a> and the folders turn up here.</p>
+{% else %}
+<p class="small muted">
+  What has been synced, not what is on the server this second. Reading here changes
+  nothing: nothing is marked read, and filing goes to the review queue like any other
+  proposal.
+</p>
+
+{# The names carry the hierarchy; the tree is drawn from them. A level with no folder of
+   its own is a label, because a parent can exist only inside its children's names. #}
+<ul class="tree">
+{% for node in tree recursive %}
+  <li>
+    {% if node.folder %}
+      <a href="/mail/{{ node.folder.id }}">{{ node.label }}</a>
+      <span class="muted small">{{ node.folder.cached_messages }}{% if node.folder.server_message_count != node.folder.cached_messages %} of {{ node.folder.server_message_count }}{% endif %}</span>
+      {% if not node.folder.exists_on_server %}<span class="warn small">proposed, not made</span>{% endif %}
+    {% else %}
+      <span class="muted">{{ node.label }}</span>
+    {% endif %}
+    {% if node.children %}<ul>{{ loop(node.children) }}</ul>{% endif %}
+  </li>
+{% endfor %}
+</ul>
+{% endif %}
+{% endblock %}

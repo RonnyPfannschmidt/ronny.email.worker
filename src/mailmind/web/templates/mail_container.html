@@ -1,0 +1,72 @@
+{% extends "base.html" %}
+{% block title %}{{ container.name }} — mailmind{% endblock %}
+{% block content %}
+<h1>{{ container.name }}</h1>
+
+{% if error %}<div class="banner error">{{ error }}</div>{% endif %}
+
+<p class="small muted">
+  <a href="/mail">all folders</a> ·
+  {% if unread %}<a href="/mail/{{ container.id }}">everything</a>
+  {% else %}<a href="/mail/{{ container.id }}?unread=1">unread only</a>{% endif %} ·
+  showing {{ listing.returned }} of {{ listing.total_matching }}
+</p>
+
+{% if not listing.messages %}
+  <p class="muted">Nothing here.</p>
+{% else %}
+<form method="post" action="/mail/{{ container.id }}/file">
+<input type="hidden" name="_csrf" value="{{ csrf }}">
+<table>
+  <tr><th></th><th>From</th><th>Subject</th><th>Date</th></tr>
+  {% for msg in listing.messages %}
+  <tr>
+    <td><input type="checkbox" name="message_id" value="{{ msg.message_id }}"></td>
+    {# The address, and the display name under it rather than instead of it: 08 —
+       identity is the address, and the disagreement between the two is a finding. #}
+    <td class="small">{{ msg.from_address or "—" }}
+      {% if msg.from_display_name %}<span class="finding muted">{{ msg.from_display_name }}</span>{% endif %}
+    </td>
+    <td>
+      <a href="/mail/message/{{ msg.message_id }}"
+         {% if "\\Seen" not in msg.flags %}class="here"{% endif %}>{{ msg.subject or "(no subject)" }}</a>
+      {% if msg.has_attachments %}<span class="muted small">attachment</span>{% endif %}
+      {% if msg.list_id %}<span class="muted small">{{ msg.list_id }}</span>{% endif %}
+      {% if msg.preview %}<span class="finding muted">{{ msg.preview[:160] }}</span>{% endif %}
+    </td>
+    <td class="small muted effect">{{ msg.date | when }}</td>
+  </tr>
+  {% endfor %}
+</table>
+
+{# Two submits rather than a dropdown: the button says which proposal it makes, and the
+   CSP leaves no script to keep a select and a button in step. #}
+<div class="actions">
+  <label>move the picked messages to
+    <select name="target_container_id">
+      <option value="">— an existing folder —</option>
+      {% for row in folders if row.folder and row.folder.id != container.id %}
+      <option value="{{ row.folder.id }}">{{ ("&nbsp;&nbsp;" * row.depth) | safe }}{{ row.label }}{% if not row.folder.exists_on_server %} (to be made){% endif %}</option>
+      {% endfor %}
+    </select>
+  </label>
+  <label>or a new one <input name="target_container_name" placeholder="Archive/2026"></label>
+  <button name="operation" value="move">propose the move</button>
+  <button name="operation" value="delete">propose deleting them</button>
+</div>
+<p class="small muted">
+  Nothing moves here. Either button writes a proposal and takes you to its review page,
+  where the whole effect is listed and accepting it is what touches the mailbox.
+</p>
+</form>
+{% endif %}
+
+<p class="small">
+  {% if offset %}
+  <a href="/mail/{{ container.id }}?offset={{ [offset - page, 0] | max }}{% if unread %}&unread=1{% endif %}">newer</a>
+  {% endif %}
+  {% if offset + listing.returned < listing.total_matching %}
+  <a href="/mail/{{ container.id }}?offset={{ offset + page }}{% if unread %}&unread=1{% endif %}">older</a>
+  {% endif %}
+</p>
+{% endblock %}

@@ -70,6 +70,12 @@ CSP = (
 )
 
 
+#: How many messages one folder page shows.  Not the agent's bounded-observation limit
+#: (05): that one is about a model asking for more than it can read, and this is a person
+#: paging through their own mail, told the total either way.
+MAIL_PAGE = 100
+
+
 async def chosen_account(scope) -> m.Account | None:  # noqa: ANN001
     """Which account the review UI is working in — a view, not a boundary
     (docs/design/11 has the argument).
@@ -515,7 +521,13 @@ def create_app(
                     if bundle is None or bundle.status is not m.BundleStatus.accepted:
                         return RedirectResponse(target, status_code=303)
                 elif task.kind is m.TaskKind.fetch_body:
-                    target = f"/bundle/{task.payload.get('bundle_id', '')}" or "/"
+                    # A body asked for from the mail view has no bundle to go back to.
+                    of_bundle = task.payload.get("bundle_id")
+                    target = (
+                        f"/bundle/{of_bundle}"
+                        if of_bundle
+                        else f"/mail/message/{task.subject_id}"
+                    )
                 elif task.kind in (m.TaskKind.sync_account, m.TaskKind.sync_container):
                     target = "/accounts"
                 await tasks.enqueue(
@@ -769,6 +781,182 @@ def create_app(
                 error = str(exc)
             await scope.commit()
         return _back(bundle_id, error)
+
+    # --------------------------------------------------- reading and filing by hand
+
+    async def _folder_options(scope, account_id: int) -> list[dict]:  # noqa: ANN001
+        """Somewhere to move mail to, in the order the folder list shows it."""
+        return views.flattened(
+            views.as_tree(
+                await views.containers(scope, account_id),
+                await views.container_delimiter(scope, account_id),
+            )
+        )
+
+    # A person browsing their own mail, and filing it the same way an agent proposes:
+    # selecting messages here builds a bundle whose producer is the reviewer, and the
+    # review page is where it is read and accepted.  Deliberately not a second way into
+    # the mailbox — 01 says this is not where mail is read, and this stays a triage view
+    # rather than a client: text only, no HTML, no attachments, nothing marked read.
+
+    @app.get("/mail", response_class=HTMLResponse)
+    async def mail_folders(request: Request):  # noqa: ANN202
+        async with service.scope(readonly=True) as scope:
+            header = await chrome(scope)
+            current = header["current_account"]
+            tree = []
+            if current:
+                tree = views.as_tree(
+                    await views.containers(scope, current["id"]),
+                    await views.container_delimiter(scope, current["id"]),
+                )
+            return render(request, "mail_folders.html", tree=tree, **header)
+
+    @app.get("/mail/message/{message_id}", response_class=HTMLResponse)
+    async def mail_message(request: Request, message_id: int):  # noqa: ANN202
+        async with service.scope(readonly=True) as scope:
+            try:
+                detail = await views.message_detail(scope, message_id, include_body=True)
+            except LookupError:
+                return HTMLResponse("no such message", status_code=404)
+            container = (
+                await scope.get(m.Container, detail["container_id"])
+                if detail["container_id"]
+                else None
+            )
+            folders = await _folder_options(scope, container.account_id) if container else []
+            fetch = None
+            for task in await views.task_summaries(scope, None, kinds=[m.TaskKind.fetch_body]):
+                if task["subject_id"] == message_id:
+                    fetch = task
+                    break
+            return render(
+                request,
+                "mail_message.html",
+                message=detail,
+                container={"id": container.id, "name": container.name} if container else None,
+                folders=folders,
+                fetch=fetch,
+                live_tasks=fetch is not None and fetch["status"] in ("queued", "running"),
+                **await chrome(scope),
+            )
+
+    @app.post("/mail/message/{message_id}/body", dependencies=changes)
+    async def mail_load_body(message_id: int):  # noqa: ANN202
+        async with service.scope() as scope:
+            placement = await scope.scalar(
+                views.live_placements().where(m.Placement.message_id == message_id)
+            )
+            if placement is not None:
+                container = await scope.get(m.Container, placement.container_id)
+                await tasks.enqueue(
+                    scope,
+                    kind=m.TaskKind.fetch_body,
+                    account_id=container.account_id,
+                    subject_id=message_id,
+                    requested_by=(await reviewer(scope)).id,
+                )
+                await scope.commit()
+        service.notify_tasks()
+        return RedirectResponse(f"/mail/message/{message_id}", status_code=303)
+
+    @app.get("/mail/{container_id}", response_class=HTMLResponse)
+    async def mail_container(  # noqa: ANN202
+        request: Request,
+        container_id: int,
+        offset: int = 0,
+        unread: str = "",
+        error: str | None = None,
+    ):
+        async with service.scope(readonly=True) as scope:
+            container = await scope.get(m.Container, container_id)
+            if container is None:
+                return HTMLResponse("no such folder", status_code=404)
+            listing = await views.messages(
+                scope,
+                container_id=container_id,
+                limit=MAIL_PAGE,
+                offset=max(offset, 0),
+                unread_only=bool(unread),
+            )
+            return render(
+                request,
+                "mail_container.html",
+                container={"id": container.id, "name": container.name},
+                listing=listing,
+                folders=await _folder_options(scope, container.account_id),
+                offset=max(offset, 0),
+                page=MAIL_PAGE,
+                unread=bool(unread),
+                error=error,
+                **await chrome(scope),
+            )
+
+    @app.post("/mail/{container_id}/file", dependencies=changes)
+    async def file_messages(  # noqa: ANN202
+        request: Request,
+        container_id: int,
+        operation: str = Form(default="move"),
+        target_container_id: str = Form(default=""),
+        target_container_name: str = Form(default=""),
+    ):
+        """What a person picked, proposed as a bundle of their own.
+
+        It goes to the review page rather than to the mailbox.  Nothing here is a shorter
+        path than the one an agent's proposal takes: the same enumerated effect is read,
+        and the same accept applies it.
+        """
+        back = f"/mail/{container_id}"
+        # The checkboxes come off the form rather than out of a signature: a repeated
+        # field is a list, and Starlette has already parsed this form for the CSRF check.
+        form = await request.form()
+        picked = [int(v) for v in form.getlist("message_id") if str(v).isdigit()]
+        async with service.scope() as scope:
+            container = await scope.get(m.Container, container_id)
+            if container is None:
+                return HTMLResponse("no such folder", status_code=404)
+            account = await scope.get(m.Account, container.account_id)
+            if not picked:
+                return _to(back, "nothing was selected, so there is nothing to propose")
+            try:
+                op = m.Operation(operation)
+                if op not in (m.Operation.move, m.Operation.delete):
+                    raise ValueError(operation)
+            except ValueError:
+                return _to(back, f"{operation!r} is not something this page proposes")
+
+            # The destination fields are on the form whichever button was pressed, and a
+            # delete that carried one would draw as "delete → Archive" on the review page.
+            # A delete goes to Trash and names nothing else.
+            named_id = target_container_id.strip() if op is m.Operation.move else ""
+            named_name = target_container_name.strip() if op is m.Operation.move else ""
+            if named_id and not named_id.isdigit():
+                return _to(back, "that is not a folder this page offered")
+            try:
+                bundle = await suggest.propose_bundle(
+                    scope,
+                    producer=await reviewer(scope),
+                    account=account,
+                    operation=op,
+                    message_ids=picked,
+                    summary=(
+                        f"{len(picked)} message{'s' if len(picked) > 1 else ''} "
+                        f"picked out of {container.name}"
+                    ),
+                    reason="Chosen by hand in the mail view.",
+                    target_container_id=int(named_id) if named_id else None,
+                    target_container_name=named_name or None,
+                    expiry_days=service.config.limits.bundle_expiry_days,
+                    max_size=service.config.limits.max_bundle_size,
+                )
+            except suggest.ProposalRefused as exc:
+                # A refusal can come after the bundle row was written, so the half of it
+                # that exists goes rather than being left in the queue for review.
+                await scope.rollback()
+                return _to(back, str(exc))
+            bundle_id = bundle.id
+            await scope.commit()
+        return RedirectResponse(f"/bundle/{bundle_id}", status_code=303)
 
     # ------------------------------------------------------------- the mailbox
 
@@ -1044,6 +1232,11 @@ async def _record_refusal(service: Service, request: Request, problem: str) -> N
                 },
             )
             await scope.commit()
+
+
+def _to(path: str, error: str | None = None) -> RedirectResponse:
+    """Back where the person was, carrying what refused them."""
+    return RedirectResponse(path + (f"?error={quote(error)}" if error else ""), status_code=303)
 
 
 def _back(bundle_id: int, error: str | None, anchor: str | None = None) -> RedirectResponse:

@@ -103,6 +103,23 @@ would mean approving mail nobody read. Read the page again and accept from that.
 
 The day a bundle expires does not move when it grows.
 
+## Mail, and filing it by hand
+
+The **mail** tab is the synced cache, read by whoever holds the key: folders, a message
+list, and the text of a message once you ask for it. Nothing is marked read, no HTML is
+rendered, attachments are named rather than fetched, and no remote content is loaded — the
+same rules the review page reads mail under.
+
+Filing from there is not a shortcut into the mailbox. Picking messages and choosing a
+destination writes a bundle whose producer is you, and drops you on its review page: the
+same enumerated effect, the same accept, the same staleness checks. It is one proposal
+route among several, not a second write path — [the security model](security-model.md) is
+unchanged by it.
+
+What it is not is a mail client. It exists so that a long untended mailbox can be sorted by
+hand where the agent's proposals are, and [01](design/01-intent.md) still says this is not
+where mail is read.
+
 ## Accounts
 
 The accounts page lists them, chooses the one you are working in, and syncs one on demand.

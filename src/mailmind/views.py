@@ -108,6 +108,63 @@ async def containers(scope: TenantScope, account_id: int) -> list[dict]:
     ]
 
 
+async def container_delimiter(scope: TenantScope, account_id: int) -> str | None:
+    """The hierarchy separator this account's server uses, as its folders report it."""
+    return await scope.scalar(
+        sa.select(m.Container.delimiter)
+        .where(m.Container.account_id == account_id, m.Container.delimiter.is_not(None))
+        .limit(1)
+    )
+
+
+def as_tree(folders: list[dict], delimiter: str | None) -> list[dict]:
+    """The folders of :func:`containers`, nested the way their names already read.
+
+    A server keeps flat names with a separator in them, so the hierarchy is derived here
+    rather than stored — and a level that has no folder of its own is a label with nothing
+    to open, because IMAP lets a parent exist only as part of its children's names.
+
+    INBOX sorts first wherever it appears: it is where mail lands and where sorting it
+    starts, and finding it under I in a list of two hundred is the thing this replaces.
+    """
+    roots: list[dict] = []
+    index: dict[tuple[str, ...], dict] = {}
+
+    def node_for(path: tuple[str, ...]) -> dict:
+        if path not in index:
+            node = index[path] = {"label": path[-1], "folder": None, "children": []}
+            (roots if len(path) == 1 else node_for(path[:-1])["children"]).append(node)
+        return index[path]
+
+    for folder in folders:
+        parts = tuple(folder["name"].split(delimiter)) if delimiter else (folder["name"],)
+        node_for(parts)["folder"] = folder
+
+    def sorted_in_place(nodes: list[dict]) -> None:
+        nodes.sort(
+            key=lambda node: (node["label"].upper() != "INBOX", node["label"].casefold())
+        )
+        for node in nodes:
+            sorted_in_place(node["children"])
+
+    sorted_in_place(roots)
+    return roots
+
+
+def flattened(tree: list[dict], depth: int = 0) -> list[dict]:
+    """The tree back in one list, each node carrying how deep it sits.
+
+    For the places a hierarchy has to fit in a control that has no nesting — the move
+    target on a folder page is one long ``<select>``, and it was the same haystack the
+    folder list used to be.
+    """
+    rows = []
+    for node in tree:
+        rows.append({"label": node["label"], "folder": node["folder"], "depth": depth})
+        rows.extend(flattened(node["children"], depth + 1))
+    return rows
+
+
 def bounded(rows: list[dict], total: int, *, kind: str = "messages") -> dict:
     """The one shape every bounded observation comes back in.
 
@@ -134,6 +191,7 @@ async def messages(
     *,
     container_id: int,
     limit: int,
+    offset: int = 0,
     from_address: str | None = None,
     list_id: str | None = None,
     unread_only: bool = False,
@@ -144,6 +202,11 @@ async def messages(
 
     05: a request that would return more than the limit gets less, and is told so, rather
     than silently returning a slice that looks complete.
+
+    ``offset`` is for the person paging through their own folder, and is not on the agent
+    surface: 05's limit exists because a model asked for more than it can read, and paging
+    past it would be the same ask spelled differently.  A reader is a different case — the
+    total is on the page either way, so nothing is being made to look complete.
     """
     stmt = live_placements(container_id).join(m.Message, m.Placement.message_id == m.Message.id)
     if from_address:
@@ -160,7 +223,9 @@ async def messages(
     total = await scope.scalar(
         sa.select(sa.func.count()).select_from(stmt.order_by(None).subquery())
     )
-    rows = await scope.all(stmt.order_by(m.Message.date_header.desc().nullslast()).limit(limit))
+    rows = await scope.all(
+        stmt.order_by(m.Message.date_header.desc().nullslast()).limit(limit).offset(offset)
+    )
     listed = []
     for placement in rows:
         listed.append(await _message_row(scope, placement))

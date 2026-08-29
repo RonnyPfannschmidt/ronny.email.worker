@@ -22,6 +22,7 @@ import pytest
 import sqlalchemy as sa
 from fastapi.testclient import TestClient
 
+from mailmind import views
 from mailmind.config import AccountConfig, Config, ConfigError, Limits, Login
 from mailmind.db import models as m
 from mailmind.db.migrate import upgrade_to_head
@@ -1203,6 +1204,189 @@ def test_the_queue_lists_what_is_waiting(client):
     page = client.get("/").text
     assert "Awaiting review" in page
     assert "Archive" in page
+
+
+# ------------------------------------------------------- reading and filing by hand
+
+
+def _inbox(client) -> int:  # noqa: ANN001
+    """The folder id, found the way the page offers it rather than by asking an agent."""
+    match = re.search(r'href="/mail/(\d+)">INBOX<', client.get("/mail").text)
+    assert match
+    return int(match.group(1))
+
+
+def _picked(client, container_id: int) -> list[str]:  # noqa: ANN001
+    """The message ids a person would be ticking, read off the folder page."""
+    page = client.get(f"/mail/{container_id}").text
+    return re.findall(r'name="message_id" value="(\d+)"', page)
+
+
+def _container(service, name: str) -> int:  # noqa: ANN001
+    async def work(scope):  # noqa: ANN001, ANN202
+        return (await scope.scalar(sa.select(m.Container).where(m.Container.name == name))).id
+
+    return scoped(service, work)
+
+
+def test_the_mail_page_puts_inbox_first(client):
+    """Sorted by name, INBOX sits under I among however many folders there are."""
+    page = client.get("/mail").text
+    assert page.index(">INBOX<") < page.index(">Archive<") < page.index(">Trash<")
+
+
+def test_a_person_can_read_a_folder_without_an_agent_proposing_anything(client):
+    """The read view is the cache, drawn for whoever holds the key.
+
+    It exists so that filing by hand is possible at all; that it is not a second way into
+    the mailbox is what the tests below are about.
+    """
+    page = client.get(f"/mail/{_inbox(client)}")
+    assert page.status_code == 200
+    # The address rather than the name attached to it, per 08.
+    assert "news@list.example" in page.text
+    # Bounded like every other read: it says how much of the folder it drew.
+    assert "showing" in page.text
+
+
+def test_reading_a_message_by_hand_marks_nothing_and_fetches_nothing_on_its_own(
+    client, service
+):
+    """01: this is not where mail is read, and a triage view must not drift into one.
+
+    Opening a message leaves the flags alone — looking does not touch the mailbox — and
+    the body is fetched only when it is asked for, because fetching is a connection to
+    somebody's server.
+    """
+    listed = re.findall(
+        r'href="/mail/message/(\d+)"', client.get(f"/mail/{_inbox(client)}").text
+    )
+    assert listed
+    page = client.get(f"/mail/message/{listed[0]}")
+    assert page.status_code == 200
+    assert "fetch the text" in page.text
+
+    async def flags(scope):  # noqa: ANN001, ANN202
+        placement = await scope.scalar(
+            views.live_placements().where(m.Placement.message_id == int(listed[0]))
+        )
+        return placement.flags
+
+    assert "\\Seen" not in scoped(service, flags)
+
+
+def test_filing_by_hand_proposes_rather_than_moving(client, service, backend):
+    """The whole of why this view is allowed to exist.
+
+    A person picking messages produces a bundle like any other — read on the review page,
+    applied by the same accept. Nothing reaches the mailbox on the way through.
+    """
+    inbox = _inbox(client)
+    picked = _picked(client, inbox)
+    assert len(picked) >= 2
+
+    landed = as_a_person(
+        client,
+        f"/mail/{inbox}/file",
+        data={
+            "message_id": picked[:2],
+            "operation": "move",
+            "target_container_id": str(_container(service, "Archive")),
+        },
+        follow_redirects=True,
+    )
+    assert landed.status_code == 200
+    # The review page, with the effect enumerated, and a mailbox nobody has touched.
+    assert "The effect" in landed.text
+    assert "picked out of INBOX" in landed.text
+    assert len(backend.folders["Archive"].messages) == 0
+    # Proposed by the person, and waiting like anything else.
+    assert "reviewer" in client.get("/").text
+
+
+def test_a_bundle_filed_by_hand_is_accepted_the_same_way_and_then_moves(
+    client, service, backend
+):
+    inbox = _inbox(client)
+    landed = as_a_person(
+        client,
+        f"/mail/{inbox}/file",
+        data={
+            "message_id": _picked(client, inbox)[:1],
+            "operation": "move",
+            "target_container_id": str(_container(service, "Archive")),
+        },
+        follow_redirects=True,
+    )
+    bundle_id = int(re.search(r"/bundle/(\d+)", str(landed.url)).group(1))
+
+    accepting(client, bundle_id)
+    assert len(backend.folders["Archive"].messages) == 1
+
+
+def test_filing_nothing_says_so_rather_than_proposing_an_empty_bundle(client):
+    inbox = _inbox(client)
+    refused = as_a_person(
+        client, f"/mail/{inbox}/file", data={"operation": "move"}, follow_redirects=True
+    )
+    assert "nothing was selected" in refused.text
+
+
+def test_a_refused_hand_filing_leaves_no_half_written_bundle_behind(client, service):
+    """propose_bundle writes the bundle row before it checks the messages named.
+
+    A refusal has to take that row with it, or a folder page quietly fills the review
+    queue with bundles nobody meant to propose.
+    """
+    inbox = _inbox(client)
+    # Into the folder they are already in: refused, because an id is a claim about a
+    # message and that one does not hold.
+    as_a_person(
+        client,
+        f"/mail/{inbox}/file",
+        data={
+            "message_id": _picked(client, inbox)[:1],
+            "operation": "move",
+            "target_container_id": str(inbox),
+        },
+        follow_redirects=True,
+    )
+
+    async def bundles(scope):  # noqa: ANN001, ANN202
+        return len(await scope.all(sa.select(m.Bundle)))
+
+    assert scoped(service, bundles) == 0
+
+
+def test_a_hand_filed_delete_names_trash_and_nothing_else(client, service, backend):
+    """The destination fields are on the form whichever button was pressed.
+
+    A delete that carried one would draw as "delete to Archive" on the review page, which
+    is not what a delete does — it goes to Trash, and nothing expunges.
+    """
+    inbox = _inbox(client)
+    landed = as_a_person(
+        client,
+        f"/mail/{inbox}/file",
+        data={
+            "message_id": _picked(client, inbox)[:1],
+            "operation": "delete",
+            "target_container_id": str(_container(service, "Archive")),
+        },
+        follow_redirects=True,
+    )
+    assert "Archive" not in landed.text.split("<h1", 1)[1].split("</h1>", 1)[0]
+
+    accepting(client, int(re.search(r"/bundle/(\d+)", str(landed.url)).group(1)))
+    assert len(backend.folders["Trash"].messages) == 1
+    assert len(backend.folders["Archive"].messages) == 0
+
+
+def test_the_mail_view_is_behind_the_key_like_every_other_page(service, backend):
+    app = create_app(service, session_key=SESSION_KEY)
+    with TestClient(app, base_url="http://127.0.0.1:8765") as stranger:
+        assert stranger.get("/mail").status_code == 401
+    assert not is_machine_path("/mail")
 
 
 def test_the_mcp_endpoint_answers_on_the_address_it_was_told_to_serve(service, backend):

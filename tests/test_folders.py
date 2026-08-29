@@ -444,3 +444,56 @@ async def test_a_discard_cannot_be_proposed_through_propose_bundle(scope, world)
             summary="s",
             reason="r",
         )
+
+
+# ------------------------------------------------------- the folder list a person reads
+
+
+async def test_the_folder_list_is_a_tree_with_inbox_at_the_top(scope, world, backend):
+    """187 folders sorted by name is a haystack, and INBOX is under I.
+
+    The names already carry the hierarchy — the server keeps flat strings with a separator
+    in them — so the tree is derived from them rather than stored anywhere.
+    """
+    for name in ("Old", "Old/2019", "Old/2019/drafts", "Archive"):
+        await _empty_folder(scope, world, backend, name)
+    account = world["account"]
+
+    tree = views.as_tree(
+        await views.containers(scope, account.id),
+        await views.container_delimiter(scope, account.id),
+    )
+
+    assert [node["label"] for node in tree] == ["INBOX", "Archive", "Old", "Trash"]
+    old = next(node for node in tree if node["label"] == "Old")
+    assert [node["label"] for node in old["children"]] == ["2019"]
+    assert [node["label"] for node in old["children"][0]["children"]] == ["drafts"]
+    # The leaf's label is the last segment; the folder it opens is the whole name.
+    assert old["children"][0]["children"][0]["folder"]["name"] == "Old/2019/drafts"
+
+
+async def test_a_level_nobody_made_is_a_label_rather_than_a_link(scope, world, backend):
+    """IMAP lets a parent exist only inside its children's names.
+
+    Drawing it as a folder would offer a page that cannot be selected, and leaving it out
+    would hide everything under it.
+    """
+    await _empty_folder(scope, world, backend, "Old/2019")
+    account = world["account"]
+
+    tree = views.as_tree(
+        await views.containers(scope, account.id),
+        await views.container_delimiter(scope, account.id),
+    )
+    old = next(node for node in tree if node["label"] == "Old")
+    assert old["folder"] is None
+    assert old["children"][0]["folder"]["name"] == "Old/2019"
+
+    # Flattened for a <select>, the same order comes back with the depth to indent by.
+    rows = views.flattened(tree)
+    assert [(row["label"], row["depth"]) for row in rows][:3] == [
+        ("INBOX", 0),
+        ("Archive", 0),
+        ("Old", 0),
+    ]
+    assert ("2019", 1) in [(row["label"], row["depth"]) for row in rows]
