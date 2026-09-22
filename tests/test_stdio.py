@@ -389,7 +389,7 @@ def test_stdio_reuses_the_named_producer_s_grant_rather_than_widening_it(workspa
             },
         )
         client.rpc("notifications/initialized", notify=True)
-        assert client.call("list_accounts")[0]["name"] == "dev"
+        assert client.call("list_accounts")["accounts"][0]["name"] == "dev"
 
         refused = client.rpc(
             "tools/call",
@@ -437,7 +437,7 @@ def test_stdio_mints_a_grant_that_cannot_be_used_over_http(workspace):
             },
         )
         client.rpc("notifications/initialized", notify=True)
-        assert [a["name"] for a in client.call("list_accounts")] == ["dev"]
+        assert [a["name"] for a in client.call("list_accounts")["accounts"]] == ["dev"]
     finally:
         client.close()
 

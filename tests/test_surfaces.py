@@ -208,6 +208,37 @@ class Agent:
 
         return json.loads(payload["content"][0]["text"])
 
+    #: What each listing calls its rows.  A listing that renamed them would fail here
+    #: rather than in whichever assertion happened to come first.
+    ROWS = {
+        "list_accounts": "accounts",
+        "list_containers": "containers",
+        "list_messages": "messages",
+        "search_messages": "messages",
+        "summarize_senders": "senders",
+        "summarize_lists": "lists",
+    }
+
+    def rows(self, name: str, **arguments) -> list:
+        """A listing's rows, with the envelope checked on the way past rather than skipped.
+
+        Every listing answers in one envelope, and a surface that quietly stopped saying
+        what it had left out would otherwise pass every test that only wanted the rows.
+        """
+        return self.unwrap(self.call(name, **arguments), self.ROWS[name])
+
+    def read_rows(self, uri: str, kind: str) -> list:
+        return self.unwrap(self.read(uri), kind)
+
+    @staticmethod
+    def unwrap(answer: dict, kind: str) -> list:
+        assert {"returned", "total_matching", "truncated", "next_cursor"} <= answer.keys(), (
+            f"a listing that does not say what it left out: {sorted(answer)}"
+        )
+        assert answer["returned"] == len(answer[kind])
+        assert answer["truncated"] is (answer["next_cursor"] is not None)
+        return answer[kind]
+
     def prompts(self) -> list[str]:
         return [p["name"] for p in self._post("prompts/list")["result"]["prompts"]]
 
@@ -402,7 +433,7 @@ NO_GRANT = ("grant", "invalid_token")
 def test_without_a_token_there_is_no_view_at_all(client):
     agent = Agent(client, token=None)
     try:
-        agent.call("list_accounts")
+        agent.rows("list_accounts")
     except (ToolRefused, AssertionError) as exc:
         assert any(wording in str(exc).lower() for wording in NO_GRANT), exc
     else:
@@ -415,7 +446,7 @@ def test_an_agent_sees_only_the_accounts_its_grant_covers(client, service):
         await scope.commit()
 
     scoped(service, _work)
-    accounts = Agent(client).call("list_accounts")
+    accounts = Agent(client).rows("list_accounts")
     assert [a["name"] for a in accounts] == ["test"]
 
 
@@ -499,7 +530,7 @@ def test_a_grant_expiry_is_honoured_rather_than_taking_the_endpoint_down(client,
     before any tool runs, so the first grant given an expiry would have broken every
     request rather than only its own.
     """
-    assert Agent(client).call("list_accounts"), "a grant with no expiry was refused"
+    assert Agent(client).rows("list_accounts"), "a grant with no expiry was refused"
 
     def set_expiry(delta: dt.timedelta) -> None:
         async def _work(scope):
@@ -510,11 +541,11 @@ def test_a_grant_expiry_is_honoured_rather_than_taking_the_endpoint_down(client,
         scoped(service, _work)
 
     set_expiry(dt.timedelta(hours=1))
-    assert Agent(client).call("list_accounts"), "a grant that had not expired was refused"
+    assert Agent(client).rows("list_accounts"), "a grant that had not expired was refused"
 
     set_expiry(-dt.timedelta(seconds=1))
     with pytest.raises((ToolRefused, AssertionError)) as refused:
-        Agent(client).call("list_accounts")
+        Agent(client).rows("list_accounts")
     assert any(wording in str(refused.value).lower() for wording in NO_GRANT), refused.value
 
 
@@ -528,10 +559,10 @@ def test_an_account_outside_the_grant_is_absent_from_every_tool(client, other_ac
     agent = Agent(client)
 
     for call in (
-        lambda: agent.call("list_containers", account_id=other_account["account_id"]),
+        lambda: agent.rows("list_containers", account_id=other_account["account_id"]),
         lambda: agent.call("list_messages", container_id=other_account["container_id"]),
-        lambda: agent.call("summarize_senders", container_id=other_account["container_id"]),
-        lambda: agent.call("summarize_lists", container_id=other_account["container_id"]),
+        lambda: agent.rows("summarize_senders", container_id=other_account["container_id"]),
+        lambda: agent.rows("summarize_lists", container_id=other_account["container_id"]),
         lambda: agent.call("request_sync", container_id=other_account["container_id"]),
         lambda: agent.call("get_message", message_id=other_account["message_id"]),
         lambda: agent.call("request_body", message_id=other_account["message_id"]),
@@ -562,16 +593,16 @@ def test_an_account_outside_the_grant_is_absent_from_search_and_resources(
     with pytest.raises(AssertionError):
         agent.read(f"mailmind://suggestion/{other_account['suggestion_id']}")
 
-    open_bundles = agent.read("mailmind://bundles/open")
+    open_bundles = agent.read_rows("mailmind://bundles/open", "bundles")
     assert other_account["bundle_id"] not in [b["bundle_id"] for b in open_bundles]
 
 
 def test_observation_is_bounded_and_says_so(client):
     agent = Agent(client)
-    account = agent.call("list_accounts")[0]
+    account = agent.rows("list_accounts")[0]
     inbox = next(
         c
-        for c in agent.call("list_containers", account_id=account["id"])
+        for c in agent.rows("list_containers", account_id=account["id"])
         if c["name"] == "INBOX"
     )
     result = agent.call("list_messages", container_id=inbox["id"], limit=100)
@@ -581,6 +612,100 @@ def test_observation_is_bounded_and_says_so(client):
     assert "summarize_senders" in result["note"]
 
 
+def test_a_listing_pages_to_the_end_over_the_wire(client):
+    """The cap here is three, and the corpus is larger, so this pages or it sees nothing."""
+    agent = Agent(client)
+    account = agent.rows("list_accounts")[0]
+    inbox = next(
+        c
+        for c in agent.rows("list_containers", account_id=account["id"])
+        if c["name"] == "INBOX"
+    )
+
+    seen, cursor, pages = [], None, 0
+    while True:
+        answer = agent.call("list_messages", container_id=inbox["id"], cursor=cursor)
+        seen.extend(row["message_id"] for row in answer["messages"])
+        pages += 1
+        assert pages < 50
+        if not answer["next_cursor"]:
+            break
+        cursor = answer["next_cursor"]
+
+    assert pages > 1, "the cap is three; one page cannot have been the whole corpus"
+    assert len(seen) == len(set(seen)) == len(CORPUS)
+
+
+def test_the_listing_resources_stay_listable_as_well_as_pageable(client):
+    """Adding a cursor must not hide a resource.
+
+    A template is returned by `resources/templates/list` and not by `resources/list`, so
+    folding these three into `…{?cursor}` alone emptied the resource list: a client that
+    enumerates resources to find out what is there would have found nothing at all. Each
+    is registered both ways, and both ways run the same body.
+    """
+    agent = Agent(client)
+    listed = {r["uri"] for r in agent._post("resources/list")["result"]["resources"]}
+    assert {
+        "mailmind://accounts",
+        "mailmind://bundles/open",
+        "mailmind://bundles/decided",
+    } <= listed
+
+    templates = {
+        t["uriTemplate"]
+        for t in agent._post("resources/templates/list")["result"]["resourceTemplates"]
+    }
+    assert {
+        "mailmind://accounts{?cursor}",
+        "mailmind://bundles/open{?cursor}",
+        "mailmind://bundles/decided{?cursor}",
+        "mailmind://containers/{account_id}{?cursor}",
+        "mailmind://bundle/{bundle_id}{?cursor}",
+    } <= templates
+
+
+def test_a_resource_pages_through_its_uri(client):
+    """A resource read is one URI, so its cursor rides in the URI.
+
+    `{?cursor}` is an optional RFC 6570 query variable, so the plain URI and the paged one
+    are the same registration and a client that never pages is unaffected.
+    """
+    agent = Agent(client)
+    account = agent.read_rows("mailmind://accounts", "accounts")[0]
+    first = agent.read(f"mailmind://containers/{account['id']}")
+    assert first["returned"] <= 3
+
+    seen = list(first["containers"])
+    cursor = first["next_cursor"]
+    while cursor:
+        answer = agent.read(f"mailmind://containers/{account['id']}?cursor={cursor}")
+        seen.extend(answer["containers"])
+        cursor = answer["next_cursor"]
+
+    names = sorted(row["name"] for row in seen)
+    assert names == ["Archive", "INBOX", "Trash"]
+
+
+def test_a_cursor_from_another_request_is_refused_not_answered(client):
+    """Answering it from a position that means nothing in the new question would be
+    silent, and silently wrong."""
+    agent = Agent(client)
+    account = agent.rows("list_accounts")[0]
+    containers = agent.rows("list_containers", account_id=account["id"])
+    inbox = next(c for c in containers if c["name"] == "INBOX")
+    first = agent.call("list_messages", container_id=inbox["id"])
+    assert first["next_cursor"]
+
+    with pytest.raises(ToolRefused, match="different request"):
+        agent.call(
+            "list_messages",
+            container_id=inbox["id"],
+            cursor=first["next_cursor"],
+            unread_only=True,
+        )
+
+
 def test_a_date_window_cuts_where_it_says_it_does(client):
     """Bound as a bare string these were compared to SQLite's datetime text.
 
@@ -588,10 +713,10 @@ def test_a_date_window_cuts_where_it_says_it_does(client):
     include the message sitting exactly on the boundary instead of excluding it.
     """
     agent = Agent(client)
-    account = agent.call("list_accounts")[0]
+    account = agent.rows("list_accounts")[0]
     inbox = next(
         c
-        for c in agent.call("list_containers", account_id=account["id"])
+        for c in agent.rows("list_containers", account_id=account["id"])
         if c["name"] == "INBOX"
     )
 
@@ -623,10 +748,10 @@ def test_a_date_window_cuts_where_it_says_it_does(client):
 
 def test_summarising_senders_is_one_call_not_an_enumeration(client):
     agent = Agent(client)
-    account = agent.call("list_accounts")[0]
+    account = agent.rows("list_accounts")[0]
     inbox = next(
         c
-        for c in agent.call("list_containers", account_id=account["id"])
+        for c in agent.rows("list_containers", account_id=account["id"])
         if c["name"] == "INBOX"
     )
     summary = agent.call("summarize_senders", container_id=inbox["id"])
@@ -645,10 +770,10 @@ def test_a_summary_that_leaves_something_out_says_how_much(client):
     """05 again: an observation must never look complete when it is not, and summarising
     is an observation. It used to be the one that did not say."""
     agent = Agent(client)
-    account = agent.call("list_accounts")[0]
+    account = agent.rows("list_accounts")[0]
     inbox = next(
         c
-        for c in agent.call("list_containers", account_id=account["id"])
+        for c in agent.rows("list_containers", account_id=account["id"])
         if c["name"] == "INBOX"
     )
     summary = agent.call("summarize_senders", container_id=inbox["id"], limit=2)
@@ -667,16 +792,16 @@ def _corpus_senders() -> set[str]:
 
 def test_a_message_arrives_marked_as_data(client):
     agent = Agent(client)
-    account = agent.call("list_accounts")[0]
+    account = agent.rows("list_accounts")[0]
     inbox = next(
         c
-        for c in agent.call("list_containers", account_id=account["id"])
+        for c in agent.rows("list_containers", account_id=account["id"])
         if c["name"] == "INBOX"
     )
     messages = agent.call("list_messages", container_id=inbox["id"])["messages"]
     detail = agent.call("get_message", message_id=messages[0]["message_id"])
     assert "data" in detail["content_warning"]
-    assert detail["assessment"][0]["origin"] == "mechanical"
+    assert detail["assessment"]["assessment"][0]["origin"] == "mechanical"
 
 
 def test_search_is_served_from_the_local_cache(client):
@@ -693,8 +818,8 @@ def test_search_is_served_from_the_local_cache(client):
 def test_an_agent_can_propose_from_a_search_without_listing_the_messages_first(client):
     """The point of the whole thing: no paging a mailing list into a list of ids."""
     agent = Agent(client)
-    account = agent.call("list_accounts")[0]
-    containers = {c["name"]: c for c in agent.call("list_containers", account_id=account["id"])}
+    account = agent.rows("list_accounts")[0]
+    containers = {c["name"]: c for c in agent.rows("list_containers", account_id=account["id"])}
     proposed = agent.call(
         "propose_bundle",
         account_id=account["id"],
@@ -712,8 +837,8 @@ def test_an_agent_can_propose_from_a_search_without_listing_the_messages_first(c
 
 def test_naming_the_messages_and_a_query_at_once_is_refused_on_the_agent_surface(client):
     agent = Agent(client)
-    account = agent.call("list_accounts")[0]
-    containers = {c["name"]: c for c in agent.call("list_containers", account_id=account["id"])}
+    account = agent.rows("list_accounts")[0]
+    containers = {c["name"]: c for c in agent.rows("list_containers", account_id=account["id"])}
     with pytest.raises(ToolRefused, match="not both"):
         agent.call(
             "propose_bundle",
@@ -750,8 +875,8 @@ def test_an_agent_told_a_query_was_narrowed_is_told_by_how_much(client, service,
     scoped(service, _work)
 
     agent = Agent(client)
-    account_id = agent.call("list_accounts")[0]["id"]
-    containers = {c["name"]: c for c in agent.call("list_containers", account_id=account_id)}
+    account_id = agent.rows("list_accounts")[0]["id"]
+    containers = {c["name"]: c for c in agent.rows("list_containers", account_id=account_id)}
     proposed = agent.call(
         "propose_bundle",
         account_id=account_id,
@@ -822,8 +947,8 @@ def test_a_bundle_that_grew_cannot_be_accepted_from_the_page_drawn_before_it(cli
 
 def test_the_review_page_says_a_bundle_was_found_by_searching(client):
     agent = Agent(client)
-    account = agent.call("list_accounts")[0]
-    containers = {c["name"]: c for c in agent.call("list_containers", account_id=account["id"])}
+    account = agent.rows("list_accounts")[0]
+    containers = {c["name"]: c for c in agent.rows("list_containers", account_id=account["id"])}
     proposed = agent.call(
         "propose_bundle",
         account_id=account["id"],
@@ -839,8 +964,8 @@ def test_the_review_page_says_a_bundle_was_found_by_searching(client):
 
 
 def _propose(agent: Agent) -> dict:
-    account = agent.call("list_accounts")[0]
-    containers = {c["name"]: c for c in agent.call("list_containers", account_id=account["id"])}
+    account = agent.rows("list_accounts")[0]
+    containers = {c["name"]: c for c in agent.rows("list_containers", account_id=account["id"])}
     # Named rather than summarised for: this fixture caps observation at three, so the
     # summary is legitimately truncated and the newsletter may not be in it.
     messages = agent.call(
@@ -862,8 +987,8 @@ def _propose(agent: Agent) -> dict:
 def test_an_agent_can_file_into_a_folder_that_does_not_exist_yet(client, backend):
     """The folder is part of the proposal, not something done on the way to making one."""
     agent = Agent(client)
-    account = agent.call("list_accounts")[0]
-    containers = {c["name"]: c for c in agent.call("list_containers", account_id=account["id"])}
+    account = agent.rows("list_accounts")[0]
+    containers = {c["name"]: c for c in agent.rows("list_containers", account_id=account["id"])}
     messages = agent.call(
         "list_messages",
         container_id=containers["INBOX"]["id"],
@@ -885,7 +1010,7 @@ def test_an_agent_can_file_into_a_folder_that_does_not_exist_yet(client, backend
     # The whole point: proposing a folder is not making one.
     assert "Lists/example" not in backend.folders
 
-    listed = {c["name"]: c for c in agent.call("list_containers", account_id=account["id"])}
+    listed = {c["name"]: c for c in agent.rows("list_containers", account_id=account["id"])}
     assert listed["Lists/example"]["exists_on_server"] is False
     assert listed["INBOX"]["exists_on_server"] is True
 
@@ -903,8 +1028,8 @@ def test_an_agent_can_propose_discarding_an_empty_folder_and_nothing_happens(
     scoped(service, _work)
 
     agent = Agent(client)
-    account = agent.call("list_accounts")[0]
-    containers = {c["name"]: c for c in agent.call("list_containers", account_id=account["id"])}
+    account = agent.rows("list_accounts")[0]
+    containers = {c["name"]: c for c in agent.rows("list_containers", account_id=account["id"])}
 
     result = agent.call(
         "propose_discard",
@@ -921,18 +1046,18 @@ def test_an_agent_can_propose_discarding_an_empty_folder_and_nothing_happens(
 
     bundle = agent.read(result["resource"])
     assert bundle["operation"] == "discard_container"
-    assert bundle["items"][0]["container"] == "Old"
-    assert bundle["items"][0]["message_id"] is None
+    assert bundle["items"]["items"][0]["container"] == "Old"
+    assert bundle["items"]["items"][0]["message_id"] is None
 
-    item = agent.read(f"mailmind://suggestion/{bundle['items'][0]['suggestion_id']}")
+    item = agent.read(f"mailmind://suggestion/{bundle['items']['items'][0]['suggestion_id']}")
     assert item["premise"]["message_count"] == 0
     assert item["premise"]["uid"] is None
 
 
 def test_an_agent_cannot_sync_a_folder_that_is_only_proposed(client):
     agent = Agent(client)
-    account = agent.call("list_accounts")[0]
-    containers = {c["name"]: c for c in agent.call("list_containers", account_id=account["id"])}
+    account = agent.rows("list_accounts")[0]
+    containers = {c["name"]: c for c in agent.rows("list_containers", account_id=account["id"])}
     messages = agent.call(
         "list_messages",
         container_id=containers["INBOX"]["id"],
@@ -947,7 +1072,7 @@ def test_an_agent_cannot_sync_a_folder_that_is_only_proposed(client):
         summary="s",
         reason="r",
     )
-    listed = {c["name"]: c for c in agent.call("list_containers", account_id=account["id"])}
+    listed = {c["name"]: c for c in agent.rows("list_containers", account_id=account["id"])}
 
     with pytest.raises(Exception, match="nothing on the server"):
         agent.call("request_sync", container_id=listed["Lists/example"]["id"])
@@ -964,25 +1089,27 @@ def test_a_suggestion_is_readable_as_a_resource(client):
     agent = Agent(client)
     proposed = _propose(agent)
 
-    index = agent.read("mailmind://bundles/open")
+    index = agent.read_rows("mailmind://bundles/open", "bundles")
     assert [b["bundle_id"] for b in index] == [proposed["bundle_id"]]
 
     bundle = agent.read(proposed["resource"])
     assert bundle["operation"] == "move"
-    assert bundle["items"][0]["currently_in"] == "INBOX"
-    assert bundle["items"][0]["would_move_to"] == "Archive"
+    assert bundle["items"]["items"][0]["currently_in"] == "INBOX"
+    assert bundle["items"]["items"][0]["would_move_to"] == "Archive"
 
-    suggestion = agent.read(f"mailmind://suggestion/{bundle['items'][0]['suggestion_id']}")
+    suggestion = agent.read(
+        f"mailmind://suggestion/{bundle['items']['items'][0]['suggestion_id']}"
+    )
     assert suggestion["premise"]["uid"] > 0
     assert suggestion["status"] == "proposed"
 
 
 def test_an_agent_can_record_an_assessment_but_only_as_interpretation(client, service):
     agent = Agent(client)
-    account = agent.call("list_accounts")[0]
+    account = agent.rows("list_accounts")[0]
     inbox = next(
         c
-        for c in agent.call("list_containers", account_id=account["id"])
+        for c in agent.rows("list_containers", account_id=account["id"])
         if c["name"] == "INBOX"
     )
     message = agent.call("list_messages", container_id=inbox["id"])["messages"][0]
@@ -992,10 +1119,11 @@ def test_an_agent_can_record_an_assessment_but_only_as_interpretation(client, se
         findings=[{"code": "pressure", "detail": "reads as urgency", "evidence": {}}],
     )
     detail = agent.call("get_message", message_id=message["message_id"])
-    classes = {f["class"] for a in detail["assessment"] for f in a["findings"]}
+    recorded = detail["assessment"]["assessment"]
+    classes = {f["class"] for a in recorded for f in a["findings"]}
     assert classes == {"mechanical", "interpretation"}
     producer_findings = [
-        f for a in detail["assessment"] if a["origin"] == "producer" for f in a["findings"]
+        f for a in recorded if a["origin"] == "producer" for f in a["findings"]
     ]
     assert all(f["class"] == "interpretation" for f in producer_findings)
 
@@ -1006,7 +1134,7 @@ def test_the_review_page_shows_the_effect_and_names_the_self_assessment(client):
     bundle = agent.read(proposed["resource"])
     agent.call(
         "add_assessment",
-        message_id=bundle["items"][0]["message_id"],
+        message_id=bundle["items"]["items"][0]["message_id"],
         findings=[{"code": "bulk", "detail": "a newsletter"}],
     )
 
@@ -1020,8 +1148,8 @@ def test_the_review_page_shows_the_effect_and_names_the_self_assessment(client):
 
 def test_the_review_page_says_a_folder_would_be_made_before_anything_moves(client, backend):
     agent = Agent(client)
-    account = agent.call("list_accounts")[0]
-    containers = {c["name"]: c for c in agent.call("list_containers", account_id=account["id"])}
+    account = agent.rows("list_accounts")[0]
+    containers = {c["name"]: c for c in agent.rows("list_containers", account_id=account["id"])}
     messages = agent.call(
         "list_messages",
         container_id=containers["INBOX"]["id"],
@@ -1057,8 +1185,8 @@ def test_a_discard_is_reviewed_and_accepted_like_anything_else(client, service, 
     scoped(service, _work)
 
     agent = Agent(client)
-    account = agent.call("list_accounts")[0]
-    containers = {c["name"]: c for c in agent.call("list_containers", account_id=account["id"])}
+    account = agent.rows("list_accounts")[0]
+    containers = {c["name"]: c for c in agent.rows("list_containers", account_id=account["id"])}
     proposed = agent.call(
         "propose_discard",
         account_id=account["id"],
@@ -1096,8 +1224,8 @@ def test_accepting_a_delete_in_the_ui_files_it_in_trash(client, backend):
     message is still there afterwards.
     """
     agent = Agent(client)
-    account = agent.call("list_accounts")[0]
-    containers = {c["name"]: c for c in agent.call("list_containers", account_id=account["id"])}
+    account = agent.rows("list_accounts")[0]
+    containers = {c["name"]: c for c in agent.rows("list_containers", account_id=account["id"])}
     assert containers["Trash"]["special_use"] == TRASH, (
         "the container the applier looks for is not the one the backend reported"
     )
@@ -1403,7 +1531,7 @@ def test_the_mcp_endpoint_answers_on_the_address_it_was_told_to_serve(service, b
     )
     app = create_app(elsewhere, session_key=SESSION_KEY)
     with opened(app, "http://127.0.0.2:9000") as moved:
-        assert [a["name"] for a in Agent(moved).call("list_accounts")] == ["test"]
+        assert [a["name"] for a in Agent(moved).rows("list_accounts")] == ["test"]
 
 
 def test_the_queue_shows_the_account_being_worked_in_and_no_other(client, other_account):
@@ -1736,8 +1864,8 @@ def test_the_key_is_never_told_to_the_agent(client, service):
     agent = Agent(client)
     everything = json.dumps(
         {
-            "tools": [agent.call("list_accounts")],
-            "resources": [agent.read("mailmind://accounts")],
+            "tools": [agent.rows("list_accounts")],
+            "resources": [agent.read_rows("mailmind://accounts", "accounts")],
             "proposal": _propose(agent),
         }
     )
@@ -2122,7 +2250,7 @@ def test_an_agent_logs_in_and_gets_the_grant_it_was_given(client):
     assert issued["refresh_token"]
 
     agent = Agent(client, token=issued["access_token"])
-    assert [a["name"] for a in agent.call("list_accounts")] == ["test"]
+    assert [a["name"] for a in agent.rows("list_accounts")] == ["test"]
 
 
 def test_what_the_agent_gets_is_what_the_person_ticked(client):
@@ -2134,7 +2262,7 @@ def test_what_the_agent_gets_is_what_the_person_ticked(client):
     issued = log_in(client, capabilities=("observe",))
     agent = Agent(client, token=issued["access_token"])
 
-    assert agent.call("list_accounts"), "observing was ticked and did not work"
+    assert agent.rows("list_accounts"), "observing was ticked and did not work"
     with pytest.raises(ToolRefused) as refused:
         agent.call(
             "propose_bundle",
@@ -2232,7 +2360,7 @@ def test_refreshing_rotates_and_the_old_one_stops_working(client):
     assert second["refresh_token"] != first
 
     # The new access token works and the spent refresh token does not.
-    assert Agent(client, token=second["access_token"]).call("list_accounts")
+    assert Agent(client, token=second["access_token"]).rows("list_accounts")
     replayed = client.post(
         "/token",
         data={
@@ -2277,7 +2405,7 @@ def test_refreshing_does_not_multiply_what_a_person_agreed_to(client, service):
 def test_revoking_on_the_agents_page_stops_a_token_that_was_working(client, service):
     issued = log_in(client)
     agent = Agent(client, token=issued["access_token"])
-    assert agent.call("list_accounts"), "the grant did not work before it was revoked"
+    assert agent.rows("list_accounts"), "the grant did not work before it was revoked"
 
     listed = client.get("/agents")
     assert "OpenCode" in listed.text
@@ -2290,7 +2418,7 @@ def test_revoking_on_the_agents_page_stops_a_token_that_was_working(client, serv
     as_a_person(client, f"/agents/{grant_id}/revoke")
 
     with pytest.raises((ToolRefused, AssertionError)):
-        Agent(client, token=issued["access_token"]).call("list_accounts")
+        Agent(client, token=issued["access_token"]).rows("list_accounts")
 
 
 def test_a_token_minted_on_the_command_line_still_works(client):
@@ -2299,7 +2427,7 @@ def test_a_token_minted_on_the_command_line_still_works(client):
     Turning authentication on hands the SDK the right to refuse anything it does not
     recognise, and every client configured the old way holds exactly such a token.
     """
-    assert [a["name"] for a in Agent(client, token=TOKEN).call("list_accounts")] == ["test"]
+    assert [a["name"] for a in Agent(client, token=TOKEN).rows("list_accounts")] == ["test"]
 
 
 def test_an_expired_access_token_is_refused(client, service):
@@ -2315,7 +2443,7 @@ def test_an_expired_access_token_is_refused(client, service):
     scoped(service, _work)
 
     with pytest.raises((ToolRefused, AssertionError)):
-        Agent(client, token=issued["access_token"]).call("list_accounts")
+        Agent(client, token=issued["access_token"]).rows("list_accounts")
 
 
 def test_a_stale_consent_request_cannot_be_answered(client, service):
@@ -2431,8 +2559,8 @@ def test_a_failed_body_fetch_is_shown_next_to_the_button(client):
 def test_request_sync_and_task_status_carry_the_work_to_its_result(client):
     """The agent's shape of the same queue: enqueue, poll, read the report."""
     agent = Agent(client)
-    account = agent.call("list_accounts")[0]
-    containers = {c["name"]: c for c in agent.call("list_containers", account_id=account["id"])}
+    account = agent.rows("list_accounts")[0]
+    containers = {c["name"]: c for c in agent.rows("list_containers", account_id=account["id"])}
     asked = agent.call("request_sync", container_id=containers["INBOX"]["id"])
     assert asked["status"] in ("queued", "running")
     assert "task_id" in asked
@@ -2449,8 +2577,8 @@ def test_request_sync_and_task_status_carry_the_work_to_its_result(client):
 
 def test_request_body_becomes_a_task_and_then_the_body(client):
     agent = Agent(client)
-    account = agent.call("list_accounts")[0]
-    containers = {c["name"]: c for c in agent.call("list_containers", account_id=account["id"])}
+    account = agent.rows("list_accounts")[0]
+    containers = {c["name"]: c for c in agent.rows("list_containers", account_id=account["id"])}
     listed = agent.call("list_messages", container_id=containers["INBOX"]["id"], limit=1)
     message_id = listed["messages"][0]["message_id"]
 

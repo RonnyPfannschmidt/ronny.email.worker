@@ -351,7 +351,7 @@ async def test_the_review_page_marks_what_arrived_after_the_bundle_was_proposed(
     await scope.flush()
 
     detail = await views.bundle_detail(scope, bundle.id)
-    late = {i["subject"] for i in detail["items"] if i["arrived_late"]}
+    late = {i["subject"] for i in detail["items"]["items"] if i["arrived_late"]}
     assert late == {"Lunch on Thursday", "Re: Lunch on Thursday"}
     assert detail["reviewed_through"] == suggest.shown_through(bundle)
     assert [q["text"] for q in detail["queries"]] == ["Lunch"]
@@ -361,8 +361,8 @@ async def test_a_bundle_nobody_grew_says_nothing_about_arriving_late(scope, worl
     bundle = await _from_query(scope, world, "Lunch")
     await scope.flush()
     detail = await views.bundle_detail(scope, bundle.id)
-    assert not any(i["arrived_late"] for i in detail["items"])
-    assert [i["arrived_from"] for i in detail["items"]] == ["Lunch", "Lunch"]
+    assert not any(i["arrived_late"] for i in detail["items"]["items"])
+    assert [i["arrived_from"] for i in detail["items"]["items"]] == ["Lunch", "Lunch"]
 
 
 async def test_expiry_still_closes_a_bundle_that_was_grown(scope, world):

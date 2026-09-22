@@ -546,7 +546,7 @@ async def test_a_bundle_nobody_decided_and_nothing_survived_closes_itself(
     assert bundle.decided_at is None
 
     # And it is out of the queue rather than sitting there looking actionable.
-    waiting = await views.bundle_summaries(scope, [m.BundleStatus.proposed])
+    waiting = (await views.bundle_summaries(scope, [m.BundleStatus.proposed]))["bundles"]
     assert [b for b in waiting if b["bundle_id"] == bundle.id] == []
 
 
@@ -565,7 +565,7 @@ async def test_drawing_the_queue_retires_what_died_in_it(scope, world, backend):
 
     assert await staleness.sweep_queue(scope) == 1
     assert bundle.status is m.BundleStatus.stale
-    assert await views.bundle_summaries(scope, [m.BundleStatus.proposed]) == []
+    assert (await views.bundle_summaries(scope, [m.BundleStatus.proposed]))["bundles"] == []
 
 
 async def test_accepting_a_bundle_that_just_died_says_so_rather_than_refusing_forever(

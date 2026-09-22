@@ -12,7 +12,7 @@
   {% if message.flags %} · {{ message.flags | join(" ") }}{% endif %}
 </p>
 
-{% for assessment in message.assessment %}
+{% for assessment in message.assessment.assessment %}
   {% for f in assessment.findings %}
   <span class="finding {{ f["class"] }}">{{ f.detail }}</span>
   {% endfor %}
@@ -20,19 +20,19 @@
 
 {% if message.body and message.body.text %}
 <div class="body">{{ message.body.text }}</div>
-{% if message.body.links %}
+{% if message.body.links.links %}
 <details>
-  <summary class="small">{{ message.body.links | length }} links</summary>
+  <summary class="small">{{ message.body.links.total_matching }} links</summary>
   <table class="links">
-    {% for link in message.body.links %}
+    {% for link in message.body.links.links %}
     <tr><td>{{ link.text }}</td><td class="muted">{{ link.target }}</td></tr>
     {% endfor %}
   </table>
 </details>
 {% endif %}
-{% if message.body.attachments %}
+{% if message.body.attachments.attachments %}
 <p class="small muted">
-  Attachments: {% for a in message.body.attachments %}{{ a.filename or a.content_type }}{{ ", " if not loop.last }}{% endfor %}
+  Attachments: {% for a in message.body.attachments.attachments %}{{ a.filename or a.content_type }}{{ ", " if not loop.last }}{% endfor %}
   — named, not fetched. Open them in your own client.
 </p>
 {% endif %}

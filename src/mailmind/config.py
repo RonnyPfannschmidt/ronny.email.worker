@@ -86,6 +86,15 @@ class AccountConfig:
 class Limits:
     #: 05: a request that would return more than this gets less, and is told so.
     max_messages_per_request: int = 200
+    #: The other half of the same rule, in the unit a client actually truncates on.  A row
+    #: limit never noticed that fifty messages weigh 41 KB and a bundle of four hundred
+    #: items 208 KB; opencode cuts a tool result at around 50 KB, so a response is fitted
+    #: to this and the rest is reachable by cursor.
+    #:
+    #: A target rather than a ceiling — the scalar fields around the rows are not weighed,
+    #: so an answer lands under ten percent over.  The default is well below 50 KB rather
+    #: than just under it for that reason, and because MCP framing rides along too.
+    max_response_bytes: int = 32 * 1024
     #: 03: suggestions nobody gets to expire rather than accumulate.
     bundle_expiry_days: int = 7
     #: How much cached body text is kept before the least recently read is evicted.

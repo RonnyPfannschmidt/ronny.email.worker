@@ -18,6 +18,9 @@ port = 8765
 [limits]
 # 05: a request matching more than this returns fewer and says so.
 max_messages_per_request = 200
+# The same rule in the unit a client actually truncates on — opencode cuts a tool result
+# at around 50 KB. What does not fit is reached with the answer's next_cursor.
+max_response_bytes = 32768
 # 03: suggestions nobody gets to expire rather than accumulate.
 bundle_expiry_days = 7
 body_cache_bytes = 268435456

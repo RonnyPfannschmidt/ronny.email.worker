@@ -24,8 +24,35 @@ before it says anything.
 Observation is bounded. A request that would return more than the limit gets less, and is told
 so, rather than silently returning a slice that looks complete. That is one rule and therefore
 one envelope: listing, searching and summarising all answer with `returned`, `total_matching`,
-`truncated` and a `note`. They did not, for a while — search returned no total and the
-summaries returned bare lists, which is exactly the slice that looks complete.
+`truncated`, `next_cursor` and a `note`. They did not, for a while — search returned no total
+and the summaries returned bare lists, which is exactly the slice that looks complete.
+
+The limit is in bytes, not rows, because bytes are what truncates on the way to a client.
+opencode cuts a tool result at around 50 KB; measured against that, a listing of fifty
+messages weighed 41 KB, a folder list 66 KB, a bundle of four hundred items 208 KB and a
+newsletter with its links 108 KB. The row limit noticed none of it, and three of those four
+had no limit at all. Worse, the envelope used to sit *after* the rows, so the client's cut
+took away precisely the fields that said the answer was incomplete and left JSON that no
+longer parsed. The envelope leads now.
+
+And what is left out is reachable. Every listing carries a cursor; handing it back continues
+where the last answer stopped. This reverses something this note used to imply and the code
+used to say outright — that paging past the observation limit is the same ask spelled
+differently, a model asking for more than it can read. That argument holds for messages,
+where narrowing by sender or list is a better answer and the note still says so. It does not
+hold for the folder list, for the items of a bundle the agent itself proposed, or for the
+record of what has been decided: none of those can be narrowed by anything, and all three
+were simply unbounded. A rule with three surfaces outside it is not one rule.
+
+Cursors are opaque and belong to the request that made them: change the folder, the filter or
+the query and the cursor is refused rather than answering a different question from a
+position that means nothing in it. They are keyset rather than offset wherever the ordering
+has a column to resume from, because a mailbox is being synced underneath a listing and an
+offset asked twice returns a window over a list that has shifted. Search is the exception —
+its order is FTS5's relevance rank, which is not a column that can be compared — so it pages
+by position and can repeat or miss a result when the index changes between pages. Said out
+loud in the tool description, because a caller that thinks it enumerated a search exhaustively
+is a caller about to propose a bundle it believes is complete.
 
 ## Naming mail, or finding it
 

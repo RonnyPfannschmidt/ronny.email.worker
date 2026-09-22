@@ -2,6 +2,12 @@
 
 Both need the same facts about the same cache, and letting them drift would mean an agent
 proposing against one picture while a person reviews another.
+
+Every listing here answers in the envelope :mod:`mailmind.paging` defines, and takes a
+cursor.  A
+caller wanting the whole of something passes ``limit=None``, which is what the review UI
+does where a person is looking at one page of their own mail and the template does its own
+paging.
 """
 
 from __future__ import annotations
@@ -10,6 +16,7 @@ import datetime as dt
 
 import sqlalchemy as sa
 
+from mailmind import paging
 from mailmind.db import cache
 from mailmind.db import models as m
 from mailmind.db.scope import TenantScope
@@ -50,23 +57,63 @@ def instant(value: str, field: str) -> dt.datetime:
     return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=dt.UTC)
 
 
-async def accounts(scope: TenantScope, allowed: set[int] | None = None) -> list[dict]:
+async def accounts(
+    scope: TenantScope,
+    allowed: set[int] | None = None,
+    *,
+    limit: int | None = None,
+    cursor: str | None = None,
+    budget: paging.Budget | None = None,
+) -> dict:
     stmt = sa.select(m.Account)
     if allowed is not None:
         stmt = stmt.where(m.Account.id.in_(allowed or {-1}))
-    return [
-        {
-            "id": a.id,
-            "name": a.name,
-            "backend": a.backend.value,
-            "health": a.health.value,
-            "health_detail": a.health_detail,
-        }
-        for a in await scope.all(stmt)
-    ]
+    guard = paging.fingerprint("accounts", sorted(allowed) if allowed is not None else None)
+    at = paging.decode(cursor, kind="accounts", guard=guard)
+    total = await scope.scalar(
+        sa.select(sa.func.count()).select_from(stmt.order_by(None).subquery())
+    )
+    if "id" in at:
+        stmt = stmt.where(m.Account.id > at["id"])
+    stmt = stmt.order_by(m.Account.id)
+    window = _window(limit)
+    rows = await scope.all(stmt if window is None else stmt.limit(window))
+    fetched_more = window is not None and len(rows) == window
+    return paging.page(
+        [
+            {
+                "id": a.id,
+                "name": a.name,
+                "backend": a.backend.value,
+                "health": a.health.value,
+                "health_detail": a.health_detail,
+            }
+            for a in (rows[:limit] if limit is not None else rows)
+        ],
+        total,
+        kind="accounts",
+        budget=budget or paging.Budget(None),
+        guard=guard,
+        positions=[{"id": a.id} for a in (rows[:limit] if limit is not None else rows)],
+        fetched_more=fetched_more,
+    )
 
 
-async def containers(scope: TenantScope, account_id: int) -> list[dict]:
+async def containers(
+    scope: TenantScope,
+    account_id: int,
+    *,
+    limit: int | None = None,
+    cursor: str | None = None,
+    budget: paging.Budget | None = None,
+) -> dict:
+    """Folders of one account, in name order.
+
+    Paged by name rather than by offset: folders appear and disappear as a bundle proposes
+    one and a person accepts it, and an offset would drop a folder from one page and repeat
+    another.  The tree an agent needs to pick a move target has to be complete or say that
+    it is not, which is what the envelope does.
+    """
     counts = dict(
         (
             await scope.execute(
@@ -81,31 +128,47 @@ async def containers(scope: TenantScope, account_id: int) -> list[dict]:
             )
         ).all()
     )
-    return [
-        {
-            "id": c.id,
-            "name": c.name,
-            "special_use": c.special_use,
-            "cached_messages": counts.get(c.id, 0),
-            "server_message_count": c.message_count,
-            # A folder some bundle has proposed and nobody has accepted yet.  Shown
-            # rather than hidden, so a second bundle can file into the same one — and
-            # marked, so nothing mistakes it for a folder that is actually there.
-            "exists_on_server": c.exists_on_server,
-            "last_synced": c.last_incremental_sync_at.isoformat()
-            if c.last_incremental_sync_at
-            else None,
-        }
-        for c in await scope.all(
-            sa.select(m.Container)
-            .where(
-                m.Container.account_id == account_id,
-                m.Container.selectable.is_(True),
-                m.Container.discarded_at.is_(None),
-            )
-            .order_by(m.Container.name)
-        )
-    ]
+    stmt = sa.select(m.Container).where(
+        m.Container.account_id == account_id,
+        m.Container.selectable.is_(True),
+        m.Container.discarded_at.is_(None),
+    )
+    guard = paging.fingerprint("containers", account_id)
+    at = paging.decode(cursor, kind="containers", guard=guard)
+    total = await scope.scalar(
+        sa.select(sa.func.count()).select_from(stmt.order_by(None).subquery())
+    )
+    if "name" in at:
+        stmt = stmt.where(m.Container.name > at["name"])
+    stmt = stmt.order_by(m.Container.name)
+    window = _window(limit)
+    rows = await scope.all(stmt if window is None else stmt.limit(window))
+    fetched_more = window is not None and len(rows) == window
+    return paging.page(
+        [
+            {
+                "id": c.id,
+                "name": c.name,
+                "special_use": c.special_use,
+                "cached_messages": counts.get(c.id, 0),
+                "server_message_count": c.message_count,
+                # A folder some bundle has proposed and nobody has accepted yet.  Shown
+                # rather than hidden, so a second bundle can file into the same one — and
+                # marked, so nothing mistakes it for a folder that is actually there.
+                "exists_on_server": c.exists_on_server,
+                "last_synced": c.last_incremental_sync_at.isoformat()
+                if c.last_incremental_sync_at
+                else None,
+            }
+            for c in (rows[:limit] if limit is not None else rows)
+        ],
+        total,
+        kind="containers",
+        budget=budget or paging.Budget(None),
+        guard=guard,
+        positions=[{"name": c.name} for c in (rows[:limit] if limit is not None else rows)],
+        fetched_more=fetched_more,
+    )
 
 
 async def container_delimiter(scope: TenantScope, account_id: int) -> str | None:
@@ -165,49 +228,76 @@ def flattened(tree: list[dict], depth: int = 0) -> list[dict]:
     return rows
 
 
-def bounded(rows: list[dict], total: int, *, kind: str = "messages") -> dict:
-    """The one shape every bounded observation comes back in.
+#: What a message listing suggests instead of paging to the end of a mailbox.  Paging is
+#: there now, and for a folder of thousands it is still the expensive way to learn what
+#: one GROUP BY knows.
+NARROW = "or narrow it, or use summarize_senders to see the shape of the rest"
 
-    05 asks that a request matching more than the limit gets less *and is told so*. Three
-    surfaces answer that question — listing, searching, summarising — and they used to
-    answer it in three shapes, one of which did not answer it at all.
+
+def budget_for(limit_bytes: int | None) -> paging.Budget:
+    """One response worth of bytes, spent across whatever lists it holds."""
+    return paging.Budget(limit_bytes)
+
+
+def _window(limit: int | None) -> int | None:
+    """One row more than asked for, which is how a query learns there is a next page."""
+    return None if limit is None else limit + 1
+
+
+def _after_newest_first(at: dict):
+    """The keyset predicate for "strictly after this row", newest first, nulls last.
+
+    A date alone does not identify a row — a mailing list delivers a hundred messages
+    inside a second — so the placement id is the tiebreaker, and both travel in the cursor.
+    Undated mail sorts last as a block, which is why a cursor already inside that block
+    compares only ids.
     """
-    return {
-        kind: rows,
-        "returned": len(rows),
-        "total_matching": total,
-        "truncated": total > len(rows),
-        "note": (
-            f"{total} {kind} match; {len(rows)} returned. Narrow the request or use "
-            "summarize_senders to see the shape of the rest."
-            if total > len(rows)
-            else None
-        ),
-    }
+    when, placement_id = at["d"], at["p"]
+    if when is None:
+        return sa.and_(m.Message.date_header.is_(None), m.Placement.id < placement_id)
+    boundary = dt.datetime.fromisoformat(when)
+    return sa.or_(
+        m.Message.date_header.is_(None),
+        m.Message.date_header < boundary,
+        sa.and_(m.Message.date_header == boundary, m.Placement.id < placement_id),
+    )
 
 
 async def messages(
     scope: TenantScope,
     *,
     container_id: int,
-    limit: int,
+    limit: int | None,
+    cursor: str | None = None,
     offset: int = 0,
+    budget: paging.Budget | None = None,
     from_address: str | None = None,
     list_id: str | None = None,
     unread_only: bool = False,
     before: str | None = None,
     since: str | None = None,
 ) -> dict:
-    """Bounded observation.
+    """Bounded observation, newest first.
 
     05: a request that would return more than the limit gets less, and is told so, rather
-    than silently returning a slice that looks complete.
+    than silently returning a slice that looks complete.  What was left out is now
+    reachable — ``next_cursor`` continues the listing — but narrowing is still the cheaper
+    answer for a folder of thousands, and the note says so.
 
-    ``offset`` is for the person paging through their own folder, and is not on the agent
-    surface: 05's limit exists because a model asked for more than it can read, and paging
-    past it would be the same ask spelled differently.  A reader is a different case — the
-    total is on the page either way, so nothing is being made to look complete.
+    Paged by keyset rather than by offset.  A folder is being synced underneath this: mail
+    arrives, mail is filed, and an offset asked a second time returns a window over a list
+    that has shifted, so a page drops messages it should have shown and repeats ones it
+    already did.  The cursor names the last row instead, and means the same thing however
+    much has landed since.
+
+    ``offset`` is the review UI's, and the two are mutually exclusive.  A person pages
+    backwards as well as forwards and a cursor only points one way, so the page they are
+    reading keeps arithmetic it can run in both directions; the cost — a window over a list
+    that shifted while they read it — is one a person absorbs by looking, and an agent
+    cannot.  Nothing on the agent surface passes it.
     """
+    if cursor and offset:
+        raise ValueError("pass a cursor or an offset, not both: they page differently")
     stmt = live_placements(container_id).join(m.Message, m.Placement.message_id == m.Message.id)
     if from_address:
         stmt = stmt.where(m.Message.from_address == from_address.lower())
@@ -220,16 +310,43 @@ async def messages(
     if since:
         stmt = stmt.where(m.Message.date_header >= instant(since, "since"))
 
+    guard = paging.fingerprint(
+        "messages", container_id, from_address, list_id, unread_only, before, since
+    )
+    at = paging.decode(cursor, kind="messages", guard=guard)
     total = await scope.scalar(
         sa.select(sa.func.count()).select_from(stmt.order_by(None).subquery())
     )
-    rows = await scope.all(
-        stmt.order_by(m.Message.date_header.desc().nullslast()).limit(limit).offset(offset)
+    if at:
+        stmt = stmt.where(_after_newest_first(at))
+    stmt = stmt.order_by(m.Message.date_header.desc().nullslast(), m.Placement.id.desc())
+    window = _window(limit)
+    if window is not None:
+        stmt = stmt.limit(window).offset(offset)
+    elif offset:
+        stmt = stmt.offset(offset)
+    rows = await scope.all(stmt)
+    fetched_more = window is not None and len(rows) == window
+    shown = rows[:limit] if limit is not None else rows
+    listed = [await _message_row(scope, placement) for placement in shown]
+    return paging.page(
+        listed,
+        total,
+        kind="messages",
+        budget=budget or paging.Budget(None),
+        guard=guard,
+        positions=[await _position_of(scope, p) for p in shown],
+        fetched_more=fetched_more,
+        steer=NARROW,
     )
-    listed = []
-    for placement in rows:
-        listed.append(await _message_row(scope, placement))
-    return bounded(listed, total)
+
+
+async def _position_of(scope: TenantScope, placement: m.Placement) -> dict:
+    message = await scope.get(m.Message, placement.message_id)
+    return {
+        "d": message.date_header.isoformat() if message.date_header else None,
+        "p": placement.id,
+    }
 
 
 async def _message_row(scope: TenantScope, placement: m.Placement) -> dict:
@@ -250,15 +367,63 @@ async def _message_row(scope: TenantScope, placement: m.Placement) -> dict:
     }
 
 
+#: Of what is left once the small parts are served, the least a body may have.  A
+#: newsletter carrying three hundred links would otherwise spend the whole response on
+#: them and answer with no text at all, which is the opposite of what was asked for.
+_BODY_SHARE = 0.5
+
+
+def _served(
+    rows: list[dict], start: int, budget: paging.Budget, *, kind: str
+) -> tuple[dict, int]:
+    """One section of a message, from ``start``, for as long as the budget holds."""
+    kept, _ = budget.fit(rows[start:])
+    through = start + len(kept)
+    return paging.section(kept, len(rows), kind=kind, through=through), through
+
+
 async def message_detail(
-    scope: TenantScope, message_id: int, *, include_body: bool = False
+    scope: TenantScope,
+    message_id: int,
+    *,
+    include_body: bool = False,
+    cursor: str | None = None,
+    budget: paging.Budget | None = None,
 ) -> dict:
+    """One message, fitted to one response.
+
+    This is the largest single thing the surface answers with — a newsletter body and its
+    links measured 108 KB — and it is not a listing, so the parts that can run long carry
+    the section shape and the response carries one cursor between them.  Hand it back and
+    the next answer resumes every part that was cut, at once.
+
+    The body is given first claim on what the lists leave, because a caller asking for a
+    body and receiving three hundred link rows instead has been answered with the wrong
+    thing.
+    """
     message = await scope.get(m.Message, message_id)
     if message is None:
         raise LookupError(f"no message {message_id}")
     placement = await scope.scalar(
         live_placements().where(m.Placement.message_id == message_id)
     )
+    budget = budget or paging.Budget(None)
+    guard = paging.fingerprint("message", message_id, include_body)
+    at = paging.decode(cursor, kind="message", guard=guard)
+
+    recipients = [
+        {"role": a.role.value, "address": a.address, "display_name": a.display_name}
+        for a in message.addresses
+    ]
+    findings = await assessment_of(scope, m.SubjectKind.message, message.id)
+
+    served_recipients, through_recipients = _served(
+        recipients, at.get("r", 0), budget, kind="recipients"
+    )
+    served_findings, through_findings = _served(
+        findings, at.get("s", 0), budget, kind="assessment"
+    )
+
     detail = {
         "message_id": message.id,
         "subject": message.subject,
@@ -267,30 +432,59 @@ async def message_detail(
         "date": message.date_header.isoformat() if message.date_header else None,
         "container_id": placement.container_id if placement else None,
         "flags": placement.flags.split() if placement else [],
-        "recipients": [
-            {"role": a.role.value, "address": a.address, "display_name": a.display_name}
-            for a in message.addresses
-        ],
+        "recipients": served_recipients,
         "list_id": message.list_id,
         "parse_status": message.parse_status.value,
-        "assessment": await assessment_of(scope, m.SubjectKind.message, message.id),
+        "assessment": served_findings,
     }
+    more = {"r": through_recipients, "s": through_findings}
+    unfinished = through_recipients < len(recipients) or through_findings < len(findings)
+
     if include_body:
         body = await scope.scalar(
             sa.select(m.MessageBody).where(m.MessageBody.message_id == message_id)
         )
-        if body is not None:
-            detail["body"] = {
-                "text": body.text_plain or body.text_from_html,
-                # Link targets travel beside their text so a disagreement is visible.
-                # Nothing here is fetched: fetching a remote image tells the sender the
-                # mail was read.
-                "links": body.links.get("links", []),
-                "attachments": body.attachments.get("attachments", []),
-            }
-        else:
+        if body is None:
             detail["body"] = None
             detail["body_note"] = "no body cached; call request_body first"
+        else:
+            text = body.text_plain or body.text_from_html or ""
+            links = body.links.get("links", [])
+            attachments = body.attachments.get("attachments", [])
+            # Held back from the body so the lists below it are not starved to nothing.
+            held_back = (
+                0 if budget.remaining is None else int(budget.remaining * (1 - _BODY_SHARE))
+            )
+            start = at.get("b", 0)
+            if budget.remaining is not None:
+                budget.remaining -= held_back
+            chunk, body_more = budget.take_text(text, start)
+            if budget.remaining is not None:
+                budget.remaining += held_back
+            served_attachments, through_attachments = _served(
+                attachments, at.get("a", 0), budget, kind="attachments"
+            )
+            # Link targets travel beside their text so a disagreement is visible.
+            # Nothing here is fetched: fetching a remote image tells the sender the
+            # mail was read.
+            served_links, through_links = _served(links, at.get("l", 0), budget, kind="links")
+            detail["body"] = {
+                "text": chunk,
+                "text_offset": start,
+                "text_returned": len(chunk),
+                "text_total": len(text),
+                "text_truncated": body_more,
+                "links": served_links,
+                "attachments": served_attachments,
+            }
+            more |= {"b": start + len(chunk), "l": through_links, "a": through_attachments}
+            unfinished = (
+                unfinished
+                or body_more
+                or (through_links < len(links) or through_attachments < len(attachments))
+            )
+
+    detail["next_cursor"] = paging.encode("message", guard, more) if unfinished else None
     return detail
 
 
@@ -320,69 +514,127 @@ async def assessment_of(scope: TenantScope, kind: m.SubjectKind, subject_id: int
     ]
 
 
-async def summarize_senders(scope: TenantScope, container_id: int, limit: int = 100) -> dict:
+async def summarize_senders(
+    scope: TenantScope,
+    container_id: int,
+    limit: int | None = 100,
+    *,
+    cursor: str | None = None,
+    budget: paging.Budget | None = None,
+) -> dict:
     """What an untended mailbox is actually made of.
 
     Without this an agent enumerates thousands of messages to learn what one GROUP BY
     knows, and hits the observation limit while doing it.
+
+    Ordered by how much each sender accounts for, so the first page is the one worth
+    reading.  The tail is reachable: the keyset runs over the grouped rows, on the count
+    and then the address, because a count alone repeats across senders and would page in
+    circles.
     """
     placements = live_placements(container_id).subquery()
-    stmt = (
+    grouped = (
         sa.select(
-            m.Message.from_address,
-            sa.func.max(m.Message.from_display),
-            sa.func.count(),
-            sa.func.min(m.Message.date_header),
-            sa.func.max(m.Message.date_header),
-            sa.func.sum(sa.case((placements.c.flags.contains("\\Seen"), 0), else_=1)),
+            m.Message.from_address.label("from_address"),
+            sa.func.coalesce(m.Message.from_address, "").label("sort_key"),
+            sa.func.max(m.Message.from_display).label("display_name"),
+            sa.func.count().label("n"),
+            sa.func.min(m.Message.date_header).label("first_seen"),
+            sa.func.max(m.Message.date_header).label("last_seen"),
+            sa.func.sum(sa.case((placements.c.flags.contains("\\Seen"), 0), else_=1)).label(
+                "unread"
+            ),
         )
         .join(placements, placements.c.message_id == m.Message.id)
         .group_by(m.Message.from_address)
-        .order_by(sa.func.count().desc())
-        .limit(limit)
+        .subquery()
     )
+    guard = paging.fingerprint("senders", container_id)
+    at = paging.decode(cursor, kind="senders", guard=guard)
+    stmt = sa.select(grouped)
+    if at:
+        stmt = stmt.where(
+            sa.or_(
+                grouped.c.n < at["c"],
+                sa.and_(grouped.c.n == at["c"], grouped.c.sort_key > at["a"]),
+            )
+        )
+    stmt = stmt.order_by(grouped.c.n.desc(), grouped.c.sort_key)
+    window = _window(limit)
+    found = (await scope.execute(stmt if window is None else stmt.limit(window))).all()
+    fetched_more = window is not None and len(found) == window
+    shown = found[:limit] if limit is not None else found
     rows = [
         {
-            "from_address": address,
-            "display_name": display,
-            "count": count,
-            "first_seen": str(first) if first else None,
-            "last_seen": str(last) if last else None,
-            "unread": int(unread or 0),
+            "from_address": row.from_address,
+            "display_name": row.display_name,
+            "count": row.n,
+            "first_seen": str(row.first_seen) if row.first_seen else None,
+            "last_seen": str(row.last_seen) if row.last_seen else None,
+            "unread": int(row.unread or 0),
         }
-        for address, display, count, first, last, unread in await scope.execute(stmt)
+        for row in shown
     ]
     total = await scope.scalar(
         sa.select(sa.func.count(sa.distinct(m.Message.from_address)))
         .select_from(m.Message)
         .join(placements, placements.c.message_id == m.Message.id)
     )
-    return bounded(rows, total, kind="senders")
+    return paging.page(
+        rows,
+        total,
+        kind="senders",
+        budget=budget or paging.Budget(None),
+        guard=guard,
+        positions=[{"c": row.n, "a": row.sort_key} for row in shown],
+        fetched_more=fetched_more,
+    )
 
 
-async def summarize_lists(scope: TenantScope, container_id: int, limit: int = 100) -> dict:
+async def summarize_lists(
+    scope: TenantScope,
+    container_id: int,
+    limit: int | None = 100,
+    *,
+    cursor: str | None = None,
+    budget: paging.Budget | None = None,
+) -> dict:
     placements = live_placements(container_id).subquery()
-    stmt = (
+    grouped = (
         sa.select(
-            m.Message.list_id,
-            sa.func.count(),
-            sa.func.max(m.Message.date_header),
-            sa.func.max(sa.cast(m.Message.has_list_unsubscribe, sa.Integer)),
+            m.Message.list_id.label("list_id"),
+            sa.func.count().label("n"),
+            sa.func.max(m.Message.date_header).label("last_seen"),
+            sa.func.max(sa.cast(m.Message.has_list_unsubscribe, sa.Integer)).label("unsub"),
         )
         .join(placements, placements.c.message_id == m.Message.id)
         .where(m.Message.list_id.is_not(None))
         .group_by(m.Message.list_id)
-        .order_by(sa.func.count().desc())
-        .limit(limit)
+        .subquery()
     )
+    guard = paging.fingerprint("lists", container_id)
+    at = paging.decode(cursor, kind="lists", guard=guard)
+    stmt = sa.select(grouped)
+    if at:
+        stmt = stmt.where(
+            sa.or_(
+                grouped.c.n < at["c"],
+                sa.and_(grouped.c.n == at["c"], grouped.c.list_id > at["a"]),
+            )
+        )
+    stmt = stmt.order_by(grouped.c.n.desc(), grouped.c.list_id)
+    window = _window(limit)
+    found = (await scope.execute(stmt if window is None else stmt.limit(window))).all()
+    fetched_more = window is not None and len(found) == window
+    shown = found[:limit] if limit is not None else found
     rows = [
         {
-            "list_id": list_id,
-            "count": count,
-            "last_seen": str(last) if last else None,
-            "has_unsubscribe": bool(unsub),
+            "list_id": row.list_id,
+            "count": row.n,
+            "last_seen": str(row.last_seen) if row.last_seen else None,
+            "has_unsubscribe": bool(row.unsub),
         }
-        for list_id, count, last, unsub in await scope.execute(stmt)
+        for row in shown
     ]
     total = await scope.scalar(
         sa.select(sa.func.count(sa.distinct(m.Message.list_id)))
@@ -390,22 +642,66 @@ async def summarize_lists(scope: TenantScope, container_id: int, limit: int = 10
         .join(placements, placements.c.message_id == m.Message.id)
         .where(m.Message.list_id.is_not(None))
     )
-    return bounded(rows, total, kind="lists")
+    return paging.page(
+        rows,
+        total,
+        kind="lists",
+        budget=budget or paging.Budget(None),
+        guard=guard,
+        positions=[{"c": row.n, "a": row.list_id} for row in shown],
+        fetched_more=fetched_more,
+    )
 
 
 async def search(
-    scope: TenantScope, query: str, *, account_ids: set[int] | None, limit: int
+    scope: TenantScope,
+    query: str,
+    *,
+    account_ids: set[int] | None,
+    limit: int | None,
+    cursor: str | None = None,
+    budget: paging.Budget | None = None,
 ) -> dict:
-    ids = await cache.search_messages(scope, query, account_ids=account_ids, limit=limit)
-    rows = []
-    for message_id in ids:
+    """Ranked search, paged by position in the ranking.
+
+    The one listing here that cannot page by keyset — see
+    :func:`mailmind.db.cache.search_messages` for why — so the cursor carries how far into
+    the ranking the last page reached.  It counts rows *the index returned*, not rows this
+    answered with: a hit whose message has since left every folder is dropped below, and a
+    cursor that skipped it would lose a real result on the next page.
+    """
+    guard = paging.fingerprint(
+        "search", query, sorted(account_ids) if account_ids is not None else None
+    )
+    at = paging.decode(cursor, kind="search", guard=guard)
+    start = at.get("o", 0)
+    window = _window(limit)
+    ids = await cache.search_messages(
+        scope, query, account_ids=account_ids, limit=window, offset=start
+    )
+    fetched_more = window is not None and len(ids) == window
+    consumed = ids[:limit] if limit is not None else ids
+    rows, positions = [], []
+    for reached, message_id in enumerate(consumed, start=start + 1):
         placement = await scope.scalar(
             live_placements().where(m.Placement.message_id == message_id)
         )
         if placement is not None:
             rows.append(await _message_row(scope, placement))
+            positions.append({"o": reached})
     total = await cache.count_search_messages(scope, query, account_ids=account_ids)
-    return bounded(rows, total)
+    return paging.page(
+        rows,
+        total,
+        kind="messages",
+        cursor_kind="search",
+        budget=budget or paging.Budget(None),
+        guard=guard,
+        positions=positions,
+        end_position={"o": start + len(consumed)},
+        fetched_more=fetched_more,
+        steer=NARROW,
+    )
 
 
 # ------------------------------------------------------------------------ bundles
@@ -416,12 +712,41 @@ async def bundle_summaries(
     statuses: list[m.BundleStatus],
     *,
     account_ids: set[int] | None = None,
-) -> list[dict]:
+    limit: int | None = None,
+    cursor: str | None = None,
+    budget: paging.Budget | None = None,
+) -> dict:
+    """Bundles in one of the given states, newest first.
+
+    ``decided`` is the listing that grows for the life of the service, so it is the one
+    that needs a cursor most: every bundle anybody ever accepted or rejected is in it.
+    """
     stmt = sa.select(m.Bundle).where(m.Bundle.status.in_(statuses))
     if account_ids is not None:
         stmt = stmt.where(m.Bundle.account_id.in_(account_ids or {-1}))
-    bundles = await scope.all(stmt.order_by(m.Bundle.created_at.desc()))
-    return [
+    guard = paging.fingerprint(
+        "bundles",
+        sorted(s.value for s in statuses),
+        sorted(account_ids) if account_ids is not None else None,
+    )
+    at = paging.decode(cursor, kind="bundles", guard=guard)
+    total = await scope.scalar(
+        sa.select(sa.func.count()).select_from(stmt.order_by(None).subquery())
+    )
+    if at:
+        boundary = dt.datetime.fromisoformat(at["t"])
+        stmt = stmt.where(
+            sa.or_(
+                m.Bundle.created_at < boundary,
+                sa.and_(m.Bundle.created_at == boundary, m.Bundle.id < at["i"]),
+            )
+        )
+    stmt = stmt.order_by(m.Bundle.created_at.desc(), m.Bundle.id.desc())
+    window = _window(limit)
+    found = await scope.all(stmt if window is None else stmt.limit(window))
+    fetched_more = window is not None and len(found) == window
+    bundles = found[:limit] if limit is not None else found
+    rows = [
         {
             "bundle_id": b.id,
             "status": b.status.value,
@@ -442,6 +767,15 @@ async def bundle_summaries(
         }
         for b in bundles
     ]
+    return paging.page(
+        rows,
+        total,
+        kind="bundles",
+        budget=budget or paging.Budget(None),
+        guard=guard,
+        positions=[{"t": b.created_at.isoformat(), "i": b.id} for b in bundles],
+        fetched_more=fetched_more,
+    )
 
 
 async def proposed_counts(scope: TenantScope) -> dict[int, int]:
@@ -527,7 +861,22 @@ async def _folder_item(scope: TenantScope, suggestion: m.Suggestion) -> dict:
     }
 
 
-async def bundle_detail(scope: TenantScope, bundle_id: int) -> dict:
+async def bundle_detail(
+    scope: TenantScope,
+    bundle_id: int,
+    *,
+    limit: int | None = None,
+    cursor: str | None = None,
+    budget: paging.Budget | None = None,
+) -> dict:
+    """One bundle: its whole effect, item by item, with premise state.
+
+    A bundle holds up to ``max_bundle_size`` items and four hundred of them measured
+    208 KB, so ``items`` is paged like everything else.  The review UI asks for all of them
+    — ``limit=None`` — and has to: ``reviewed_through`` says what the page being accepted
+    from actually showed, and a reviewer accepting one page of a bundle they have not read
+    to the end is the thing that field exists to prevent.
+    """
     bundle = await scope.get(m.Bundle, bundle_id)
     if bundle is None:
         raise LookupError(f"no bundle {bundle_id}")
@@ -555,8 +904,16 @@ async def bundle_detail(scope: TenantScope, bundle_id: int) -> dict:
         default=None,
     )
 
+    guard = paging.fingerprint("bundle", bundle_id)
+    at = paging.decode(cursor, kind="bundle", guard=guard)
+    ordered = sorted(bundle.suggestions, key=lambda s: s.id)
+    after = at.get("i")
+    pending = [s for s in ordered if after is None or s.id > after]
+    selected = pending if limit is None else pending[:limit]
+    fetched_more = limit is not None and len(pending) > len(selected)
+
     items = []
-    for suggestion in bundle.suggestions:
+    for suggestion in selected:
         if suggestion.message_id is None:
             items.append(await _folder_item(scope, suggestion))
             continue
@@ -592,9 +949,24 @@ async def bundle_detail(scope: TenantScope, bundle_id: int) -> dict:
         }
     )
 
+    budget = budget or paging.Budget(None)
+    paged = paging.page(
+        items,
+        len(ordered),
+        kind="items",
+        # The rows are items; the cursor is the bundle's.  Without this the cursor is
+        # issued under one name and read back under another, and every second page is
+        # refused as somebody else's.
+        cursor_kind="bundle",
+        budget=budget,
+        guard=guard,
+        positions=[{"i": s.id} for s in selected],
+        fetched_more=fetched_more,
+    )
+
     attempts = await scope.all(
         sa.select(m.ApplyAttempt).where(
-            m.ApplyAttempt.suggestion_id.in_([s.id for s in bundle.suggestions] or [-1])
+            m.ApplyAttempt.suggestion_id.in_([s.id for s in selected] or [-1])
         )
     )
 
@@ -615,10 +987,12 @@ async def bundle_detail(scope: TenantScope, bundle_id: int) -> dict:
         "decided_at": bundle.decided_at.isoformat() if bundle.decided_at else None,
         "decided_by": bundle.decided_by.name if bundle.decided_by else None,
         "decision_reason": bundle.decision_reason,
-        "items": items,
+        "items": paged,
         #: The last item this page is showing.  Travels back on the accept form so that
         #: accepting means "the bundle I read" rather than "the bundle as it stands".
-        "reviewed_through": max((s.id for s in bundle.suggestions), default=0),
+        #: Taken from what was actually returned, not from the bundle: a caller that asked
+        #: for one page of it has read one page of it.
+        "reviewed_through": max((s.id for s in selected[: paged["returned"]]), default=0),
         "queries": queries,
         "self_assessed_by": same_producer,
         "attempts": [

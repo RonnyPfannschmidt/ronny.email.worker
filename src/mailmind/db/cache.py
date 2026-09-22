@@ -129,19 +129,32 @@ async def search_messages(
     query: str,
     *,
     account_ids: set[int] | None = None,
-    limit: int = 50,
+    limit: int | None = 50,
+    offset: int = 0,
 ) -> list[int]:
     """Search the index, optionally narrowed to a set of accounts.
 
     ``account_ids`` is how a caller's own view reaches the one query the loader criteria
     cannot police.  ``None`` means every account of the tenant, which is the reviewer's
     view and never an agent's; an empty set means no mail rather than all of it.
+
+    ``offset`` is how a second page of results is reached, and it is an offset rather than
+    a keyset because the ordering is FTS5's ``rank``: rank is not a column that can be
+    compared in a ``WHERE`` clause, so there is nothing to resume from.  The cost is the
+    ordinary one — mail indexed between two pages shifts the boundary, so a page can miss
+    a result or repeat one.  Acceptable here and nowhere else in this module: a search is
+    a way of finding candidates, and every other listing pages by keyset.
     """
     where, params = _search_where(scope, query, account_ids)
     if where is None:
         return []
-    params["limit"] = limit
-    sql = f"SELECT message_id FROM message_fts WHERE {where} ORDER BY rank LIMIT :limit"
+    # SQLite has no OFFSET without LIMIT; -1 is its documented "no limit".
+    params["limit"] = -1 if limit is None else limit
+    params["offset"] = offset
+    sql = (
+        f"SELECT message_id FROM message_fts WHERE {where} "
+        "ORDER BY rank LIMIT :limit OFFSET :offset"
+    )
     result = await scope.session.execute(sa.text(sql), params)
     return [row[0] for row in result]
 

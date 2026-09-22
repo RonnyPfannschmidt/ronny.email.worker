@@ -1,8 +1,10 @@
 {% extends "base.html" %}
+{# The reviewer is shown every item, so this page reads the whole section. #}
+{% set items = bundle["items"]["items"] %}
 {% block title %}review — mailmind{% endblock %}
 {% block content %}
 
-{% set stale_items = bundle["items"] | selectattr("status", "equalto", "stale") | list %}
+{% set stale_items = items | selectattr("status", "equalto", "stale") | list %}
 
 {% set folders = bundle.operation == "discard_container" %}
 
@@ -10,7 +12,7 @@
   {% if folders %}discard{% else %}{{ bundle.operation }}{% endif %}{% if bundle.flag %} {{ bundle.flag }}{% endif %}
   {% if bundle.target_container %}<span class="arrow">&rarr;</span> {{ bundle.target_container }}{% endif %}
   {% if bundle.target_is_new %}<span class="muted small">(new folder &mdash; will be created)</span>{% endif %}
-  <span class="muted small">({{ bundle["items"] | length }} {{ "folders" if folders else "messages" }})</span>
+  <span class="muted small">({{ items | length }} {{ "folders" if folders else "messages" }})</span>
 </h1>
 
 {% if bundle.target_is_new %}
@@ -76,7 +78,7 @@
 {% if folders %}
 <table>
   <tr><th>Folder</th><th>Holds</th><th>Under it</th><th></th><th>Would be</th><th></th></tr>
-  {% for item in bundle["items"] %}
+  {% for item in items %}
   <tr class="{{ 'stale' if item.status == 'stale' }}">
     <td class="small">{{ item.container }}</td>
     <td class="small {{ 'warn' if item.cached_messages }}">
@@ -109,7 +111,7 @@ that still has something below it.</p>
 {% else %}
 <table>
   <tr><th>From</th><th>Subject</th><th>Date</th><th>Now in</th><th></th><th>Would be in</th><th></th></tr>
-  {% for item in bundle["items"] %}
+  {% for item in items %}
   <tr id="m{{ item.message_id }}" class="{{ 'stale' if item.status == 'stale' }}">
     <td class="small">
       {% if item.arrived_late %}<span class="muted small">added later</span><br>{% endif %}

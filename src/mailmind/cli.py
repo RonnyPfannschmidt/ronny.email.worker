@@ -389,7 +389,8 @@ def status(ctx: click.Context) -> None:
 
     async def go() -> None:
         async with service.scope(TENANT_ZERO, readonly=True) as scope:
-            bundles = await views.bundle_summaries(scope, [m.BundleStatus.proposed])
+            waiting = await views.bundle_summaries(scope, [m.BundleStatus.proposed])
+            bundles = waiting["bundles"]
             click.echo(json.dumps(bundles, indent=2))
 
     service.run(go())

@@ -367,7 +367,9 @@ async def test_a_discarded_folder_leaves_the_container_list(scope, world, backen
     await applier.apply_bundle(scope, bundle, backend)
     await scope.commit()
 
-    names = [c["name"] for c in await views.containers(scope, world["account"].id)]
+    names = [
+        c["name"] for c in (await views.containers(scope, world["account"].id))["containers"]
+    ]
     assert "Old" not in names
 
 
@@ -399,11 +401,11 @@ async def test_the_reviewer_sees_folders_where_the_messages_usually_are(scope, w
 
     detail = await views.bundle_detail(scope, bundle.id)
     assert detail["operation"] == "discard_container"
-    by_name = {item["container"]: item for item in detail["items"]}
+    by_name = {item["container"]: item for item in detail["items"]["items"]}
     assert by_name["Old"]["children"] == ["Old/2019"]
     assert by_name["Old"]["cached_messages"] == 0
     assert by_name["Old/2019"]["children"] == []
-    assert all(item["message_id"] is None for item in detail["items"])
+    assert all(item["message_id"] is None for item in detail["items"]["items"])
 
 
 async def test_an_item_can_be_excluded_from_a_discard_like_any_other(scope, world, backend):
@@ -460,7 +462,7 @@ async def test_the_folder_list_is_a_tree_with_inbox_at_the_top(scope, world, bac
     account = world["account"]
 
     tree = views.as_tree(
-        await views.containers(scope, account.id),
+        (await views.containers(scope, account.id))["containers"],
         await views.container_delimiter(scope, account.id),
     )
 
@@ -482,7 +484,7 @@ async def test_a_level_nobody_made_is_a_label_rather_than_a_link(scope, world, b
     account = world["account"]
 
     tree = views.as_tree(
-        await views.containers(scope, account.id),
+        (await views.containers(scope, account.id))["containers"],
         await views.container_delimiter(scope, account.id),
     )
     old = next(node for node in tree if node["label"] == "Old")

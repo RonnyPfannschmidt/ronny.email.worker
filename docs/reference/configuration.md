@@ -43,6 +43,7 @@ with no way for an agent to log in.
 ```toml
 [limits]
 max_messages_per_request = 200
+max_response_bytes = 32768
 bundle_expiry_days = 7
 body_cache_bytes = 268435456
 max_bundle_size = 500
@@ -51,6 +52,7 @@ max_bundle_size = 500
 | Key | Default | |
 |---|---|---|
 | `max_messages_per_request` | `200` | A request matching more returns fewer, and says so. |
+| `max_response_bytes` | `32768` | The same rule in bytes, which is what a client truncates on. What does not fit is reached with `next_cursor`. |
 | `bundle_expiry_days` | `7` | Undecided bundles expire rather than accumulate. |
 | `body_cache_bytes` | `268435456` | Cached body text kept before the coldest is evicted. |
 | `max_bundle_size` | `500` | A larger bundle is refused at the proposal. |

@@ -489,7 +489,7 @@ def create_app(
         """What the header shows on every page: the accounts, and which one is chosen."""
         current = await chosen_account(scope)
         return {
-            "accounts": await views.accounts(scope),
+            "accounts": (await views.accounts(scope))["accounts"],
             "current_account": {"id": current.id, "name": current.name} if current else None,
             "waiting": await views.proposed_counts(scope),
         }
@@ -602,9 +602,9 @@ def create_app(
             # being offered here rather than after somebody opens it to find out.
             await staleness.sweep_queue(scope, here)
             await scope.commit()
-            bundles = await views.bundle_summaries(
-                scope, [m.BundleStatus.proposed], account_ids=here
-            )
+            bundles = (
+                await views.bundle_summaries(scope, [m.BundleStatus.proposed], account_ids=here)
+            )["bundles"]
             recent = (
                 await views.bundle_summaries(
                     scope,
@@ -617,11 +617,12 @@ def create_app(
                         m.BundleStatus.stale,
                     ],
                     account_ids=here,
+                    limit=10,
                 )
-            )[:10]
-            applying = await views.bundle_summaries(
-                scope, [m.BundleStatus.accepted], account_ids=here
-            )
+            )["bundles"]
+            applying = (
+                await views.bundle_summaries(scope, [m.BundleStatus.accepted], account_ids=here)
+            )["bundles"]
             waiting_ids = {b["bundle_id"] for b in applying}
             apply_tasks = {
                 task["subject_id"]: task
@@ -652,9 +653,11 @@ def create_app(
                 # The first of the two staleness checks: before it is shown.
                 await staleness.refresh_bundle(scope, bundle)
                 await scope.commit()
-            detail = await views.bundle_detail(scope, bundle_id)
+            # limit=None: a reviewer is shown the whole of what they are accepting, and
+            # `reviewed_through` is only honest about a page that held all of it.
+            detail = await views.bundle_detail(scope, bundle_id, limit=None)
             bodies = {}
-            for item in detail["items"]:
+            for item in detail["items"]["items"]:
                 body = await scope.scalar(
                     sa.select(m.MessageBody).where(
                         m.MessageBody.message_id == item["message_id"]
@@ -788,7 +791,7 @@ def create_app(
         """Somewhere to move mail to, in the order the folder list shows it."""
         return views.flattened(
             views.as_tree(
-                await views.containers(scope, account_id),
+                (await views.containers(scope, account_id))["containers"],
                 await views.container_delimiter(scope, account_id),
             )
         )
@@ -807,7 +810,7 @@ def create_app(
             tree = []
             if current:
                 tree = views.as_tree(
-                    await views.containers(scope, current["id"]),
+                    (await views.containers(scope, current["id"]))["containers"],
                     await views.container_delimiter(scope, current["id"]),
                 )
             return render(request, "mail_folders.html", tree=tree, **header)
@@ -973,7 +976,7 @@ def create_app(
                 rows.append(
                     {
                         "account": account,
-                        "containers": await views.containers(scope, account.id),
+                        "containers": (await views.containers(scope, account.id))["containers"],
                         "capabilities": sorted(
                             (c.name, c.declared, c.probed_present) for c in caps
                         ),
@@ -1159,7 +1162,7 @@ def create_app(
     async def agents_page(request: Request):  # noqa: ANN202
         """What has been let in, and the button that takes it back."""
         async with service.scope(readonly=True) as scope:
-            names = {a["id"]: a["name"] for a in await views.accounts(scope)}
+            names = {a["id"]: a["name"] for a in (await views.accounts(scope))["accounts"]}
             clients = {
                 c.client_id: c.client_name for c in await scope.all(sa.select(m.OAuthClient))
             }
