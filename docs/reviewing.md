@@ -25,7 +25,8 @@ over an enumerated list of messages, with the summary and reason its producer wr
 `mailmindctl status` answers the same question without a browser.
 
 Several can be ticked and rejected together, with one reason. Accepting has no such shortcut:
-it is done from the page that shows what would happen.
+it is done from the page that shows what would happen. On the keyboard, `j` and `k` move through
+the queue, `x` ticks and Enter opens the bundle.
 
 ## A bundle
 

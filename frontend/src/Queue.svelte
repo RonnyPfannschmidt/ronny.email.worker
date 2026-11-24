@@ -12,6 +12,9 @@
   let rejecting = $state(false);
   let refused = $state([]);
   let held = $state([]);
+  let body = $state(null);
+  // Where the keyboard is, kept so that a row leaving does not lose the place.
+  let at = -1;
 
   const ids = (bundles) => bundles.map((each) => each.bundle_id);
   const rows = $derived((queue?.bundles ?? []).filter((each) => !held.includes(each.bundle_id)));
@@ -71,8 +74,31 @@
     }
   }
 
+  function go(to) {
+    const boxes = body.querySelectorAll("input");
+    at = Math.max(0, Math.min(to, boxes.length - 1));
+    boxes[at].focus();
+  }
+
+  function key(event) {
+    if (!body || event.ctrlKey || event.altKey || event.metaKey || event.isComposing) return;
+    const { target } = event;
+    if (target.matches("input:not([type=checkbox]), textarea, select")) return;
+    const row = target.closest("tbody") === body ? target.closest("tr") : null;
+    if (row) at = [...body.rows].indexOf(row);
+    if (event.key === "j") go(row ? at + 1 : at);
+    else if (event.key === "k") go(row ? at - 1 : at);
+    else if (event.key === "x" && row && !event.repeat) row.querySelector("input").click();
+    else if (event.key === "Enter" && target.matches("[type=checkbox]") && row)
+      row.querySelector("a").click();
+    else return;
+    event.preventDefault();
+  }
+
   onMount(() => listen(load, taskChanged, load));
 </script>
+
+<svelte:window onkeydown={key} />
 
 <h1>Awaiting review</h1>
 {#each refused as each (each.bundle_id)}
@@ -92,7 +118,7 @@
           <th></th><th>What would happen</th><th>Messages</th><th>From</th><th>Why</th><th></th>
         </tr>
       </thead>
-      <tbody>
+      <tbody class="keyed" bind:this={body}>
         {#each rows as bundle (bundle.bundle_id)}
           <tr>
             <td>
@@ -122,7 +148,9 @@
       {#if held.length}
         <button type="button" onclick={() => (held = [])}>Show {held.length} new</button>
       {/if}
-      <span class="small muted">To accept one, review it.</span>
+      <span class="small muted">
+        To accept one, review it. Keys: j and k move, x ticks, Enter reviews.
+      </span>
     </form>
   {:else}
     <p class="muted">Nothing to review{queue.account ? ` in ${queue.account}` : ""}.</p>
