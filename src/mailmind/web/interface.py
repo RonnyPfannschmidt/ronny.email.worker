@@ -18,6 +18,7 @@ from mailmind import tasks, views
 from mailmind.db import models as m
 from mailmind.suggest import model as suggest
 from mailmind.suggest import staleness
+from mailmind.worker import QUEUE_CHANGED
 
 ASSETS = Path(__file__).parent / "static" / "app"
 
@@ -300,11 +301,14 @@ def mount(app, service, render, chrome, changes, reviewer) -> None:  # noqa: ANN
                 # Subscribed first, so what happens while the page reads is not missed.
                 yield "event: ready\ndata: {}\n\n"
                 while True:
-                    task_id = await queue.get()
-                    if task_id is None:
+                    fact = await queue.get()
+                    if fact is None:
                         return
+                    if fact == QUEUE_CHANGED:
+                        yield "event: queue\ndata: {}\n\n"
+                        continue
                     async with service.scope(readonly=True) as scope:
-                        task = await scope.get(m.Task, task_id)
+                        task = await scope.get(m.Task, fact)
                         view = views.task_view(task) if task is not None else None
                     if view is not None:
                         yield f"event: task\ndata: {json.dumps(view)}\n\n"

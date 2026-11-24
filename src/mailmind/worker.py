@@ -46,16 +46,24 @@ def _shut_the_whole_service_down() -> None:
     signal.raise_signal(signal.SIGTERM)
 
 
+#: On the hub in place of a task id: what awaits review, or what became of it, changed.
+QUEUE_CHANGED = "queue"
+
+#: The suggestion verbs the queue shows.  ``apply_attempted`` is one per message and is
+#: reported by its task.
+_SHOWN_SUGGESTION_VERBS = ("suggestion_excluded", "suggestion_stale")
+
+
 class Hub:
     """Task ids fan out to whoever is streaming; everything shares the loop."""
 
     def __init__(self) -> None:
-        self._streams: set[asyncio.Queue[int | None]] = set()
+        self._streams: set[asyncio.Queue[int | str | None]] = set()
         self._closed = False
 
-    def publish(self, task_id: int) -> None:
+    def publish(self, fact: int | str) -> None:
         for stream in self._streams:
-            stream.put_nowait(task_id)
+            stream.put_nowait(fact)
 
     def close(self) -> None:
         """Nobody will publish again: ``None`` is each stream's last word."""
@@ -63,14 +71,14 @@ class Hub:
         for stream in self._streams:
             stream.put_nowait(None)
 
-    def subscribe(self) -> asyncio.Queue[int | None]:
-        stream: asyncio.Queue[int | None] = asyncio.Queue()
+    def subscribe(self) -> asyncio.Queue[int | str | None]:
+        stream: asyncio.Queue[int | str | None] = asyncio.Queue()
         if self._closed:
             stream.put_nowait(None)
         self._streams.add(stream)
         return stream
 
-    def unsubscribe(self, stream: asyncio.Queue[int]) -> None:
+    def unsubscribe(self, stream: asyncio.Queue[int | str | None]) -> None:
         self._streams.discard(stream)
 
 
@@ -139,6 +147,7 @@ class TaskRunner:
         self._stopping = asyncio.Event()
         self._lanes: dict[int, asyncio.Task] = {}
         self._last_tick = 0.0
+        self._audited_through = 0
 
     async def start(self, tg: asyncio.TaskGroup) -> None:
         self.service.notify_tasks = self._wakeup.set
@@ -205,6 +214,7 @@ class TaskRunner:
     async def _one_pass(self) -> bool:
         """Housekeeping if due, then claim at most one task.  True if one was claimed."""
         await self._tick_if_due()
+        await self._announce_queue_changes()
         async with self.service.scope() as scope:
             claimed = await tasks.claim_next(scope, busy_accounts=set(self._lanes))
             if claimed is None:
@@ -221,6 +231,26 @@ class TaskRunner:
         finally:
             self._lanes.pop(account_id, None)
             self._wakeup.set()
+
+    async def _announce_queue_changes(self) -> None:
+        """Read from the audit log because ``mailmindctl mcp`` proposes from a process of
+        its own, which nothing in this one hears about.
+        """
+        event = m.AuditEvent
+        shown = sa.or_(event.subject_kind == "bundle", event.verb.in_(_SHOWN_SUGGESTION_VERBS))
+        async with self.service.scope(readonly=True) as scope:
+            through, changes = (
+                await scope.execute(
+                    sa.select(sa.func.max(event.id), sa.func.count().filter(shown)).where(
+                        event.id > self._audited_through
+                    )
+                )
+            ).one()
+        if through is None:
+            return
+        self._audited_through = through
+        if changes:
+            self.hub.publish(QUEUE_CHANGED)
 
     async def _tick_if_due(self) -> None:
         """Housekeeping, off the request path — and the schema drift check first.

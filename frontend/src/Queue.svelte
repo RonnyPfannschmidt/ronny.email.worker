@@ -33,7 +33,7 @@
     }
   }
 
-  onMount(() => listen(load, taskChanged));
+  onMount(() => listen(load, taskChanged, load));
 </script>
 
 <h1>Awaiting review</h1>

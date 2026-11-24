@@ -9,10 +9,11 @@ export const post = (path, csrf) =>
   fetch(path, { method: "POST", body: new URLSearchParams({ _csrf: csrf }) }).then(answer);
 
 /** Calls `onReady` on every (re)connection, so whatever was missed is read again. */
-export function listen(onReady, onTask) {
+export function listen(onReady, onTask, onQueue) {
   const source = new EventSource("/api/events");
   source.addEventListener("ready", onReady);
   source.addEventListener("task", (event) => onTask(JSON.parse(event.data)));
+  if (onQueue) source.addEventListener("queue", onQueue);
   return () => source.close();
 }
 
