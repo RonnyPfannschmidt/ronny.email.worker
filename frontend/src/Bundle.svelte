@@ -11,6 +11,7 @@
   let bundle = $state(null);
   let error = $state("");
   let grown = $state(false);
+  let closed = $state(false);
 
   const items = $derived(bundle?.items ?? []);
   const folders = $derived(bundle?.operation === "discard_container");
@@ -24,7 +25,17 @@
       grown = true;
       return;
     }
-    bundle = fresh;
+    grown = false;
+    closed ||= bundle?.status === "proposed" && !["proposed", "accepted"].includes(fresh.status);
+    // Kept rather than replaced: a click still waiting for its answer holds the old item.
+    const shown = new Map(items.map((item) => [item.suggestion_id, item]));
+    bundle = {
+      ...fresh,
+      items: fresh.items.map((item) => {
+        const old = shown.get(item.suggestion_id);
+        return old ? Object.assign(old, item) : item;
+      }),
+    };
   }
 
   const load = oneAtATime(async () => {
@@ -82,7 +93,11 @@
     }
   }
 
-  onMount(() => listen(load, taskChanged));
+  function queueChanged(bundles) {
+    if (bundles.includes(bundleId)) load();
+  }
+
+  onMount(() => listen(load, taskChanged, queueChanged));
 </script>
 
 {#if refused}<div class="banner error">{refused}</div>{/if}
@@ -100,7 +115,7 @@
     <span class="muted small">({items.length} {noun})</span>
   </h1>
 
-  <Banners {bundle} {folders} {noun} {grown} />
+  <Banners {bundle} {folders} {noun} {grown} {closed} />
 
   <p class="small muted">
     Proposed by {bundle.producer} · status {bundle.status} · expires {when(bundle.expires_at)}
@@ -144,5 +159,5 @@
     The table above is what it would actually do — decide from that, not from this.
   </p>
 
-  <Decision {bundle} {csrf} {items} {retry} />
+  <Decision {bundle} {csrf} {items} {noun} {grown} {retry} />
 {/if}

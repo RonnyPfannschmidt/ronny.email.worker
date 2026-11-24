@@ -360,11 +360,11 @@ async def test_a_bug_in_the_dispatcher_fails_the_whole_service_not_half(
         await runner.stop()
 
 
-async def _announced(runner) -> bool:
+async def _announced(runner) -> tuple[int, ...]:
     heard = runner.hub.subscribe()
     await runner._announce_queue_changes()
     runner.hub.unsubscribe(heard)
-    return not heard.empty() and heard.get_nowait() == worker.QUEUE_CHANGED
+    return () if heard.empty() else heard.get_nowait().bundles
 
 
 async def test_a_proposal_from_another_process_is_announced_once(service):
@@ -374,11 +374,11 @@ async def test_a_proposal_from_another_process_is_announced_once(service):
 
     elsewhere = Service(service.config)
     try:
-        await _accepted_bundle(elsewhere)
+        bundle_id, _ = await _accepted_bundle(elsewhere)
     finally:
         await elsewhere.dispose()
 
-    assert await _announced(runner)
+    assert await _announced(runner) == (bundle_id,)
     assert not await _announced(runner)
 
 
@@ -393,12 +393,19 @@ async def test_a_proposal_from_another_process_is_announced_once(service):
     ],
 )
 async def test_only_what_the_queue_shows_is_announced(service, verb, subject, shown):
+    bundle_id, _ = await _accepted_bundle(service)
     runner = worker.TaskRunner(service)
     await _announced(runner)
     async with service.scope() as scope:
-        await scope.audit(verb, actor_kind="service", subject_kind=subject, subject_id=1)
+        # Not the bundle's own id, so an item is told apart from the bundle it is in.
+        await scope.session.execute(sa.update(m.Suggestion).values(id=m.Suggestion.id + 100))
+        item = await scope.scalar(sa.select(m.Suggestion.id))
+        subject_id = item if subject == "suggestion" else bundle_id
+        await scope.audit(
+            verb, actor_kind="service", subject_kind=subject, subject_id=subject_id
+        )
         await scope.commit()
-    assert await _announced(runner) is shown
+    assert await _announced(runner) == ((bundle_id,) if shown else ())
 
 
 async def test_a_change_beside_one_the_queue_does_not_show_is_still_announced(service):
@@ -406,7 +413,7 @@ async def test_a_change_beside_one_the_queue_does_not_show_is_still_announced(se
     await _announced(runner)
     async with service.scope() as scope:
         for verb, subject in (("bundle_proposed", "bundle"), ("task_started", "task")):
-            await scope.audit(verb, actor_kind="service", subject_kind=subject)
+            await scope.audit(verb, actor_kind="service", subject_kind=subject, subject_id=1)
             await scope.flush()
         await scope.commit()
     assert await _announced(runner)

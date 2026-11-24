@@ -18,7 +18,7 @@ from mailmind import tasks, views
 from mailmind.db import models as m
 from mailmind.suggest import model as suggest
 from mailmind.suggest import staleness
-from mailmind.worker import QUEUE_CHANGED
+from mailmind.worker import QueueChanged
 
 ASSETS = Path(__file__).parent / "static" / "app"
 
@@ -304,8 +304,9 @@ def mount(app, service, render, chrome, changes, reviewer) -> None:  # noqa: ANN
                     fact = await queue.get()
                     if fact is None:
                         return
-                    if fact == QUEUE_CHANGED:
-                        yield "event: queue\ndata: {}\n\n"
+                    if isinstance(fact, QueueChanged):
+                        changed = json.dumps({"bundles": fact.bundles})
+                        yield f"event: queue\ndata: {changed}\n\n"
                         continue
                     async with service.scope(readonly=True) as scope:
                         task = await scope.get(m.Task, fact)

@@ -13,7 +13,7 @@ export function listen(onReady, onTask, onQueue) {
   const source = new EventSource("/api/events");
   source.addEventListener("ready", onReady);
   source.addEventListener("task", (event) => onTask(JSON.parse(event.data)));
-  if (onQueue) source.addEventListener("queue", onQueue);
+  if (onQueue) source.addEventListener("queue", (event) => onQueue(JSON.parse(event.data).bundles));
   return () => source.close();
 }
 
