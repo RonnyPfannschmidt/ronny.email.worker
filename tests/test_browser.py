@@ -93,6 +93,7 @@ async def bundle_at(tmp_path):
         )
         await scope.commit()
         bundle_id = bundle.id
+    backend.config = service.config
     backend.slow = True
     app = create_app(service, session_key=KEY)
     server = Server(uvicorn.Config(app, host="127.0.0.1", port=port, log_level="warning"), app)
@@ -456,6 +457,48 @@ async def test_the_queue_follows_an_apply_from_waiting_to_decided(page, bundle_a
     await page.get_by_text("Being applied").wait_for(timeout=15_000)
     await page.get_by_text("Recently decided").wait_for(timeout=30_000)
     await page.get_by_text("Nothing to review in test").wait_for()
+    assert await page.evaluate("document.body.dataset.mark") == "1", "the page was replaced"
+    assert page.problems == []
+
+
+@contextlib.asynccontextmanager
+async def another_process(backend):  # noqa: ANN001, ANN201
+    """What `mailmindctl mcp` is to `serve`: the same file and nothing else shared."""
+    service = Service(backend.config)
+    try:
+        async with service.scope() as scope:
+            yield scope
+    finally:
+        await service.dispose()
+
+
+async def test_the_queue_shows_what_another_process_proposes_and_withdraws(page, bundle_at):
+    base, bundle_id, backend = bundle_at
+    await page.goto(f"{base}/")
+    await page.get_by_role("link", name="review", exact=True).wait_for()
+    await page.evaluate("document.body.dataset.mark = 1")
+
+    async with another_process(backend) as scope:
+        first = await scope.get(m.Bundle, bundle_id)
+        producer = await scope.get(m.Producer, first.producer_id)
+        account = await scope.get(m.Account, first.account_id)
+        arrived = await suggest.propose_bundle(
+            scope,
+            producer=producer,
+            account=account,
+            operation=m.Operation.add_flag,
+            flag="\\Seen",
+            message_ids=(await scope.all(sa.select(m.Message.id)))[:2],
+            summary="arrived while the page was open",
+            reason="r",
+        )
+        await scope.commit()
+        row = page.get_by_text("arrived while the page was open")
+        await row.wait_for(timeout=10_000)
+        await suggest.withdraw(scope, arrived, producer, "changed my mind")
+        await scope.commit()
+    await page.get_by_text("withdrawn", exact=True).wait_for(timeout=10_000)
+    assert await page.get_by_role("link", name="review", exact=True).count() == 1
     assert await page.evaluate("document.body.dataset.mark") == "1", "the page was replaced"
     assert page.problems == []
 

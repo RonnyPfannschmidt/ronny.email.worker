@@ -358,3 +358,55 @@ async def test_a_bug_in_the_dispatcher_fails_the_whole_service_not_half(
         service.notify_tasks()
         await asyncio.wait_for(pulled_the_plug.wait(), timeout=10)
         await runner.stop()
+
+
+async def _announced(runner) -> bool:
+    heard = runner.hub.subscribe()
+    await runner._announce_queue_changes()
+    runner.hub.unsubscribe(heard)
+    return not heard.empty() and heard.get_nowait() == worker.QUEUE_CHANGED
+
+
+async def test_a_proposal_from_another_process_is_announced_once(service):
+    runner = worker.TaskRunner(service)
+    await _announced(runner)
+    assert not await _announced(runner)
+
+    elsewhere = Service(service.config)
+    try:
+        await _accepted_bundle(elsewhere)
+    finally:
+        await elsewhere.dispose()
+
+    assert await _announced(runner)
+    assert not await _announced(runner)
+
+
+@pytest.mark.parametrize(
+    ("verb", "subject", "shown"),
+    [
+        ("suggestion_excluded", "suggestion", True),
+        ("suggestion_stale", "suggestion", True),
+        ("bundle_withdrawn", "bundle", True),
+        ("apply_attempted", "suggestion", False),
+        ("container_synced", "container", False),
+    ],
+)
+async def test_only_what_the_queue_shows_is_announced(service, verb, subject, shown):
+    runner = worker.TaskRunner(service)
+    await _announced(runner)
+    async with service.scope() as scope:
+        await scope.audit(verb, actor_kind="service", subject_kind=subject, subject_id=1)
+        await scope.commit()
+    assert await _announced(runner) is shown
+
+
+async def test_a_change_beside_one_the_queue_does_not_show_is_still_announced(service):
+    runner = worker.TaskRunner(service)
+    await _announced(runner)
+    async with service.scope() as scope:
+        for verb, subject in (("bundle_proposed", "bundle"), ("task_started", "task")):
+            await scope.audit(verb, actor_kind="service", subject_kind=subject)
+            await scope.flush()
+        await scope.commit()
+    assert await _announced(runner)
