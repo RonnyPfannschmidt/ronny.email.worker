@@ -371,3 +371,48 @@ async def test_the_bundle_page_says(page, bundle_at, what):
     for words in says_not:
         assert words not in text, text
     assert page.problems == []
+
+
+async def test_fetching_a_message_text_keeps_the_filing_form_as_it_was(page, bundle_at):
+    """The old page reloaded, and took the destination somebody had typed with it."""
+    base, _, _ = bundle_at
+    await page.goto(f"{base}/mail/message/5")
+    await page.locator("[name=target_container_name]").fill("Archive/half-typed")
+    await page.evaluate("document.body.dataset.mark = 1")
+    await page.get_by_role("button", name="fetch the text").click()
+    await page.get_by_text("fetching").wait_for()
+    await page.locator(".body").wait_for(timeout=10_000)
+
+    assert "body number" in await page.locator(".body").inner_text()
+    assert await page.locator("[name=target_container_name]").input_value() == (
+        "Archive/half-typed"
+    )
+    assert await page.evaluate("document.body.dataset.mark") == "1", "the page was replaced"
+    assert page.problems == []
+    assert await page.locator("img").count() == 0, "a stranger's markup became markup"
+
+
+async def test_a_message_text_that_could_not_be_fetched_says_so_and_offers_again(
+    page, bundle_at
+):
+    base, _, backend = bundle_at
+    backend.force_unreachable()
+    await page.goto(f"{base}/mail/message/5")
+    await page.get_by_role("button", name="fetch the text").click()
+    await page.get_by_role("button", name="try again").wait_for(timeout=10_000)
+    assert await page.locator(".banner.error").count() == 1
+
+    backend.reachable = True
+    await page.get_by_role("button", name="try again").click()
+    await page.locator(".body").wait_for(timeout=10_000)
+
+
+async def test_a_message_reached_from_the_folder_list_loads_its_script(page, bundle_at):
+    """The list is driven by Turbo; the message page is not."""
+    base, _, _ = bundle_at
+    await page.goto(f"{base}/mail")
+    await page.get_by_role("link", name="INBOX", exact=True).click()
+    await page.locator("a[href^='/mail/message/']").first.click()
+    await page.get_by_role("button", name="fetch the text").wait_for(timeout=10_000)
+    await page.go_back()
+    await page.locator("a[href^='/mail/message/']").first.wait_for()

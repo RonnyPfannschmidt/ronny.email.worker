@@ -729,7 +729,7 @@ def create_app(
     async def mail_message(request: Request, message_id: int):  # noqa: ANN202
         async with service.scope(readonly=True) as scope:
             try:
-                detail = await views.message_detail(scope, message_id, include_body=True)
+                detail = await views.message_detail(scope, message_id)
             except LookupError:
                 return HTMLResponse("no such message", status_code=404)
             container = (
@@ -738,40 +738,15 @@ def create_app(
                 else None
             )
             folders = await _folder_options(scope, container.account_id) if container else []
-            fetch = None
-            for task in await views.task_summaries(scope, None, kinds=[m.TaskKind.fetch_body]):
-                if task["subject_id"] == message_id:
-                    fetch = task
-                    break
             return render(
                 request,
-                "mail_message.html",
+                "message.html",
                 message=detail,
                 container={"id": container.id, "name": container.name} if container else None,
                 folders=folders,
-                fetch=fetch,
-                live_tasks=fetch is not None and fetch["status"] in ("queued", "running"),
+                script=bundle_page.script_for("src/message.js"),
                 **await chrome(scope),
             )
-
-    @app.post("/mail/message/{message_id}/body", dependencies=changes)
-    async def mail_load_body(message_id: int):  # noqa: ANN202
-        async with service.scope() as scope:
-            placement = await scope.scalar(
-                views.live_placements().where(m.Placement.message_id == message_id)
-            )
-            if placement is not None:
-                container = await scope.get(m.Container, placement.container_id)
-                await tasks.enqueue(
-                    scope,
-                    kind=m.TaskKind.fetch_body,
-                    account_id=container.account_id,
-                    subject_id=message_id,
-                    requested_by=(await reviewer(scope)).id,
-                )
-                await scope.commit()
-        service.notify_tasks()
-        return RedirectResponse(f"/mail/message/{message_id}", status_code=303)
 
     @app.get("/mail/{container_id}", response_class=HTMLResponse)
     async def mail_container(  # noqa: ANN202

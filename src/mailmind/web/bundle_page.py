@@ -1,4 +1,6 @@
-"""The bundle page's server half: its data, its two small changes, and what happens live.
+"""The server half of the pages with an interface of their own.
+
+Their data, their two small changes, and what happens live.
 
 The server decides everything and the browser displays it.  The interface itself is in
 ``frontend/``.  Accepting and rejecting stay ordinary forms.
@@ -87,6 +89,29 @@ def mount(app, service, render, chrome, changes, reviewer) -> None:  # noqa: ANN
             applies = await views.task_summaries(scope, None, kinds=[m.TaskKind.apply_bundle])
             apply_task = next((t for t in applies if t["subject_id"] == bundle_id), None)
             return {**detail, "items": rows, "apply_task": apply_task}
+
+    @app.get("/api/message/{message_id}")
+    async def message(message_id: int) -> dict:
+        async with service.scope(readonly=True) as scope:
+            try:
+                detail = await views.message_detail(scope, message_id, include_body=True)
+            except LookupError:
+                raise HTTPException(404) from None
+            fetches = await views.task_summaries(scope, None, kinds=[m.TaskKind.fetch_body])
+            task = next((t for t in fetches if t["subject_id"] == message_id), None)
+            body = detail["body"]
+            return {
+                "task": task,
+                "body": body
+                and {
+                    "text": body["text"],
+                    "links": body["links"]["links"],
+                    "attachments": [
+                        a["filename"] or a["content_type"]
+                        for a in body["attachments"]["attachments"]
+                    ],
+                },
+            }
 
     @app.get("/api/message/{message_id}/body")
     async def message_body(message_id: int) -> dict:

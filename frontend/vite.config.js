@@ -13,6 +13,6 @@ export default defineConfig({
     modulePreload: { polyfill: false },
     // The page's script policy forbids data: URLs.
     assetsInlineLimit: 0,
-    rollupOptions: { input: "src/bundle.js" },
+    rollupOptions: { input: ["src/bundle.js", "src/message.js"] },
   },
 });
