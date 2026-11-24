@@ -35,7 +35,7 @@ from mailmind.mcp import oauth
 from mailmind.mcp import server as mcp_server
 from mailmind.service import Service
 from mailmind.suggest import model as suggest
-from mailmind.web import bundle_page
+from mailmind.web import interface
 from mailmind.worker import TaskRunner
 
 TEMPLATES = Jinja2Templates(directory=str(Path(__file__).parent / "templates"))
@@ -61,8 +61,8 @@ TEMPLATES.env.filters["day"] = lambda value: _local(value, "%d %b %Y")
 
 #: No inline script, no eval, no remote anything.  A remote image would tell a sender
 #: their mail was read, and this page renders mail written by strangers.  The scripts are
-#: the vendored Turbo and the interface built from frontend/, both served by this process
-#: from /static; connect-src covers their requests and event streams, all to ourselves.
+#: the interface built from frontend/, served by this process from /static; connect-src
+#: covers their requests and event streams, all to ourselves.
 CSP = (
     "default-src 'none'; style-src 'self' 'unsafe-inline'; script-src 'self'; "
     "connect-src 'self'; form-action 'self'; "
@@ -494,154 +494,9 @@ def create_app(
             "waiting": await views.proposed_counts(scope),
         }
 
-    def task_fragment(task: dict, *, streaming: bool) -> str:
-        """One task's row, as Turbo will swap it: same template for route and stream."""
-        return TEMPLATES.env.get_template("_task.html").render(
-            task=task, csrf=form_token, streaming=streaming
-        )
-
-    @app.get("/task/{task_id}/fragment", response_class=HTMLResponse)
-    async def task_fragment_page(task_id: int):  # noqa: ANN202
-        async with service.scope(readonly=True) as scope:
-            task = await scope.get(m.Task, task_id)
-            if task is None:
-                return HTMLResponse("no such task", status_code=404)
-            return HTMLResponse(task_fragment(views.task_view(task), streaming=False))
-
-    @app.post("/task/{task_id}/retry", dependencies=changes)
-    async def retry_task(task_id: int):  # noqa: ANN202
-        """Ask again.  Only a failed task; coalescing makes double-clicks harmless."""
-        target = "/"
-        async with service.scope() as scope:
-            task = await scope.get(m.Task, task_id)
-            if task is not None and task.status is m.TaskStatus.failed:
-                if task.kind is m.TaskKind.apply_bundle:
-                    bundle = await scope.get(m.Bundle, task.subject_id)
-                    target = f"/bundle/{task.subject_id}"
-                    if bundle is None or bundle.status is not m.BundleStatus.accepted:
-                        return RedirectResponse(target, status_code=303)
-                elif task.kind is m.TaskKind.fetch_body:
-                    # A body asked for from the mail view has no bundle to go back to.
-                    of_bundle = task.payload.get("bundle_id")
-                    target = (
-                        f"/bundle/{of_bundle}"
-                        if of_bundle
-                        else f"/mail/message/{task.subject_id}"
-                    )
-                elif task.kind in (m.TaskKind.sync_account, m.TaskKind.sync_container):
-                    target = "/accounts"
-                await tasks.enqueue(
-                    scope,
-                    kind=task.kind,
-                    account_id=task.account_id,
-                    subject_id=task.subject_id,
-                    payload=dict(task.payload),
-                    requested_by=(await reviewer(scope)).id,
-                )
-                await scope.commit()
-        service.notify_tasks()
-        return RedirectResponse(target, status_code=303)
-
-    @app.get("/events")
-    async def events(request: Request):  # noqa: ANN202
-        """Progress, pushed: each event is a <turbo-stream> replacing one task's row.
-
-        A terminal transition also sends a page refresh, so the surroundings — the
-        attempts table, the queue's sections — catch up without anybody polling.
-        """
-        from fastapi.responses import StreamingResponse
-
-        runner = getattr(request.app.state, "task_runner", None)
-
-        def as_event(view: dict) -> str:
-            body = task_fragment(view, streaming=True).replace("\n", " ")
-            return (
-                'data: <turbo-stream action="replace" '
-                f'target="task-{view["id"]}"><template>{body}</template>'
-                "</turbo-stream>\n\n"
-            )
-
-        async def stream():  # noqa: ANN202
-            if runner is None:
-                return
-            queue = runner.hub.subscribe()
-            try:
-                # Catch up first: a page that opens the stream mid-run gets the current
-                # state now rather than at the next change.
-                async with service.scope(readonly=True) as scope:
-                    live_now = await views.task_summaries(scope, None, live_only=True)
-                for view in live_now:
-                    yield as_event(view)
-                while True:
-                    task_id = await queue.get()
-                    if task_id is None:
-                        return
-                    async with service.scope(readonly=True) as scope:
-                        task = await scope.get(m.Task, task_id)
-                        if task is None:
-                            continue
-                        view = views.task_view(task)
-                    live = view["status"] in ("queued", "running")
-                    yield as_event(view)
-                    if not live:
-                        yield 'data: <turbo-stream action="refresh"></turbo-stream>\n\n'
-            finally:
-                runner.hub.unsubscribe(queue)
-
-        return StreamingResponse(stream(), media_type="text/event-stream")
-
     # -------------------------------------------------------------- the queue
 
-    @app.get("/", response_class=HTMLResponse)
-    async def queue(request: Request):  # noqa: ANN202
-        async with service.scope(readonly=True) as scope:
-            header = await chrome(scope)
-            current = header["current_account"]
-            # None means every account, which is only reachable when there are none at all.
-            here = {current["id"]} if current else None
-            # Expiry and staleness are the runner's, once a minute: this scope cannot write.
-            bundles = (
-                await views.bundle_summaries(scope, [m.BundleStatus.proposed], account_ids=here)
-            )["bundles"]
-            recent = (
-                await views.bundle_summaries(
-                    scope,
-                    [
-                        m.BundleStatus.applied,
-                        m.BundleStatus.partially_applied,
-                        m.BundleStatus.rejected,
-                        m.BundleStatus.expired,
-                        m.BundleStatus.withdrawn,
-                        m.BundleStatus.stale,
-                    ],
-                    account_ids=here,
-                    limit=10,
-                )
-            )["bundles"]
-            applying = (
-                await views.bundle_summaries(scope, [m.BundleStatus.accepted], account_ids=here)
-            )["bundles"]
-            waiting_ids = {b["bundle_id"] for b in applying}
-            apply_tasks = {
-                task["subject_id"]: task
-                for task in await views.task_summaries(
-                    scope, here, kinds=[m.TaskKind.apply_bundle]
-                )
-                if task["subject_id"] in waiting_ids
-            }
-            live = any(task["status"] in ("queued", "running") for task in apply_tasks.values())
-            return render(
-                request,
-                "queue.html",
-                bundles=bundles,
-                recent=recent,
-                applying=applying,
-                apply_tasks=apply_tasks,
-                live_tasks=live,
-                **header,
-            )
-
-    bundle_page.mount(app, service, render, chrome, changes, reviewer)
+    interface.mount(app, service, render, chrome, changes, reviewer)
 
     @app.post("/bundle/{bundle_id}/accept", dependencies=changes)
     async def accept_bundle(  # noqa: ANN202
@@ -744,7 +599,7 @@ def create_app(
                 message=detail,
                 container={"id": container.id, "name": container.name} if container else None,
                 folders=folders,
-                script=bundle_page.script_for("src/message.js"),
+                script=interface.script_for("src/message.js"),
                 **await chrome(scope),
             )
 
@@ -848,41 +703,6 @@ def create_app(
 
     # ------------------------------------------------------------- the mailbox
 
-    @app.get("/accounts", response_class=HTMLResponse)
-    async def accounts_page(request: Request):  # noqa: ANN202
-        async with service.scope(readonly=True) as scope:
-            rows = []
-            for account in await scope.all(sa.select(m.Account)):
-                caps = await scope.all(
-                    sa.select(m.AccountCapability).where(
-                        m.AccountCapability.account_id == account.id
-                    )
-                )
-                rows.append(
-                    {
-                        "account": account,
-                        "containers": (await views.containers(scope, account.id))["containers"],
-                        "capabilities": sorted(
-                            (c.name, c.declared, c.probed_present) for c in caps
-                        ),
-                    }
-                )
-            sync_tasks = {}
-            for task in await views.task_summaries(
-                scope, None, kinds=[m.TaskKind.sync_account]
-            ):
-                sync_tasks.setdefault(task["account_id"], task)
-            return render(
-                request,
-                "accounts.html",
-                rows=rows,
-                sync_tasks=sync_tasks,
-                live_tasks=any(
-                    task["status"] in ("queued", "running") for task in sync_tasks.values()
-                ),
-                **await chrome(scope),
-            )
-
     @app.post("/accounts/choose", dependencies=changes)
     async def choose_account(account_id: int = Form()):  # noqa: ANN202
         """Work in a different account.
@@ -896,22 +716,6 @@ def create_app(
                 (await reviewer(scope)).current_account_id = account.id
                 await scope.commit()
         return RedirectResponse("/", status_code=303)
-
-    @app.post("/accounts/{account_id}/sync", dependencies=changes)
-    async def sync_account(account_id: int):  # noqa: ANN202
-        async with service.scope() as scope:
-            account = await scope.get(m.Account, account_id)
-            if account is not None:
-                await tasks.enqueue(
-                    scope,
-                    kind=m.TaskKind.sync_account,
-                    account_id=account.id,
-                    subject_id=account.id,
-                    requested_by=(await reviewer(scope)).id,
-                )
-                await scope.commit()
-        service.notify_tasks()
-        return RedirectResponse("/accounts", status_code=303)
 
     # ------------------------------------------------------------- letting an agent in
 

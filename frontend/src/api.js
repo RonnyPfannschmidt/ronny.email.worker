@@ -17,3 +17,21 @@ export function listen(onReady, onTask) {
 }
 
 export const taskIsLive = (task) => ["queued", "running"].includes(task?.status);
+
+/** Runs `read` once at a time: asking during a run asks for one more after it, not for a
+    second one racing it. */
+export function oneAtATime(read) {
+  let reading = null;
+  let again = false;
+  async function run() {
+    do {
+      again = false;
+      await read();
+    } while (again);
+  }
+  return () => {
+    if (reading) again = true;
+    else reading = run().finally(() => (reading = null));
+    return reading;
+  };
+}

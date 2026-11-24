@@ -873,7 +873,7 @@ def _watched_paths(named: tuple[str, ...]) -> list[Path]:
 
 
 def _built_interface() -> Path:
-    from mailmind.web.bundle_page import ASSETS
+    from mailmind.web.interface import ASSETS
 
     return ASSETS
 
