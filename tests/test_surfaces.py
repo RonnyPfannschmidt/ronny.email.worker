@@ -35,6 +35,7 @@ from mailmind.service import Service, hash_token
 from mailmind.suggest import model as suggest
 from mailmind.web import app as app_module
 from mailmind.web.app import SESSION_KEY_PARAM, create_app, csrf_token, is_machine_path
+from mailmind.web.interface import ASSETS
 from tests.corpus import CORPUS
 from tests.targets.fake import FakeBackend
 
@@ -333,6 +334,12 @@ async def shown(client: Browser, bundle_id: int) -> dict:
     answer = await client.get(f"/api/bundle/{bundle_id}")
     assert answer.status_code == 200, answer.text
     return answer.json()
+
+
+async def waiting(client: Browser) -> dict:
+    """What the queue page shows, the same way."""
+    assert (await client.get("/")).status_code == 200
+    return (await client.get("/api/queue")).json()
 
 
 async def accepting(client: Browser, bundle_id: int, **kwargs):  # noqa: ANN201
@@ -1394,8 +1401,7 @@ async def test_a_bundle_whose_every_message_moved_leaves_the_queue_by_itself(
         assert bundle.status is m.BundleStatus.stale
 
     # Gone from what is waiting, and nothing was done to the mailbox on the way out.
-    queue = (await client.get("/")).text
-    assert "Newsletter issues" not in queue.split("Awaiting review")[-1].split("<h2")[0]
+    assert (await waiting(client))["bundles"] == []
     assert len(backend.folders["Archive"].messages) == 0
 
 
@@ -1424,14 +1430,13 @@ async def test_the_queue_still_draws_when_a_bundle_is_due_to_expire(client, serv
         bundle.expires_at = dt.datetime.now(dt.UTC) - dt.timedelta(days=1)
         await scope.commit()
 
-    assert (await client.get("/")).status_code == 200
+    assert [b["bundle_id"] for b in (await waiting(client))["bundles"]] == [bundle_id]
 
 
 async def test_the_queue_lists_what_is_waiting(client):
     await _propose(await Agent.connect(client))
-    page = (await client.get("/")).text
-    assert "Awaiting review" in page
-    assert "Archive" in page
+    (bundle,) = (await waiting(client))["bundles"]
+    assert (bundle["operation"], bundle["target_container"]) == ("move", "Archive")
 
 
 # ------------------------------------------------------- reading and filing by hand
@@ -1531,7 +1536,7 @@ async def test_filing_by_hand_proposes_rather_than_moving(client, service, backe
     assert "picked out of INBOX" in page["summary"] + page["reason"]
     assert len(backend.folders["Archive"].messages) == 0
     # Proposed by the person, and waiting like anything else.
-    assert "reviewer" in (await client.get("/")).text
+    assert [b["producer"] for b in (await waiting(client))["bundles"]] == ["reviewer"]
 
 
 async def test_a_bundle_filed_by_hand_is_accepted_the_same_way_and_then_moves(
@@ -1647,10 +1652,11 @@ async def test_the_queue_shows_the_account_being_worked_in_and_no_other(client, 
     theirs = other_account["bundle_id"]
 
     # Nothing chosen yet, so the first account by name — "other" sorts before "test".
-    queue = (await client.get("/")).text
-    assert "working in" in queue
-    assert f"/bundle/{theirs}" in queue
-    assert f"/bundle/{mine}" not in queue
+    assert "working in" in (await client.get("/")).text
+    queue = await waiting(client)
+    assert queue["account"] == "other"
+    assert [b["bundle_id"] for b in queue["bundles"]] == [theirs]
+    assert queue["elsewhere"] == [{"name": "test", "waiting": 1}]
 
     switched = await as_a_person(
         client,
@@ -1659,11 +1665,10 @@ async def test_the_queue_shows_the_account_being_worked_in_and_no_other(client, 
         follow_redirects=True,
     )
     assert switched.status_code == 200
-    assert f"/bundle/{mine}" in switched.text
-    assert f"/bundle/{theirs}" not in switched.text
+    assert [b["bundle_id"] for b in (await waiting(client))["bundles"]] == [mine]
 
     # The choice is the person's and outlives the request that made it.
-    assert f"/bundle/{mine}" in (await client.get("/")).text
+    assert (await waiting(client))["account"] == "test"
 
     # Not a boundary: the other account's bundle is still readable by its link.
     assert (await client.get(f"/bundle/{theirs}")).status_code == 200
@@ -1842,7 +1847,7 @@ async def test_a_sync_that_dies_partway_keeps_the_folders_it_finished(tmp_path, 
         account_id = account.id
 
     async with opened(create_app(service, session_key=SESSION_KEY)) as client:
-        died = await as_a_person(client, f"/accounts/{account_id}/sync")
+        died = await as_a_person(client, f"/api/account/{account_id}/sync")
         # The person pressed a button, so what comes back is a page, not a stack trace.
         assert died.status_code < 400
         await settle(client)
@@ -1894,14 +1899,15 @@ async def test_a_mailbox_that_cannot_be_reached_says_so_on_the_page(tmp_path, ma
         account_id = account.id
 
     async with opened(create_app(service, session_key=SESSION_KEY)) as client:
-        pressed = await as_a_person(
-            client, f"/accounts/{account_id}/sync", follow_redirects=True
-        )
+        pressed = await as_a_person(client, f"/api/account/{account_id}/sync")
         assert pressed.status_code == 200, "a mailbox being down is not a bug in the request"
         await settle(client)
         # The failure is the sync task's now; the page shows it where the button is.
-        page = (await client.get("/accounts")).text
-        assert "Hostname mismatch" in page, "the page does not say what went wrong"
+        (shown_as,) = (await client.get("/api/accounts")).json()["accounts"]
+        assert "Hostname mismatch" in shown_as["health_detail"], (
+            "it does not say what went wrong"
+        )
+        assert shown_as["task"]["status"] == "failed"
 
     async with service.scope() as scope:
         account = await scope.get(m.Account, account_id)
@@ -2109,12 +2115,14 @@ async def test_the_review_pages_forbid_remote_content(client):
 
 async def test_the_script_is_served_and_stays_behind_the_key(client):
     """/static is a page asset, not a machine path — no session, no script."""
-    served = await client.get("/static/turbo.js")
+    if not (ASSETS / "manifest.json").exists():
+        pytest.skip("the interface is not built")
+    served = await client.get("/static/app/manifest.json")
     assert served.status_code == 200
-    assert "javascript" in served.headers["content-type"]
+    assert served.json()
 
     async with Browser(client.app) as stranger:
-        assert (await stranger.get("/static/turbo.js")).status_code == 401
+        assert (await stranger.get("/static/app/manifest.json")).status_code == 401
 
 
 # =====================================================================================
@@ -2287,7 +2295,13 @@ async def test_excluding_answers_with_what_became_of_the_row(client):
 
 
 @pytest.mark.parametrize(
-    "change", ["message/{message_id}/body", "bundle/{bundle_id}/exclude/{suggestion_id}"]
+    "change",
+    [
+        "message/{message_id}/body",
+        "bundle/{bundle_id}/exclude/{suggestion_id}",
+        "account/1/sync",
+        "task/1/retry",
+    ],
 )
 async def test_the_page_script_changes_nothing_without_the_form_token(client, change):
     proposed = await _propose(await Agent.connect(client))
@@ -2308,6 +2322,8 @@ async def test_the_page_data_is_behind_the_key(client):
             f"bundle/{proposed['bundle_id']}",
             "message/1",
             "message/1/body",
+            "queue",
+            "accounts",
             "events",
         ):
             assert (await stranger.get(f"/api/{path}")).status_code == 401, path
@@ -2636,11 +2652,12 @@ async def _stranded_accepted(client, *, with_failed_task: bool) -> tuple[int, in
 async def test_an_accepted_bundle_is_visible_on_the_queue_not_invisible(client):
     """The stuck-state hole, closed at the page: accepted work has a section of its own."""
     bundle_id, task_id = await _stranded_accepted(client, with_failed_task=True)
-    page = (await client.get("/")).text
-    assert "Being applied" in page
-    assert f"/bundle/{bundle_id}" in page
-    assert "the mailbox went away mid-apply" in page, "the failure is shown, not hidden"
-    assert f"/task/{task_id}/retry" in page, "and there is a way to try again"
+    queue = await waiting(client)
+    assert queue["bundles"] == []
+    (bundle,) = queue["applying"]
+    assert bundle["bundle_id"] == bundle_id
+    assert bundle["task"]["id"] == task_id, "there is something to try again"
+    assert bundle["task"]["error"] == "the mailbox went away mid-apply"
 
 
 async def test_the_bundle_page_shows_the_apply_and_retry_finishes_it(client, backend):
@@ -2650,8 +2667,8 @@ async def test_the_bundle_page_shows_the_apply_and_retry_finishes_it(client, bac
     assert page["apply_task"]["id"] == task_id
     assert page["apply_task"]["error"] == "the mailbox went away mid-apply"
 
-    response = await as_a_person(client, f"/task/{task_id}/retry", follow_redirects=True)
-    assert response.status_code == 200
+    response = await as_a_person(client, f"/api/task/{task_id}/retry")
+    assert response.json()["id"] != task_id
     await settle(client)
     assert len(backend.folders["Archive"].messages) == 1
     assert (await shown(client, bundle_id))["status"] == "applied"
@@ -2718,8 +2735,8 @@ async def test_request_body_becomes_a_task_and_then_the_body(client):
     assert again.get("body"), "once cached, the body is the answer"
 
 
-async def test_progress_reaches_the_page_as_a_turbo_stream(service):
-    """One event off the wire: the SSE endpoint speaks <turbo-stream>.
+async def test_progress_reaches_the_page_as_a_fact_about_a_task(service):
+    """One event off the wire, after the one that says the stream is listening.
 
     Driven at the ASGI level: ASGITransport buffers whole responses, so an endless stream
     can never be read through it — here the raw response messages are read until the
@@ -2755,8 +2772,8 @@ async def test_progress_reaches_the_page_as_a_turbo_stream(service):
         scope_dict = {
             "type": "http",
             "method": "GET",
-            "path": "/events",
-            "raw_path": b"/events",
+            "path": "/api/events",
+            "raw_path": b"/api/events",
             "query_string": b"",
             "headers": [
                 (b"host", b"127.0.0.1:8765"),
@@ -2771,7 +2788,9 @@ async def test_progress_reaches_the_page_as_a_turbo_stream(service):
             start = await asyncio.wait_for(messages.get(), timeout=10)
             assert start["type"] == "http.response.start" and start["status"] == 200
             body = b""
-            while b"</turbo-stream>" not in body:
+            while b"event: task" not in body:
+                if b"event: ready" in body:
+                    app.state.task_runner.hub.publish(task_id)
                 chunk = await asyncio.wait_for(messages.get(), timeout=10)
                 body += chunk.get("body", b"")
         finally:
@@ -2779,10 +2798,15 @@ async def test_progress_reaches_the_page_as_a_turbo_stream(service):
             with contextlib.suppress(asyncio.CancelledError, Exception):
                 await request
 
-        event = body.decode()
-        assert event.startswith("data: <turbo-stream")
-        assert f'target="task-{task_id}"' in event
-        assert "3/9" in event and "INBOX" in event
+        ready, _, fact = body.decode().partition("event: task\ndata: ")
+        assert ready.startswith("event: ready")
+        task = json.loads(fact.split("\n\n")[0])
+        assert (task["id"], task["done"], task["total"], task["note"]) == (
+            task_id,
+            3,
+            9,
+            "INBOX",
+        )
 
 
 async def test_a_schema_problem_answers_every_surface_with_503_not_tracebacks(client):

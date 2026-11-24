@@ -1,7 +1,12 @@
 <script>
   import { taskIsLive } from "./api.js";
-  let { task, csrf } = $props();
-  const VERBS = { apply_bundle: "applying", fetch_body: "fetching" };
+  let { task, retry } = $props();
+  const VERBS = {
+    apply_bundle: "applying",
+    sync_account: "syncing",
+    sync_container: "syncing",
+    fetch_body: "fetching",
+  };
 </script>
 
 <div class="task small">
@@ -17,10 +22,7 @@
   {:else if task.status === "failed"}
     <div class="banner error">
       {task.error}
-      <form method="post" action="/task/{task.id}/retry" class="inline">
-        <input type="hidden" name="_csrf" value={csrf} />
-        <button>retry</button>
-      </form>
+      <button onclick={() => retry(task)}>retry</button>
     </div>
   {:else}
     <span class="ok">done{task.result?.note ? ` — ${task.result.note}` : ""}</span>

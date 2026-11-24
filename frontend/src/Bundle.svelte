@@ -1,6 +1,6 @@
 <script>
   import { onMount } from "svelte";
-  import { get, listen, post } from "./api.js";
+  import { get, listen, oneAtATime, post } from "./api.js";
   import Banners from "./Banners.svelte";
   import Decision from "./Decision.svelte";
   import FolderItem from "./FolderItem.svelte";
@@ -27,27 +27,22 @@
     bundle = fresh;
   }
 
-  // One read at a time: a reconnect during a read asks for one more after it, not for a
-  // second one racing it.
-  let reading = null;
-  let again = false;
+  const load = oneAtATime(async () => {
+    try {
+      take(await get(`/api/bundle/${bundleId}`));
+      error = "";
+    } catch (problem) {
+      error = problem.message;
+    }
+  });
 
-  function load() {
-    if (reading) again = true;
-    else reading = read().finally(() => (reading = null));
-    return reading;
-  }
-
-  async function read() {
-    do {
-      again = false;
-      try {
-        take(await get(`/api/bundle/${bundleId}`));
-        error = "";
-      } catch (problem) {
-        error = problem.message;
-      }
-    } while (again);
+  async function retry(task) {
+    try {
+      bundle.apply_task = await post(`/api/task/${task.id}/retry`, csrf);
+      error = "";
+    } catch (problem) {
+      error = problem.message;
+    }
   }
 
   async function change(item, path, apply) {
@@ -149,5 +144,5 @@
     The table above is what it would actually do — decide from that, not from this.
   </p>
 
-  <Decision {bundle} {csrf} {items} />
+  <Decision {bundle} {csrf} {items} {retry} />
 {/if}

@@ -1,9 +1,8 @@
-"""The server half of the pages with an interface of their own.
+"""The server half of the interface built from ``frontend/``.
 
-Their data, their two small changes, and what happens live.
-
-The server decides everything and the browser displays it.  The interface itself is in
-``frontend/``.  Accepting and rejecting stay ordinary forms.
+The server decides everything and the browser displays it: what the pages show is here as
+data, with the changes their scripts ask for and the stream that says what happened.
+Accepting and rejecting stay ordinary forms.
 """
 
 from __future__ import annotations
@@ -13,7 +12,7 @@ from pathlib import Path
 
 import sqlalchemy as sa
 from fastapi import HTTPException, Request
-from fastapi.responses import HTMLResponse, Response, StreamingResponse
+from fastapi.responses import HTMLResponse, StreamingResponse
 
 from mailmind import tasks, views
 from mailmind.db import models as m
@@ -44,19 +43,153 @@ def _body(body: m.MessageBody) -> dict:
 
 
 def mount(app, service, render, chrome, changes, reviewer) -> None:  # noqa: ANN001
+    async def draw(request, scope, page: str, title: str, **data) -> HTMLResponse:  # noqa: ANN001
+        return render(
+            request,
+            "interface.html",
+            title=title,
+            script=script_for(f"src/{page}.js"),
+            data=data,
+            **await chrome(scope),
+        )
+
+    @app.get("/", response_class=HTMLResponse)
+    async def queue_page(request: Request) -> HTMLResponse:
+        async with service.scope(readonly=True) as scope:
+            return await draw(request, scope, "queue", "review queue")
+
+    @app.get("/accounts", response_class=HTMLResponse)
+    async def accounts_page(request: Request) -> HTMLResponse:
+        async with service.scope(readonly=True) as scope:
+            return await draw(request, scope, "accounts", "accounts")
+
     @app.get("/bundle/{bundle_id}", response_class=HTMLResponse)
-    async def page(request: Request, bundle_id: int, error: str | None = None) -> Response:
+    async def bundle_page(request: Request, bundle_id: int, error: str = "") -> HTMLResponse:
         async with service.scope(readonly=True) as scope:
             if await scope.get(m.Bundle, bundle_id) is None:
                 return HTMLResponse("no such bundle", status_code=404)
-            return render(
-                request,
-                "bundle.html",
-                bundle_id=bundle_id,
-                error=error,
-                script=script_for("src/bundle.js"),
-                **await chrome(scope),
+            return await draw(request, scope, "bundle", "review", bundle=bundle_id, error=error)
+
+    @app.get("/api/queue")
+    async def queue() -> dict:
+        async with service.scope(readonly=True) as scope:
+            header = await chrome(scope)
+            current = header["current_account"]
+            # None means every account, which is only reachable when there are none at all.
+            here = {current["id"]} if current else None
+
+            async def listed(*statuses, limit: int | None = None) -> list[dict]:  # noqa: ANN002
+                found = await views.bundle_summaries(
+                    scope, list(statuses), account_ids=here, limit=limit
+                )
+                return found["bundles"]
+
+            status = m.BundleStatus
+            applying = await listed(status.accepted)
+            applies: dict = {}
+            for task in await views.task_summaries(
+                scope, here, kinds=[m.TaskKind.apply_bundle]
+            ):
+                applies.setdefault(task["subject_id"], task)
+            # Expiry and staleness are the runner's, once a minute: this scope cannot write.
+            return {
+                "account": current["name"] if current else None,
+                "elsewhere": [
+                    {"name": a["name"], "waiting": header["waiting"][a["id"]]}
+                    for a in header["accounts"]
+                    if current and a["id"] != current["id"] and header["waiting"].get(a["id"])
+                ],
+                "bundles": await listed(status.proposed),
+                "applying": [{**b, "task": applies.get(b["bundle_id"])} for b in applying],
+                "recent": await listed(
+                    status.applied,
+                    status.partially_applied,
+                    status.rejected,
+                    status.expired,
+                    status.withdrawn,
+                    status.stale,
+                    limit=10,
+                ),
+            }
+
+    @app.get("/api/accounts")
+    async def accounts() -> dict:
+        async with service.scope(readonly=True) as scope:
+            syncs: dict = {}
+            for task in await views.task_summaries(
+                scope, None, kinds=[m.TaskKind.sync_account]
+            ):
+                syncs.setdefault(task["account_id"], task)
+            found = []
+            for account in await scope.all(sa.select(m.Account).order_by(m.Account.id)):
+                capabilities = await scope.all(
+                    sa.select(m.AccountCapability)
+                    .where(m.AccountCapability.account_id == account.id)
+                    .order_by(m.AccountCapability.name)
+                )
+                found.append(
+                    {
+                        "id": account.id,
+                        "name": account.name,
+                        "health": account.health.value,
+                        "health_detail": account.health_detail,
+                        "capabilities": [
+                            {
+                                "name": c.name,
+                                "declared": c.declared,
+                                "offered": c.probed_present,
+                            }
+                            for c in capabilities
+                        ],
+                        "containers": (await views.containers(scope, account.id))["containers"],
+                        "task": syncs.get(account.id),
+                    }
+                )
+            return {"accounts": found}
+
+    @app.post("/api/account/{account_id}/sync", dependencies=changes)
+    async def sync_account(account_id: int) -> dict:
+        async with service.scope() as scope:
+            account = await scope.get(m.Account, account_id)
+            if account is None:
+                raise HTTPException(404)
+            task, _ = await tasks.enqueue(
+                scope,
+                kind=m.TaskKind.sync_account,
+                account_id=account.id,
+                subject_id=account.id,
+                requested_by=(await reviewer(scope)).id,
             )
+            await scope.commit()
+            view = views.task_view(task)
+        service.notify_tasks()
+        return view
+
+    @app.post("/api/task/{task_id}/retry", dependencies=changes)
+    async def retry(task_id: int) -> dict:
+        """Ask again.  Only a failed task; coalescing makes double-clicks harmless."""
+        async with service.scope() as scope:
+            task = await scope.get(m.Task, task_id)
+            if task is None:
+                raise HTTPException(404)
+            if task.status is not m.TaskStatus.failed:
+                return views.task_view(task)
+            if task.kind is m.TaskKind.apply_bundle:
+                bundle = await scope.get(m.Bundle, task.subject_id)
+                if bundle is None or bundle.status is not m.BundleStatus.accepted:
+                    return views.task_view(task)
+            again, _ = await tasks.enqueue(
+                scope,
+                kind=task.kind,
+                account_id=task.account_id,
+                subject_id=task.subject_id,
+                payload=dict(task.payload),
+                requested_by=(await reviewer(scope)).id,
+            )
+            await scope.commit()
+            view = views.task_view(again)
+        service.notify_tasks()
+        return view
 
     @app.get("/api/bundle/{bundle_id}")
     async def bundle(bundle_id: int) -> dict:

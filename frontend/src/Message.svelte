@@ -1,6 +1,6 @@
 <script>
   import { onMount } from "svelte";
-  import { get, listen, post, taskIsLive } from "./api.js";
+  import { get, listen, oneAtATime, post, taskIsLive } from "./api.js";
 
   let { messageId, csrf } = $props();
   let message = $state(null);
@@ -9,14 +9,14 @@
   const body = $derived(message?.body);
   const task = $derived(message?.task);
 
-  async function load() {
+  const load = oneAtATime(async () => {
     try {
       message = await get(`/api/message/${messageId}`);
       error = "";
     } catch (problem) {
       error = problem.message;
     }
-  }
+  });
 
   async function fetchText() {
     try {

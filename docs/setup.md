@@ -1,7 +1,7 @@
 # Setting it up
 
 There is no release yet, so this starts from a checkout, and building it needs Node 22.12
-or newer with npm: the bundle page is a small Svelte program.
+or newer with npm: the review UI is a small Svelte program.
 
 ```
 git clone https://github.com/RonnyPfannschmidt/ronny.email.worker

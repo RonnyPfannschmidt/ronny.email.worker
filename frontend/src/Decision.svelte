@@ -2,7 +2,7 @@
   import Task from "./Task.svelte";
   import { when } from "./when.js";
 
-  let { bundle, csrf, items } = $props();
+  let { bundle, csrf, items, retry } = $props();
   const stale = $derived(items.filter((item) => item.status === "stale").length);
 </script>
 
@@ -58,7 +58,7 @@
     Accepted — being applied to the mailbox now. Nothing here needs you until it finishes.
   </div>
   {#if bundle.apply_task}
-    <Task task={bundle.apply_task} {csrf} />
+    <Task task={bundle.apply_task} {retry} />
   {:else}
     <p class="small muted">waiting for the runner</p>
   {/if}

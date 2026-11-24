@@ -1,7 +1,5 @@
 {% extends "base.html" %}
 {% block title %}{{ message.subject or "message" }} — mailmind{% endblock %}
-{# Arriving here from a page Turbo drives has to be an ordinary load. #}
-{% block turbo %}<meta name="turbo-visit-control" content="reload">{% endblock %}
 {% block head %}
 {% if script %}<script type="module" src="{{ script }}"></script>{% endif %}
 {% endblock %}

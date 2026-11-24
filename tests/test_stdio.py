@@ -262,9 +262,10 @@ def test_serve_brings_the_review_ui_up_for_the_life_of_the_session(workspace):
         jar = http.cookiejar.CookieJar()
         browser = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(jar))
         with browser.open(opened_with, timeout=20) as response:
-            page = response.read().decode()
-        assert response.status == 200
-        assert f"/bundle/{proposed['bundle_id']}" in page, "the queue did not show it"
+            assert response.status == 200
+        with browser.open(f"{url.rstrip('/')}/api/queue", timeout=20) as response:
+            queue = json.load(response)
+        assert [b["bundle_id"] for b in queue["bundles"]] == [proposed["bundle_id"]]
         assert [c.name for c in jar] == ["mailmind_session"]
 
         # The agent is on the pipe, so the served app offers no second way in.

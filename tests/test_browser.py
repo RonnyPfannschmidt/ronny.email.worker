@@ -25,7 +25,7 @@ from mailmind.imap.capabilities import probe_account
 from mailmind.service import Service
 from mailmind.suggest import model as suggest
 from mailmind.web.app import SESSION_KEY_PARAM, create_app
-from mailmind.web.bundle_page import script_for
+from mailmind.web.interface import script_for
 from mailmind.web.serving import Server
 from tests.targets.fake import FakeBackend
 
@@ -111,7 +111,8 @@ async def bundle_at(tmp_path):
 async def page(bundle_at):
     async with playwright.async_playwright() as p:
         browser = await p.chromium.launch(channel="chrome")
-        page = await browser.new_page(viewport={"width": 1100, "height": 700})
+        context = await browser.new_context(viewport={"width": 1100, "height": 700})
+        page = await context.new_page()
         page.problems = []
         page.on(
             "console",
@@ -408,7 +409,6 @@ async def test_a_message_text_that_could_not_be_fetched_says_so_and_offers_again
 
 
 async def test_a_message_reached_from_the_folder_list_loads_its_script(page, bundle_at):
-    """The list is driven by Turbo; the message page is not."""
     base, _, _ = bundle_at
     await page.goto(f"{base}/mail")
     await page.get_by_role("link", name="INBOX", exact=True).click()
@@ -416,3 +416,68 @@ async def test_a_message_reached_from_the_folder_list_loads_its_script(page, bun
     await page.get_by_role("button", name="fetch the text").wait_for(timeout=10_000)
     await page.go_back()
     await page.locator("a[href^='/mail/message/']").first.wait_for()
+
+
+async def test_syncing_shows_its_progress_and_result_without_a_reload(page, bundle_at):
+    base, _, backend = bundle_at
+    await page.goto(f"{base}/accounts")
+    await page.get_by_role("button", name="sync now").wait_for()
+    await page.evaluate("document.body.dataset.mark = 1")
+    backend.add_message("Archive", b"From: n@example.org\r\nSubject: new\r\n\r\nnew\r\n")
+    await page.get_by_role("button", name="sync now").click()
+    await page.get_by_text("done", exact=True).wait_for(timeout=15_000)
+
+    archive = page.locator("tr", has_text="Archive")
+    assert await archive.locator("td").nth(1).inner_text() == "1"
+    assert await page.evaluate("document.body.dataset.mark") == "1", "the page was replaced"
+    assert page.problems == []
+
+
+async def test_a_sync_that_failed_can_be_retried_where_it_says_so(page, bundle_at):
+    base, _, backend = bundle_at
+    backend.force_unreachable()
+    await page.goto(f"{base}/accounts")
+    await page.get_by_role("button", name="sync now").click()
+    await page.get_by_role("button", name="retry").wait_for(timeout=15_000)
+    backend.reachable = True
+    await page.get_by_role("button", name="retry").click()
+    await page.get_by_text("done", exact=True).wait_for(timeout=15_000)
+
+
+async def test_the_queue_follows_an_apply_from_waiting_to_decided(page, bundle_at):
+    base, bundle_id, _ = bundle_at
+    other = await page.context.new_page()
+    await page.goto(f"{base}/")
+    await page.get_by_role("link", name="review", exact=True).wait_for()
+    await page.evaluate("document.body.dataset.mark = 1")
+
+    await other.goto(f"{base}/bundle/{bundle_id}")
+    await other.get_by_role("button", name="Accept").click()
+    await page.get_by_text("Being applied").wait_for(timeout=15_000)
+    await page.get_by_text("Recently decided").wait_for(timeout=30_000)
+    await page.get_by_text("Nothing to review in test").wait_for()
+    assert await page.evaluate("document.body.dataset.mark") == "1", "the page was replaced"
+    assert page.problems == []
+
+
+async def test_the_queue_says_what_is_stuck_and_what_waits_elsewhere(page, bundle_at):
+    base, _, _ = bundle_at
+    summary = {**BUNDLE, "item_count": 3, "stale_count": 1}
+    queue = {
+        "account": "test",
+        "elsewhere": [{"name": "work", "waiting": 2}],
+        "bundles": [summary],
+        "applying": [{**summary, "bundle_id": 2, "status": "accepted", "task": FAILED}],
+        "recent": [{**summary, "bundle_id": 3, "status": "partially_applied"}],
+    }
+
+    async def serve(route):  # noqa: ANN001, ANN202
+        await route.fulfill(json=queue)
+
+    await page.route("**/api/queue", serve)
+    await page.goto(f"{base}/")
+    await page.get_by_text("Being applied").wait_for()
+    text = " ".join((await page.locator("body").inner_text()).split())
+    for words in ("2 in work", "1 moved", "went away mid-apply", "partially_applied"):
+        assert words in text, text
+    assert await page.get_by_role("button", name="retry").count() == 1

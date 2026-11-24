@@ -19,7 +19,7 @@ migrates on its own. What happens around a restart:
 - **Every other command** refuses until the database catches up, and says so — which is
   better than the `no such column` traceback that taught us to add the check.
 
-**The bundle page is built, and an editable install never builds it** — a service that
+**The review UI is built, and an editable install never builds it** — a service that
 restarts through `uv run` must not need npm or a network. Once, and again after a pull that
 touched `frontend/`:
 
