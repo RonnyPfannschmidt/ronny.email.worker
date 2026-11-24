@@ -1,5 +1,10 @@
 {% extends "base.html" %}
 {% block title %}{{ message.subject or "message" }} — mailmind{% endblock %}
+{# Arriving here from a page Turbo drives has to be an ordinary load. #}
+{% block turbo %}<meta name="turbo-visit-control" content="reload">{% endblock %}
+{% block head %}
+{% if script %}<script type="module" src="{{ script }}"></script>{% endif %}
+{% endblock %}
 {% block content %}
 <h1>{{ message.subject or "(no subject)" }}</h1>
 
@@ -18,31 +23,13 @@
   {% endfor %}
 {% endfor %}
 
-{% if message.body and message.body.text %}
-<div class="body">{{ message.body.text }}</div>
-{% if message.body.links.links %}
-<details>
-  <summary class="small">{{ message.body.links.total_matching }} links</summary>
-  <table class="links">
-    {% for link in message.body.links.links %}
-    <tr><td>{{ link.text }}</td><td class="muted">{{ link.target }}</td></tr>
-    {% endfor %}
-  </table>
-</details>
-{% endif %}
-{% if message.body.attachments.attachments %}
-<p class="small muted">
-  Attachments: {% for a in message.body.attachments.attachments %}{{ a.filename or a.content_type }}{{ ", " if not loop.last }}{% endfor %}
-  — named, not fetched. Open them in your own client.
-</p>
-{% endif %}
+{% if script %}
+<div id="text" data-message="{{ message.message_id }}" data-csrf="{{ csrf }}"></div>
+<noscript><p>Fetching the text needs this page's own script.</p></noscript>
 {% else %}
-<form method="post" action="/mail/message/{{ message.message_id }}/body">
-  <input type="hidden" name="_csrf" value="{{ csrf }}">
-  <button>fetch the text</button>
-  <span class="small muted">Only the text parts, and no remote content is ever loaded.</span>
-</form>
-{% if fetch %}{% set task = fetch %}{% include "_task.html" %}{% endif %}
+<p class="banner">The interface is not built, so the text cannot be shown. In a checkout, run
+<code>npm ci --ignore-scripts &amp;&amp; npm run build</code> in <code>frontend/</code>, then
+reload this page.</p>
 {% endif %}
 
 {% if container %}

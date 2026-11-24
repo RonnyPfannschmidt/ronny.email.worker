@@ -1494,7 +1494,8 @@ async def test_reading_a_message_by_hand_marks_nothing_and_fetches_nothing_on_it
     assert listed
     page = await client.get(f"/mail/message/{listed[0]}")
     assert page.status_code == 200
-    assert "fetch the text" in page.text
+    answer = (await client.get(f"/api/message/{listed[0]}")).json()
+    assert answer == {"task": None, "body": None}, "nothing was fetched by looking"
 
     async with service.scope() as scope:
         placement = await scope.scalar(
@@ -2303,8 +2304,27 @@ async def test_the_page_script_changes_nothing_without_the_form_token(client, ch
 async def test_the_page_data_is_behind_the_key(client):
     proposed = await _propose(await Agent.connect(client))
     async with Browser(client.app) as stranger:
-        for path in (f"bundle/{proposed['bundle_id']}", "message/1/body", "events"):
+        for path in (
+            f"bundle/{proposed['bundle_id']}",
+            "message/1",
+            "message/1/body",
+            "events",
+        ):
             assert (await stranger.get(f"/api/{path}")).status_code == 401, path
+
+
+async def test_a_message_text_asked_for_by_hand_arrives_as_text(client):
+    message = re.search(
+        r'href="/mail/message/(\d+)"', (await client.get(f"/mail/{await _inbox(client)}")).text
+    ).group(1)
+    asked = await as_a_person(client, f"/api/message/{message}/body")
+    assert asked.json()["status"] in ("queued", "running")
+    await settle(client)
+
+    answer = (await client.get(f"/api/message/{message}")).json()
+    assert answer["task"]["status"] == "done"
+    assert answer["body"]["text"]
+    assert (await client.get("/api/message/99999")).status_code == 404
 
 
 async def test_a_bundle_that_is_not_there_is_a_404_not_a_page(client):
