@@ -503,6 +503,117 @@ async def test_the_queue_shows_what_another_process_proposes_and_withdraws(page,
     assert page.problems == []
 
 
+async def _mine(scope, bundle_id):  # noqa: ANN001, ANN202
+    bundle = await scope.get(m.Bundle, bundle_id)
+    return bundle, await scope.get(m.Producer, bundle.producer_id)
+
+
+async def test_a_withdrawal_reaches_the_reader_before_they_accept(page, bundle_at):
+    base, bundle_id, backend = bundle_at
+    details, _ = await _open_one_far_down(page, base, f"/bundle/{bundle_id}")
+    was = (await details.bounding_box())["y"]
+    async with another_process(backend) as scope:
+        bundle, producer = await _mine(scope, bundle_id)
+        await suggest.withdraw(scope, bundle, producer, "changed my mind")
+        await scope.commit()
+
+    await page.get_by_text("closed while this page was open: withdrawn").wait_for(
+        timeout=10_000
+    )
+    assert await page.get_by_role("button", name="Accept").count() == 0
+    assert await page.get_by_role("button", name="exclude").count() == 0
+    assert await details.get_attribute("open") is not None, "the open message closed"
+    assert await page.evaluate("document.body.dataset.mark") == "1", "the page was replaced"
+    assert abs((await details.bounding_box())["y"] - was) < 100, "the reader lost their place"
+    assert page.problems == []
+
+
+async def test_growth_is_announced_and_accepting_is_off_until_it_is_read(page, bundle_at):
+    base, bundle_id, backend = bundle_at
+    async with another_process(backend) as scope:
+        bundle, producer = await _mine(scope, bundle_id)
+        account = await scope.get(m.Account, bundle.account_id)
+        ids = await scope.all(sa.select(m.Message.id).order_by(m.Message.id))
+        small = await suggest.propose_bundle(
+            scope,
+            producer=producer,
+            account=account,
+            operation=m.Operation.move,
+            target_container_id=bundle.target_container_id,
+            message_ids=ids[:2],
+            summary="small",
+            reason="r",
+        )
+        await scope.commit()
+        await page.goto(f"{base}/bundle/{small.id}")
+        await page.get_by_role("button", name="Accept").wait_for()
+        await page.get_by_placeholder("why not").fill("half a thought")
+        await suggest.add_to_bundle(scope, bundle=small, producer=producer, query="a70")
+        await scope.commit()
+    await page.get_by_text("More messages arrived. Read it again").wait_for(timeout=10_000)
+    assert await page.get_by_role("button", name="Accept").is_disabled()
+    assert await page.get_by_role("button", name="exclude").count() == 2
+    assert await page.get_by_placeholder("why not").input_value() == "half a thought"
+
+
+async def test_a_tick_does_not_outlive_another_message_going_stale(page, bundle_at):
+    base, bundle_id, backend = bundle_at
+
+    async def lose(scope, index):  # noqa: ANN001, ANN202
+        bundle, _ = await _mine(scope, bundle_id)
+        await scope.session.refresh(bundle, ["suggestions"])
+        item = bundle.suggestions[index]
+        item.status = m.SuggestionStatus.stale
+        item.stale_detail = "it left"
+        await scope.audit(
+            "suggestion_stale",
+            actor_kind="service",
+            subject_kind="suggestion",
+            subject_id=item.id,
+        )
+        await scope.commit()
+
+    async with another_process(backend) as scope:
+        await lose(scope, 0)
+        await page.goto(f"{base}/bundle/{bundle_id}")
+        await page.get_by_role("checkbox").check()
+        await lose(scope, 1)
+    await page.get_by_text("on the 2 message(s)").wait_for(timeout=10_000)
+    assert not await page.get_by_role("checkbox").is_checked()
+
+
+async def test_a_click_still_waiting_survives_the_page_reading_again(page, bundle_at):
+    base, bundle_id, backend = bundle_at
+    held = asyncio.Event()
+    reread = asyncio.Event()
+
+    async def refuse_late(route):  # noqa: ANN001, ANN202
+        await held.wait()
+        await route.fulfill(json={"status": "proposed", "problem": "refused, late"})
+
+    await page.route("**/exclude/*", refuse_late)
+    await page.goto(f"{base}/bundle/{bundle_id}")
+    await page.get_by_role("button", name="exclude").first.click()
+    page.on(
+        "requestfinished",
+        lambda r: reread.set() if r.url.endswith(f"/api/bundle/{bundle_id}") else None,
+    )
+    async with another_process(backend) as scope:
+        bundle, producer = await _mine(scope, bundle_id)
+        await scope.audit(
+            "bundle_grown",
+            actor_kind="producer",
+            actor_id=producer.id,
+            subject_kind="bundle",
+            subject_id=bundle.id,
+        )
+        await scope.commit()
+    await asyncio.wait_for(reread.wait(), 10)
+    await asyncio.sleep(0.3)
+    held.set()
+    await page.get_by_text("refused, late").wait_for(timeout=5_000)
+
+
 async def test_the_queue_says_what_is_stuck_and_what_waits_elsewhere(page, bundle_at):
     base, _, _ = bundle_at
     summary = {**BUNDLE, "item_count": 3, "stale_count": 1}

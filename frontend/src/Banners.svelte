@@ -1,12 +1,19 @@
 <script>
   import { day } from "./when.js";
 
-  let { bundle, folders, noun, grown } = $props();
+  let { bundle, folders, noun, grown, closed } = $props();
   const named = $derived(bundle.queries.find((query) => !query.grew));
   const later = $derived(bundle.queries.filter((query) => query.grew));
   const stale = $derived(bundle.items.filter((item) => item.status === "stale").length);
 </script>
 
+{#if closed}
+  <div class="banner error">
+    This bundle was closed while this page was open: {bundle.status}{bundle.decision_reason
+      ? ` — ${bundle.decision_reason}`
+      : ""}. There is nothing left to decide.
+  </div>
+{/if}
 {#if grown}
   <div class="banner error">
     More {noun} arrived in this bundle after this page was drawn. Accepting it from here will be

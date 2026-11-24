@@ -13,6 +13,7 @@ carries the app's lifespan, and a bug in one sync must not take the service down
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import datetime as dt
 import logging
 import signal
@@ -46,8 +47,12 @@ def _shut_the_whole_service_down() -> None:
     signal.raise_signal(signal.SIGTERM)
 
 
-#: On the hub in place of a task id: what awaits review, or what became of it, changed.
-QUEUE_CHANGED = "queue"
+@dataclasses.dataclass(frozen=True)
+class QueueChanged:
+    """What awaits review, or what became of it, changed."""
+
+    bundles: tuple[int, ...]
+
 
 #: The suggestion verbs the queue shows.  ``apply_attempted`` is one per message and is
 #: reported by its task.
@@ -58,10 +63,10 @@ class Hub:
     """Task ids fan out to whoever is streaming; everything shares the loop."""
 
     def __init__(self) -> None:
-        self._streams: set[asyncio.Queue[int | str | None]] = set()
+        self._streams: set[asyncio.Queue[int | QueueChanged | None]] = set()
         self._closed = False
 
-    def publish(self, fact: int | str) -> None:
+    def publish(self, fact: int | QueueChanged) -> None:
         for stream in self._streams:
             stream.put_nowait(fact)
 
@@ -71,14 +76,14 @@ class Hub:
         for stream in self._streams:
             stream.put_nowait(None)
 
-    def subscribe(self) -> asyncio.Queue[int | str | None]:
-        stream: asyncio.Queue[int | str | None] = asyncio.Queue()
+    def subscribe(self) -> asyncio.Queue[int | QueueChanged | None]:
+        stream: asyncio.Queue[int | QueueChanged | None] = asyncio.Queue()
         if self._closed:
             stream.put_nowait(None)
         self._streams.add(stream)
         return stream
 
-    def unsubscribe(self, stream: asyncio.Queue[int | str | None]) -> None:
+    def unsubscribe(self, stream: asyncio.Queue[int | QueueChanged | None]) -> None:
         self._streams.discard(stream)
 
 
@@ -156,6 +161,8 @@ class TaskRunner:
                 requeued = await tasks.requeue_interrupted(scope)
                 rescued = await tasks.rescue_accepted_bundles(scope)
                 await scope.commit()
+                # Before anybody can have connected, so nothing they read predates it.
+                self._audited_through = await self._audited_last(scope)
             if requeued or rescued:
                 self._wakeup.set()
         except Exception:
@@ -237,20 +244,35 @@ class TaskRunner:
         its own, which nothing in this one hears about.
         """
         event = m.AuditEvent
-        shown = sa.or_(event.subject_kind == "bundle", event.verb.in_(_SHOWN_SUGGESTION_VERBS))
+        item = m.Suggestion
         async with self.service.scope(readonly=True) as scope:
-            through, changes = (
-                await scope.execute(
-                    sa.select(sa.func.max(event.id), sa.func.count().filter(shown)).where(
-                        event.id > self._audited_through
-                    )
+            through = await self._audited_last(scope)
+            if through <= self._audited_through:
+                return
+            changed = await scope.all(
+                sa.select(sa.func.coalesce(item.bundle_id, event.subject_id))
+                .select_from(event)
+                .outerjoin(
+                    item,
+                    sa.and_(event.subject_kind == "suggestion", item.id == event.subject_id),
                 )
-            ).one()
-        if through is None:
-            return
+                .where(
+                    event.id > self._audited_through,
+                    event.id <= through,
+                    sa.or_(
+                        event.subject_kind == "bundle",
+                        event.verb.in_(_SHOWN_SUGGESTION_VERBS),
+                    ),
+                )
+                .distinct()
+            )
         self._audited_through = through
-        if changes:
-            self.hub.publish(QUEUE_CHANGED)
+        if changed:
+            self.hub.publish(QueueChanged(tuple(sorted(changed))))
+
+    @staticmethod
+    async def _audited_last(scope) -> int:  # noqa: ANN001
+        return await scope.scalar(sa.select(sa.func.max(m.AuditEvent.id))) or 0
 
     async def _tick_if_due(self) -> None:
         """Housekeeping, off the request path — and the schema drift check first.

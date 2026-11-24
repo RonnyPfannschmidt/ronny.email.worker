@@ -2,7 +2,7 @@
   import Task from "./Task.svelte";
   import { when } from "./when.js";
 
-  let { bundle, csrf, items, retry } = $props();
+  let { bundle, csrf, items, noun, grown, retry } = $props();
   const stale = $derived(items.filter((item) => item.status === "stale").length);
 </script>
 
@@ -37,15 +37,24 @@
     <form method="post" action="/bundle/{bundle.bundle_id}/accept">
       <input type="hidden" name="_csrf" value={csrf} />
       <input type="hidden" name="reviewed_through" value={bundle.reviewed_through} />
-      {#if stale}
-        <p class="small">
-          <label>
-            <input type="checkbox" name="acknowledge_stale" value="1" required />
-            I have read what changed on the {stale} message(s) above. They will not be applied.
-          </label>
+      <!-- Keyed: a tick says what was read, so it does not outlive another item going stale. -->
+      {#key stale}
+        {#if stale}
+          <p class="small">
+            <label>
+              <input type="checkbox" name="acknowledge_stale" value="1" required />
+              I have read what changed on the {stale} message(s) above. They will not be applied.
+            </label>
+          </p>
+        {/if}
+      {/key}
+      {#if grown}
+        <p class="small warn">
+          More {noun} arrived. <a href="/bundle/{bundle.bundle_id}">Read it again</a> before
+          accepting.
         </p>
       {/if}
-      <button>Accept — do this to the mailbox</button>
+      <button disabled={grown}>Accept — do this to the mailbox</button>
     </form>
     <form method="post" action="/bundle/{bundle.bundle_id}/reject">
       <input type="hidden" name="_csrf" value={csrf} />
