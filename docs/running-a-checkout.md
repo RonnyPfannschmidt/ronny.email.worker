@@ -19,6 +19,21 @@ migrates on its own. What happens around a restart:
 - **Every other command** refuses until the database catches up, and says so — which is
   better than the `no such column` traceback that taught us to add the check.
 
+**The bundle page is built, and an editable install never builds it** — a service that
+restarts through `uv run` must not need npm or a network. Once, and again after a pull that
+touched `frontend/`:
+
+```
+cd frontend
+npm ci --ignore-scripts
+npm run build          # or `npm run watch` while changing it
+```
+
+No restart is needed; reload the page. Not built, the page says so.
+
+**The image** is `podman build --build-arg VERSION=… .` — it builds the interface itself and
+carries no Node, no compiler, no configuration and no mail. Mount those.
+
 **`serve --watch` is the editable-install service loop.** The process never reloads
 anything in place: it exits 0 when the package source, `pyproject.toml` or `uv.lock`
 changes, and the supervisor restarts it — one restarter, and `uv run` re-syncs

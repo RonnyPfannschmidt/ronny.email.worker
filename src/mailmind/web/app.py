@@ -35,8 +35,7 @@ from mailmind.mcp import oauth
 from mailmind.mcp import server as mcp_server
 from mailmind.service import Service
 from mailmind.suggest import model as suggest
-from mailmind.suggest import staleness
-from mailmind.web import next as next_ui
+from mailmind.web import bundle_page
 from mailmind.worker import TaskRunner
 
 TEMPLATES = Jinja2Templates(directory=str(Path(__file__).parent / "templates"))
@@ -61,9 +60,9 @@ TEMPLATES.env.filters["when"] = lambda value: _local(value, "%d %b %Y %H:%M")
 TEMPLATES.env.filters["day"] = lambda value: _local(value, "%d %b %Y")
 
 #: No inline script, no eval, no remote anything.  A remote image would tell a sender
-#: their mail was read, and this page renders mail written by strangers.  The one script
-#: is the vendored Turbo served by this process from /static; connect-src covers its
-#: form submissions and the SSE stream, both to ourselves.
+#: their mail was read, and this page renders mail written by strangers.  The scripts are
+#: the vendored Turbo and the interface built from frontend/, both served by this process
+#: from /static; connect-src covers their requests and event streams, all to ourselves.
 CSP = (
     "default-src 'none'; style-src 'self' 'unsafe-inline'; script-src 'self'; "
     "connect-src 'self'; form-action 'self'; "
@@ -575,6 +574,8 @@ def create_app(
                     yield as_event(view)
                 while True:
                     task_id = await queue.get()
+                    if task_id is None:
+                        return
                     async with service.scope(readonly=True) as scope:
                         task = await scope.get(m.Task, task_id)
                         if task is None:
@@ -640,97 +641,7 @@ def create_app(
                 **header,
             )
 
-    next_ui.mount(app, service, render, changes, reviewer)
-
-    @app.get("/bundle/{bundle_id}", response_class=HTMLResponse)
-    async def bundle_page(request: Request, bundle_id: int, error: str | None = None):  # noqa: ANN202
-        async with service.scope() as scope:
-            bundle = await scope.get(m.Bundle, bundle_id)
-            if bundle is None:
-                return HTMLResponse("no such bundle", status_code=404)
-            if bundle.status is m.BundleStatus.proposed:
-                # The first of the two staleness checks: before it is shown.
-                await staleness.refresh_bundle(scope, bundle)
-                await scope.commit()
-            # limit=None: a reviewer is shown the whole of what they are accepting, and
-            # `reviewed_through` is only honest about a page that held all of it.
-            detail = await views.bundle_detail(scope, bundle_id, limit=None)
-            bodies = {}
-            for item in detail["items"]["items"]:
-                body = await scope.scalar(
-                    sa.select(m.MessageBody).where(
-                        m.MessageBody.message_id == item["message_id"]
-                    )
-                )
-                if body is not None:
-                    bodies[item["message_id"]] = {
-                        "text": (body.text_plain or body.text_from_html or "")[:4000],
-                        "links": body.links.get("links", [])[:40],
-                    }
-            apply_task = None
-            for task in await views.task_summaries(
-                scope, None, kinds=[m.TaskKind.apply_bundle]
-            ):
-                if task["subject_id"] == bundle_id:
-                    apply_task = task
-                    break
-            fetch_tasks = {}
-            for task in await views.task_summaries(scope, None, kinds=[m.TaskKind.fetch_body]):
-                fetch_tasks.setdefault(task["subject_id"], task)
-            live = (
-                apply_task is not None and apply_task["status"] in ("queued", "running")
-            ) or any(task["status"] in ("queued", "running") for task in fetch_tasks.values())
-            return render(
-                request,
-                "bundle.html",
-                bundle=detail,
-                bodies=bodies,
-                error=error,
-                apply_task=apply_task,
-                fetch_tasks=fetch_tasks,
-                live_tasks=live,
-                **await chrome(scope),
-            )
-
-    @app.post("/bundle/{bundle_id}/body/{message_id}", dependencies=changes)
-    async def load_body(bundle_id: int, message_id: int):  # noqa: ANN202
-        async with service.scope() as scope:
-            placement = await scope.scalar(
-                views.live_placements().where(m.Placement.message_id == message_id)
-            )
-            if placement is not None:
-                container = await scope.get(m.Container, placement.container_id)
-                await tasks.enqueue(
-                    scope,
-                    kind=m.TaskKind.fetch_body,
-                    account_id=container.account_id,
-                    subject_id=message_id,
-                    payload={"bundle_id": bundle_id},
-                    requested_by=(await reviewer(scope)).id,
-                )
-                await scope.commit()
-        service.notify_tasks()
-        return RedirectResponse(f"/bundle/{bundle_id}#m{message_id}", status_code=303)
-
-    @app.post("/bundle/{bundle_id}/exclude/{suggestion_id}", dependencies=changes)
-    async def exclude_item(bundle_id: int, suggestion_id: int):  # noqa: ANN202
-        anchor = None
-        async with service.scope() as scope:
-            suggestion = await scope.get(m.Suggestion, suggestion_id)
-            error = None
-            if suggestion is not None and suggestion.bundle_id == bundle_id:
-                # Land back where the reviewer was, not at the top of a long table.
-                anchor = (
-                    f"m{suggestion.message_id}"
-                    if suggestion.message_id
-                    else f"s{suggestion_id}"
-                )
-                try:
-                    await suggest.exclude(scope, suggestion, await reviewer(scope))
-                except suggest.ProposalRefused as exc:
-                    error = str(exc)
-                await scope.commit()
-        return _back(bundle_id, error, anchor)
+    bundle_page.mount(app, service, render, chrome, changes, reviewer)
 
     @app.post("/bundle/{bundle_id}/accept", dependencies=changes)
     async def accept_bundle(  # noqa: ANN202
@@ -1241,10 +1152,8 @@ def _to(path: str, error: str | None = None) -> RedirectResponse:
     return RedirectResponse(path + (f"?error={quote(error)}" if error else ""), status_code=303)
 
 
-def _back(bundle_id: int, error: str | None, anchor: str | None = None) -> RedirectResponse:
+def _back(bundle_id: int, error: str | None) -> RedirectResponse:
     target = f"/bundle/{bundle_id}"
     if error:
         target += f"?error={quote(error)}"
-    if anchor:
-        target += f"#{anchor}"
     return RedirectResponse(target, status_code=303)

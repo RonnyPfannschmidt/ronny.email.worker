@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 import os
 import socket
 import time
@@ -24,10 +25,14 @@ from mailmind.imap.capabilities import probe_account
 from mailmind.service import Service
 from mailmind.suggest import model as suggest
 from mailmind.web.app import SESSION_KEY_PARAM, create_app
-from mailmind.web.next import script_for
+from mailmind.web.bundle_page import script_for
+from mailmind.web.serving import Server
 from tests.targets.fake import FakeBackend
 
 playwright = pytest.importorskip("playwright.async_api")
+pytestmark = pytest.mark.skipif(
+    script_for("src/bundle.js") is None, reason="the interface is not built"
+)
 KEY = "browser-test-key"
 ITEMS = 81
 HOSTILE = "<img src=x onerror=document.title='owned'>"
@@ -89,15 +94,8 @@ async def bundle_at(tmp_path):
         await scope.commit()
         bundle_id = bundle.id
     backend.slow = True
-    server = uvicorn.Server(
-        uvicorn.Config(
-            create_app(service, session_key=KEY),
-            host="127.0.0.1",
-            port=port,
-            log_level="warning",
-            timeout_graceful_shutdown=1,
-        )
-    )
+    app = create_app(service, session_key=KEY)
+    server = Server(uvicorn.Config(app, host="127.0.0.1", port=port, log_level="warning"), app)
     server.install_signal_handlers = lambda: None
     serving = asyncio.create_task(server.serve())
     while not server.started:
@@ -122,6 +120,7 @@ async def page(bundle_at):
         page.on("pageerror", lambda exc: page.problems.append(str(exc)))
         await page.goto(f"{bundle_at[0]}/?{SESSION_KEY_PARAM}={KEY}")
         yield page
+        await page.unroute_all(behavior="ignoreErrors")
         await browser.close()
 
 
@@ -135,10 +134,9 @@ async def _open_one_far_down(page, base, path):
     return details, await page.evaluate("scrollY")
 
 
-@pytest.mark.skipif(script_for("src/bundle.js") is None, reason="the interface is not built")
 async def test_fetching_a_body_leaves_everything_else_where_it_was(page, bundle_at):
     base, bundle_id, _ = bundle_at
-    details, was = await _open_one_far_down(page, base, f"/next/bundle/{bundle_id}")
+    details, was = await _open_one_far_down(page, base, f"/bundle/{bundle_id}")
     other = page.locator("details").nth(61)
     await other.locator("summary").click()
 
@@ -156,13 +154,11 @@ async def test_fetching_a_body_leaves_everything_else_where_it_was(page, bundle_
     assert await page.locator("img").count() == 0, "a stranger's markup became markup"
 
 
-@pytest.mark.skipif(script_for("src/bundle.js") is None, reason="the interface is not built")
 async def test_excluding_and_then_accepting_moves_only_what_was_left(page, bundle_at):
     base, bundle_id, backend = bundle_at
-    await page.goto(f"{base}/next/bundle/{bundle_id}")
+    await page.goto(f"{base}/bundle/{bundle_id}")
     await page.get_by_role("button", name="exclude").first.click()
     await page.get_by_text("excluded").wait_for()
-    assert "80 of 81" in await page.locator("h1").inner_text()
 
     await page.get_by_role("button", name="Accept").click()
     for _ in range(600):
@@ -170,3 +166,208 @@ async def test_excluding_and_then_accepting_moves_only_what_was_left(page, bundl
             break
         await asyncio.sleep(0.1)
     assert len(backend.folders["Archive"].messages) == ITEMS - 1
+
+
+async def test_a_bundle_that_grows_is_not_slipped_under_the_reader(page, bundle_at):
+    """A laptop wakes, the stream reconnects, the page reads the bundle again."""
+    base, bundle_id, _ = bundle_at
+
+    async def ending(route):  # noqa: ANN001, ANN202
+        await route.fulfill(
+            body="retry: 500\nevent: ready\ndata: {}\n\n", content_type="text/event-stream"
+        )
+
+    await page.route("**/api/events", ending)
+    await page.goto(f"{base}/bundle/{bundle_id}")
+    await page.get_by_text("Accept — do this").wait_for()
+    answer = await (await page.request.get(f"{base}/api/bundle/{bundle_id}")).json()
+    read = answer["reviewed_through"]
+    extra = {**answer["items"][0], "suggestion_id": read + 1, "subject": "slipped in"}
+    grown = {**answer, "reviewed_through": read + 1, "items": [*answer["items"], extra]}
+
+    async def serve(route):  # noqa: ANN001, ANN202
+        await route.fulfill(json=grown)
+
+    await page.route(f"**/api/bundle/{bundle_id}", serve)
+    await page.get_by_text("arrived in this bundle after this page was drawn").wait_for(
+        timeout=15_000
+    )
+    assert await page.get_by_text("slipped in").count() == 0
+    assert await page.locator("[name=reviewed_through]").input_value() == str(read)
+
+
+MESSAGE = {
+    "suggestion_id": 7,
+    "message_id": 3,
+    "from_address": "a@example.org",
+    "from_display_name": "A",
+    "subject": "hello",
+    "date": "2026-08-19T09:00:00",
+    "currently_in": "INBOX",
+    "would_move_to": "Archive",
+    "status": "proposed",
+    "stale_detail": None,
+    "arrived_from": None,
+    "arrived_late": False,
+    "findings": [],
+    "body": None,
+    "task": None,
+}
+BUNDLE = {
+    "bundle_id": 1,
+    "status": "proposed",
+    "operation": "move",
+    "flag": None,
+    "target_container": "Archive",
+    "target_is_new": False,
+    "producer": "opencode",
+    "summary": "s",
+    "reason": "r",
+    "created_at": "2026-08-19T09:00:00",
+    "expires_at": "2026-08-26T09:00:00",
+    "decided_at": None,
+    "decided_by": None,
+    "decision_reason": None,
+    "reviewed_through": 7,
+    "queries": [],
+    "self_assessed_by": [],
+    "attempts": [],
+    "apply_task": None,
+    "items": [MESSAGE],
+}
+FOLDER = {
+    "suggestion_id": 7,
+    "message_id": None,
+    "container_id": 4,
+    "container": "Old",
+    "cached_messages": 0,
+    "children": ["Old/Sub"],
+    "exists_on_server": True,
+    "status": "proposed",
+    "stale_detail": None,
+    "findings": [],
+    "body": None,
+    "task": None,
+}
+FAILED = {
+    "id": 5,
+    "kind": "apply_bundle",
+    "status": "failed",
+    "subject_id": 1,
+    "done": 0,
+    "total": None,
+    "note": None,
+    "error": "went away mid-apply",
+    "result": {},
+}
+STALE = {**MESSAGE, "status": "stale", "stale_detail": "the message has left INBOX"}
+ACCEPT = "Accept — do this to the mailbox"
+
+#: What differs from an ordinary bundle, what the page must say, and what it must not.
+SAYS = {
+    "ordinary": ({}, ["move → Archive", ACCEPT, "expires 26 Aug 2026"], ["does not exist yet"]),
+    "new folder": ({"target_is_new": True}, ["does not exist yet", "will be created"], []),
+    "discard": (
+        {"operation": "discard_container", "target_container": None, "items": [FOLDER]},
+        ["cannot lose mail", "Old/Sub", "nothing", "1 folders"],
+        [],
+    ),
+    "found by search": (
+        {"queries": [{"text": "news", "items": [7, 7]}]},
+        ["found by searching for news", "the search is not run again"],
+        [],
+    ),
+    "grew": (
+        {
+            "queries": [
+                {"text": "more", "grew": True, "added": 1, "at": "2026-08-20T09:00:00"}
+            ],
+            "items": [{**MESSAGE, "arrived_late": True}],
+        },
+        ["added to since it was proposed", "20 Aug 2026", "added later"],
+        ["found by searching"],
+    ),
+    "self assessed": ({"self_assessed_by": ["opencode"]}, ["the same producer that"], []),
+    "delete": (
+        {
+            "operation": "delete",
+            "target_container": None,
+            "items": [{**MESSAGE, "would_move_to": None}],
+        },
+        ["Trash"],
+        ["Archive"],
+    ),
+    "flag": (
+        {"operation": "add_flag", "flag": "\\Seen", "target_container": None},
+        ["(add_flag \\Seen)"],
+        [],
+    ),
+    "partly stale": (
+        {"items": [STALE, {**MESSAGE, "suggestion_id": 8, "message_id": 4}]},
+        ["1 of these changed", "has left INBOX", "I have read what changed"],
+        [],
+    ),
+    "closed itself": (
+        {"status": "stale", "items": [STALE]},
+        ["this closed itself"],
+        [ACCEPT, "exclude"],
+    ),
+    "accepted and stuck": (
+        {"status": "accepted", "apply_task": FAILED},
+        ["being applied", "went away mid-apply", "retry"],
+        [ACCEPT],
+    ),
+    "rejected": (
+        {
+            "status": "rejected",
+            "decided_by": "ronny",
+            "decision_reason": "keep these",
+            "decided_at": "2026-08-20T09:00:00",
+        },
+        ["rejected by ronny", "keep these"],
+        [ACCEPT],
+    ),
+    "applied": (
+        {
+            "status": "applied",
+            "attempts": [
+                {
+                    "suggestion_id": 7,
+                    "outcome": "applied",
+                    "precondition": "conditional",
+                    "guarantee_obtained": "best_effort",
+                    "detail": None,
+                }
+            ],
+        },
+        ["What happened", "asked for conditional"],
+        [ACCEPT],
+    ),
+    "fetch failed": (
+        {"items": [{**MESSAGE, "task": {**FAILED, "kind": "fetch_body", "subject_id": 3}}]},
+        ["went away mid-apply", "try again"],
+        [],
+    ),
+}
+
+
+@pytest.mark.parametrize("what", list(SAYS))
+async def test_the_bundle_page_says(page, bundle_at, what):
+    base, bundle_id, _ = bundle_at
+    differs, says, says_not = SAYS[what]
+
+    async def serve(route):  # noqa: ANN001, ANN202
+        await route.fulfill(
+            body=json.dumps({**BUNDLE, **differs}), content_type="application/json"
+        )
+
+    await page.route(f"**/api/bundle/{bundle_id}", serve)
+    await page.goto(f"{base}/bundle/{bundle_id}")
+    await page.get_by_text("What the producer says").wait_for()
+    await page.evaluate("document.querySelectorAll('details').forEach((d) => (d.open = true))")
+    text = " ".join((await page.locator("body").inner_text()).split())
+    for words in says:
+        assert words in text, text
+    for words in says_not:
+        assert words not in text, text
+    assert page.problems == []

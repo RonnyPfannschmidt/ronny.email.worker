@@ -10,8 +10,10 @@ export const post = (path, csrf) =>
 
 /** Calls `onReady` on every (re)connection, so whatever was missed is read again. */
 export function listen(onReady, onTask) {
-  const source = new EventSource("/next/api/events");
+  const source = new EventSource("/api/events");
   source.addEventListener("ready", onReady);
   source.addEventListener("task", (event) => onTask(JSON.parse(event.data)));
   return () => source.close();
 }
+
+export const taskIsLive = (task) => ["queued", "running"].includes(task?.status);

@@ -1,22 +1,53 @@
 <script>
   import { onMount } from "svelte";
   import { get, listen, post } from "./api.js";
+  import Banners from "./Banners.svelte";
+  import Decision from "./Decision.svelte";
+  import FolderItem from "./FolderItem.svelte";
   import Item from "./Item.svelte";
+  import { when } from "./when.js";
 
-  let { bundleId, csrf } = $props();
+  let { bundleId, csrf, refused } = $props();
   let bundle = $state(null);
   let error = $state("");
+  let grown = $state(false);
 
   const items = $derived(bundle?.items ?? []);
-  const included = $derived(items.filter((item) => item.status === "proposed").length);
+  const folders = $derived(bundle?.operation === "discard_container");
+  const open = $derived(bundle?.status === "proposed");
+  const noun = $derived(folders ? "folders" : "messages");
 
-  async function load() {
-    try {
-      bundle = await get(`/next/api/bundle/${bundleId}`);
-      error = "";
-    } catch (problem) {
-      error = problem.message;
+  function take(fresh) {
+    // A reader is never handed items under their eyes: what is on the page stays the page,
+    // and so does the `reviewed_through` that accepting it sends.
+    if (bundle && fresh.status === "proposed" && fresh.reviewed_through !== bundle.reviewed_through) {
+      grown = true;
+      return;
     }
+    bundle = fresh;
+  }
+
+  // One read at a time: a reconnect during a read asks for one more after it, not for a
+  // second one racing it.
+  let reading = null;
+  let again = false;
+
+  function load() {
+    if (reading) again = true;
+    else reading = read().finally(() => (reading = null));
+    return reading;
+  }
+
+  async function read() {
+    do {
+      again = false;
+      try {
+        take(await get(`/api/bundle/${bundleId}`));
+        error = "";
+      } catch (problem) {
+        error = problem.message;
+      }
+    } while (again);
   }
 
   async function change(item, path, apply) {
@@ -29,62 +60,94 @@
   }
 
   const fetchBody = (item) =>
-    change(item, `/next/api/message/${item.message_id}/body`, (task) => (item.task = task));
+    change(item, `/api/message/${item.message_id}/body`, (task) => (item.task = task));
 
   const exclude = (item) =>
-    change(item, `/next/api/bundle/${bundleId}/exclude/${item.suggestion_id}`, (after) => {
+    change(item, `/api/bundle/${bundleId}/exclude/${item.suggestion_id}`, (after) => {
       item.status = after.status;
       item.problem = after.problem;
     });
 
   async function taskChanged(task) {
-    if (task.kind === "apply_bundle" && task.subject_id === bundleId) return load();
+    if (!bundle) return;
+    if (task.kind === "apply_bundle" && task.subject_id === bundleId) {
+      bundle.apply_task = task;
+      if (["done", "failed"].includes(task.status)) await load();
+      return;
+    }
     if (task.kind !== "fetch_body") return;
     const item = items.find((each) => each.message_id === task.subject_id);
     if (!item) return;
     item.task = task;
-    if (task.status === "done") item.body = await get(`/next/api/message/${item.message_id}/body`);
+    if (task.status !== "done" || task.result?.note) return;
+    try {
+      item.body = await get(`/api/message/${item.message_id}/body`);
+    } catch (problem) {
+      item.problem = problem.message;
+    }
   }
 
   onMount(() => listen(load, taskChanged));
 </script>
 
+{#if refused}<div class="banner error">{refused}</div>{/if}
 {#if error}<div class="banner error">{error}</div>{/if}
 
 {#if !bundle}
   <p class="muted">loading</p>
 {:else}
   <h1 class="effect">
-    {bundle.operation}
-    {#if bundle.target_container}<span class="arrow">→</span>{bundle.target_container}{/if}
-    <span class="muted small">({included} of {items.length} messages)</span>
+    {folders ? "discard" : bundle.operation}{bundle.flag ? ` ${bundle.flag}` : ""}
+    {#if bundle.target_container}<span class="arrow">→</span> {bundle.target_container}{/if}
+    {#if bundle.target_is_new}
+      <span class="muted small">(new folder — will be created)</span>
+    {/if}
+    <span class="muted small">({items.length} {noun})</span>
   </h1>
-  <p class="small muted">Proposed by {bundle.producer} · status {bundle.status}</p>
-  <table>
-    <thead>
-      <tr><th>From</th><th>Subject</th><th>Now in</th><th>Would be in</th><th></th></tr>
-    </thead>
-    <tbody>
-      {#each items as item (item.suggestion_id)}
-        <Item {item} open={bundle.status === "proposed"} {fetchBody} {exclude} />
-      {/each}
-    </tbody>
-  </table>
+
+  <Banners {bundle} {folders} {noun} {grown} />
+
+  <p class="small muted">
+    Proposed by {bundle.producer} · status {bundle.status} · expires {when(bundle.expires_at)}
+  </p>
+
+  <h2>The effect</h2>
+  {#if folders}
+    <table>
+      <thead>
+        <tr><th>Folder</th><th>Holds</th><th>Under it</th><th></th><th>Would be</th><th></th></tr>
+      </thead>
+      <tbody>
+        {#each items as item (item.suggestion_id)}<FolderItem {item} {open} {exclude} />{/each}
+      </tbody>
+    </table>
+    <p class="small muted">
+      A folder listed under another one goes after it does, so a whole branch can be removed in
+      one bundle without the server ever being asked to delete a folder that still has something
+      below it.
+    </p>
+  {:else}
+    <table>
+      <thead>
+        <tr>
+          <th>From</th><th>Subject</th><th>Date</th><th>Now in</th><th></th><th>Would be in</th>
+          <th></th>
+        </tr>
+      </thead>
+      <tbody>
+        {#each items as item (item.suggestion_id)}
+          <Item {item} {bundle} {open} {fetchBody} {exclude} />
+        {/each}
+      </tbody>
+    </table>
+  {/if}
+
   <h2>What the producer says</h2>
   <p>{bundle.summary}</p>
   <p class="muted">{bundle.reason}</p>
-  {#if bundle.status === "proposed"}
-    <div class="actions">
-      <form method="post" action="/bundle/{bundleId}/accept">
-        <input type="hidden" name="_csrf" value={csrf} />
-        <input type="hidden" name="reviewed_through" value={bundle.reviewed_through} />
-        <button>Accept — do this to the mailbox</button>
-      </form>
-      <form method="post" action="/bundle/{bundleId}/reject">
-        <input type="hidden" name="_csrf" value={csrf} />
-        <input name="reason" placeholder="why not (optional)" size="30" />
-        <button>Reject</button>
-      </form>
-    </div>
-  {/if}
+  <p class="small muted">
+    The table above is what it would actually do — decide from that, not from this.
+  </p>
+
+  <Decision {bundle} {csrf} {items} />
 {/if}

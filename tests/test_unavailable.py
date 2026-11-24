@@ -6,6 +6,10 @@ with the one message that explains everything sitting in a journal nobody reads.
 
 from __future__ import annotations
 
+import contextlib
+import http.cookiejar
+import os
+import re
 import socket
 import subprocess
 import sys
@@ -129,6 +133,46 @@ def test_serve_watch_exits_cleanly_when_the_source_changes(tmp_path):
         (watched / "server.py").write_text("after — the edit being fixed\n")
         assert proc.wait(timeout=30) == 0, "a source change is a clean exit, not a crash"
         assert "restarts into the edit" in proc.stderr.read()
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait(timeout=10)
+
+
+def test_serve_stops_while_somebody_has_a_page_open(tmp_path):
+    """A bundle page holds an event stream for as long as its tab is open."""
+    db = tmp_path / "mm.db"
+    upgrade_to_head(f"sqlite:///{db}")
+    port = _free_port()
+    config = tmp_path / "mailmind.toml"
+    config.write_text(CONFIG.format(db=db, port=port))
+    runtime = tmp_path / "run"
+    runtime.mkdir()
+
+    proc = subprocess.Popen(
+        [sys.executable, "-m", "mailmind.cli", "--config", str(config), "serve"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        env={**os.environ, "XDG_RUNTIME_DIR": str(runtime)},
+    )
+    try:
+        left = runtime / "mailmind" / f"review-{port}.link"
+        deadline = time.monotonic() + 20
+        status = None
+        while status != 401 and time.monotonic() < deadline:
+            with contextlib.suppress(OSError):
+                status, _ = _get(f"http://127.0.0.1:{port}/")
+            time.sleep(0.1)
+        link = re.search(r"http\S+", left.read_text()).group(0)
+        browser = urllib.request.build_opener(
+            urllib.request.HTTPCookieProcessor(http.cookiejar.CookieJar())
+        )
+        browser.open(link).read()
+        stream = browser.open(f"http://127.0.0.1:{port}/api/events")
+        assert stream.readline() == b"event: ready\n"
+
+        proc.terminate()
+        assert proc.wait(timeout=10) is not None
     finally:
         if proc.poll() is None:
             proc.kill()

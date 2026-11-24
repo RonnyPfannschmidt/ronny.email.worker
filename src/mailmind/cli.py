@@ -459,6 +459,7 @@ def mcp_stdio(
     from mailmind.mcp import server as mcp_server
     from mailmind.web import app as web_app
     from mailmind.web.app import create_app, mint_session_key
+    from mailmind.web.serving import Server
 
     if review_url and serve_ui:
         raise click.ClickException(
@@ -522,13 +523,8 @@ def mcp_stdio(
             return
         # No MCP endpoint on it: the agent is already on the pipe, and mounting a second
         # way in would be surface nobody asked for.
-        web = uvicorn.Server(
-            uvicorn.Config(
-                create_app(service, with_mcp=False, session_key=session_key),
-                log_level="warning",
-                access_log=False,
-            )
-        )
+        review = create_app(service, with_mcp=False, session_key=session_key)
+        web = Server(uvicorn.Config(review, log_level="warning", access_log=False), review)
         serving = asyncio.create_task(web.serve(sockets=[listener]))
         try:
             await server.run_stdio_async()
@@ -798,6 +794,7 @@ def serve(
     import uvicorn
 
     from mailmind.web.app import create_app, mint_session_key
+    from mailmind.web.serving import Server
 
     # An override has to reach the configuration rather than only uvicorn: the MCP
     # endpoint builds its DNS-rebinding allow-list from the configured bind address, so
@@ -846,8 +843,8 @@ def serve(
     # The trailing slash is not decoration: the endpoint is mounted at /mcp/ and a POST to
     # /mcp gets a 307, which an MCP client is entitled to follow and may not.
     click.echo(f"MCP        {where}/mcp/", err=not a_terminal)
-    server = uvicorn.Server(
-        uvicorn.Config(app, host=service.config.bind, port=service.config.port)
+    server = Server(
+        uvicorn.Config(app, host=service.config.bind, port=service.config.port), app
     )
     asyncio.run(_serve_watched(server, watch=watch, watch_paths=watch_paths))
     raise SystemExit(0)
@@ -876,7 +873,7 @@ def _watched_paths(named: tuple[str, ...]) -> list[Path]:
 
 
 def _built_interface() -> Path:
-    from mailmind.web.next import ASSETS
+    from mailmind.web.bundle_page import ASSETS
 
     return ASSETS
 

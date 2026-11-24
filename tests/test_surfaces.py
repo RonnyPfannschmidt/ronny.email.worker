@@ -324,6 +324,17 @@ async def as_a_person(client: Browser, path: str, **kwargs):  # noqa: ANN201
     return await client.post(path, headers=headers, data=data, **kwargs)
 
 
+async def shown(client: Browser, bundle_id: int) -> dict:
+    """What the bundle page shows: the page itself, and the data its script reads.
+
+    What it says about it is drawn in a browser, and tested in one — see test_browser.
+    """
+    assert (await client.get(f"/bundle/{bundle_id}")).status_code == 200
+    answer = await client.get(f"/api/bundle/{bundle_id}")
+    assert answer.status_code == 200, answer.text
+    return answer.json()
+
+
 async def accepting(client: Browser, bundle_id: int, **kwargs):  # noqa: ANN201
     """Accept the way a person does: from the page, carrying what the page showed.
 
@@ -331,9 +342,7 @@ async def accepting(client: Browser, bundle_id: int, **kwargs):  # noqa: ANN201
     read rather than whatever the bundle holds when the form arrives.  A test that posts
     without it is a test of the refusal, not of accepting.
     """
-    page = (await client.get(f"/bundle/{bundle_id}")).text
-    shown = re.search(r'name="reviewed_through" value="(\d+)"', page)
-    data = {"reviewed_through": shown.group(1) if shown else "0"}
+    data = {"reviewed_through": (await shown(client, bundle_id))["reviewed_through"]}
     data.update(kwargs.pop("data", {}))
     response = await as_a_person(
         client, f"/bundle/{bundle_id}/accept", data=data, follow_redirects=True, **kwargs
@@ -979,22 +988,22 @@ async def test_a_bundle_that_grew_cannot_be_accepted_from_the_page_drawn_before_
     agent = await Agent.connect(client)
     proposed = await _propose(agent)
 
-    page = (await client.get(f"/bundle/{proposed['bundle_id']}")).text
-    shown = re.search(r'name="reviewed_through" value="(\d+)"', page).group(1)
+    read = (await shown(client, proposed["bundle_id"]))["reviewed_through"]
 
     await agent.call("add_to_bundle", bundle_id=proposed["bundle_id"], query="Lunch")
 
     refused = await as_a_person(
         client,
         f"/bundle/{proposed['bundle_id']}/accept",
-        data={"reviewed_through": shown},
+        data={"reviewed_through": read},
         follow_redirects=True,
     )
-    assert "2 more messages arrived" in refused.text
+    assert "2 more messages arrived" in str(refused.url.params["error"])
     assert len(backend.folders["Archive"].messages) == 0, "it applied anyway"
 
     # Reading it again is the whole resolution: the page now shows what arrived.
-    assert "added later" in (await client.get(f"/bundle/{proposed['bundle_id']}")).text
+    late = [i["arrived_late"] for i in (await shown(client, proposed["bundle_id"]))["items"]]
+    assert late.count(True) == 2
     await accepting(client, proposed["bundle_id"])
     assert len(backend.folders["Archive"].messages) == 3
 
@@ -1014,9 +1023,8 @@ async def test_the_review_page_says_a_bundle_was_found_by_searching(client):
         summary="Newsletter issues",
         reason="Bulk mail",
     )
-    page = (await client.get(f"/bundle/{proposed['bundle_id']}")).text
-    assert "found by searching for" in page
-    assert "the search is not run again" in page
+    queries = (await shown(client, proposed["bundle_id"]))["queries"]
+    assert [(q["text"], bool(q.get("grew"))) for q in queries] == [("news@list.example", False)]
 
 
 async def _propose(agent: Agent) -> dict:
@@ -1212,12 +1220,13 @@ async def test_the_review_page_shows_the_effect_and_names_the_self_assessment(cl
         findings=[{"code": "bulk", "detail": "a newsletter"}],
     )
 
-    page = (await client.get(f"/bundle/{proposed['bundle_id']}")).text
-    assert "INBOX" in page and "Archive" in page
-    assert "Issue 402" in page
+    page = await shown(client, proposed["bundle_id"])
+    (item,) = page["items"]
+    assert (item["currently_in"], item["would_move_to"]) == ("INBOX", "Archive")
+    assert "Issue 402" in item["subject"]
+    assert "a newsletter" in [f["detail"] for f in item["findings"]]
     # 02's rule, stated where it cannot be enforced.
-    assert "same\n  producer that proposed this" in page or "same" in page
-    assert "opencode" in page
+    assert page["self_assessed_by"] == ["opencode"]
 
 
 async def test_the_review_page_says_a_folder_would_be_made_before_anything_moves(
@@ -1245,9 +1254,9 @@ async def test_the_review_page_says_a_folder_would_be_made_before_anything_moves
         reason="Bulk mail with a List-Id",
     )
 
-    page = (await client.get(f"/bundle/{proposed['bundle_id']}")).text
-    assert "Lists/example" in page
-    assert "does not exist yet" in page, "the reviewer has to be told what they are making"
+    page = await shown(client, proposed["bundle_id"])
+    assert page["target_container"] == "Lists/example"
+    assert page["target_is_new"], "the reviewer has to be told what they are making"
 
     response = await accepting(client, proposed["bundle_id"])
     assert response.status_code == 200
@@ -1275,15 +1284,15 @@ async def test_a_discard_is_reviewed_and_accepted_like_anything_else(client, ser
         reason="Nothing has ever been filed in it",
     )
 
-    page = (await client.get(f"/bundle/{proposed['bundle_id']}")).text
-    assert "Old" in page
-    assert "cannot lose mail" in page, "why an empty folder is the only one offered"
+    page = await shown(client, proposed["bundle_id"])
+    assert page["operation"] == "discard_container"
+    assert [i["container"] for i in page["items"]] == ["Old"]
     assert "Old" in backend.folders, "reading the page changes nothing"
 
     response = await accepting(client, proposed["bundle_id"])
     assert response.status_code == 200
     assert "Old" not in backend.folders
-    assert "applied" in response.text
+    assert (await shown(client, proposed["bundle_id"]))["status"] == "applied"
 
 
 async def test_accepting_in_the_ui_actually_moves_the_mail(client, backend):
@@ -1294,7 +1303,7 @@ async def test_accepting_in_the_ui_actually_moves_the_mail(client, backend):
     response = await accepting(client, proposed["bundle_id"])
     assert response.status_code == 200
     assert len(backend.folders["Archive"].messages) == 1
-    assert "applied" in response.text
+    assert (await shown(client, proposed["bundle_id"]))["status"] == "applied"
 
 
 async def test_accepting_a_delete_in_the_ui_files_it_in_trash(client, backend):
@@ -1326,9 +1335,10 @@ async def test_accepting_a_delete_in_the_ui_files_it_in_trash(client, backend):
 
     response = await accepting(client, proposed["bundle_id"])
     assert response.status_code == 200
-    assert "no Trash container is known" not in response.text
     assert len(backend.folders["Trash"].messages) == 1
-    assert "applied" in response.text
+    page = await shown(client, proposed["bundle_id"])
+    assert page["status"] == "applied"
+    assert not [a for a in page["attempts"] if "no Trash" in (a["detail"] or "")]
 
 
 async def test_the_ui_refuses_to_accept_around_something_that_moved(client, backend, service):
@@ -1345,9 +1355,8 @@ async def test_the_ui_refuses_to_accept_around_something_that_moved(client, back
         await sync.sync_container(scope, account, inbox, backend)
         await scope.commit()
 
-    page = (await client.get(f"/bundle/{proposed['bundle_id']}")).text
-    if "moved since this was proposed" in page:
-        assert "acknowledge_stale" in page
+    statuses = [i["status"] for i in (await shown(client, proposed["bundle_id"]))["items"]]
+    assert statuses, "the page shows what died rather than hiding it"
     response = await accepting(client, proposed["bundle_id"])
     assert response.status_code == 200
 
@@ -1376,9 +1385,9 @@ async def test_a_bundle_whose_every_message_moved_leaves_the_queue_by_itself(
         await sync.sync_container(scope, account, inbox, backend)
         await scope.commit()
 
-    page = (await client.get(f"/bundle/{proposed['bundle_id']}")).text
-    assert "closed itself" in page
-    assert "Accept — do this to the mailbox" not in page, "a dead bundle offers no buttons"
+    page = await shown(client, proposed["bundle_id"])
+    assert page["status"] == "stale"
+    assert all(i["stale_detail"] for i in page["items"])
 
     async with service.scope() as scope:
         bundle = await scope.get(m.Bundle, proposed["bundle_id"])
@@ -1399,8 +1408,10 @@ async def test_a_rejection_can_carry_a_reason_and_is_as_easy_as_accepting(client
         data={"reason": "I want to keep reading these"},
         follow_redirects=True,
     )
-    assert "rejected" in response.text
-    assert "I want to keep reading these" in response.text
+    assert response.status_code == 200
+    page = await shown(client, proposed["bundle_id"])
+    assert page["status"] == "rejected"
+    assert page["decision_reason"] == "I want to keep reading these"
     assert len(backend.folders["Archive"].messages) == 0
 
 
@@ -1437,6 +1448,10 @@ async def _picked(client, container_id: int) -> list[str]:  # noqa: ANN001
     """The message ids a person would be ticking, read off the folder page."""
     page = (await client.get(f"/mail/{container_id}")).text
     return re.findall(r'name="message_id" value="(\d+)"', page)
+
+
+def _landed_on(response) -> int:  # noqa: ANN001
+    return int(re.search(r"/bundle/(\d+)", str(response.url)).group(1))
 
 
 async def _container(service, name: str) -> int:  # noqa: ANN001
@@ -1510,8 +1525,9 @@ async def test_filing_by_hand_proposes_rather_than_moving(client, service, backe
     )
     assert landed.status_code == 200
     # The review page, with the effect enumerated, and a mailbox nobody has touched.
-    assert "The effect" in landed.text
-    assert "picked out of INBOX" in landed.text
+    page = await shown(client, _landed_on(landed))
+    assert len(page["items"]) == 2
+    assert "picked out of INBOX" in page["summary"] + page["reason"]
     assert len(backend.folders["Archive"].messages) == 0
     # Proposed by the person, and waiting like anything else.
     assert "reviewer" in (await client.get("/")).text
@@ -1531,7 +1547,7 @@ async def test_a_bundle_filed_by_hand_is_accepted_the_same_way_and_then_moves(
         },
         follow_redirects=True,
     )
-    bundle_id = int(re.search(r"/bundle/(\d+)", str(landed.url)).group(1))
+    bundle_id = _landed_on(landed)
 
     await accepting(client, bundle_id)
     assert len(backend.folders["Archive"].messages) == 1
@@ -1586,9 +1602,9 @@ async def test_a_hand_filed_delete_names_trash_and_nothing_else(client, service,
         },
         follow_redirects=True,
     )
-    assert "Archive" not in landed.text.split("<h1", 1)[1].split("</h1>", 1)[0]
+    assert (await shown(client, _landed_on(landed)))["target_container"] is None
 
-    await accepting(client, int(re.search(r"/bundle/(\d+)", str(landed.url)).group(1)))
+    await accepting(client, _landed_on(landed))
     assert len(backend.folders["Trash"].messages) == 1
     assert len(backend.folders["Archive"].messages) == 0
 
@@ -2013,19 +2029,18 @@ async def test_the_review_ui_refuses_a_change_without_the_form_token(client, bac
 
 
 async def test_a_framework_fetch_from_our_own_page_gets_through(client, backend):
-    """A same-origin fetch (Turbo's form submission) is a person's action, not an agent's.
+    """A same-origin fetch (the bundle page's own) is a person's action, not an agent's.
 
     ``sec-fetch-mode: cors`` with ``sec-fetch-site: same-origin`` is exactly what a
     framework submitting a form with fetch sends; refusing it was the old gesture check,
     replaced on purpose.
     """
     proposed = await _propose(await Agent.connect(client))
-    page = (await client.get(f"/bundle/{proposed['bundle_id']}")).text
-    shown = re.search(r'name="reviewed_through" value="(\d+)"', page)
+    read = (await shown(client, proposed["bundle_id"]))["reviewed_through"]
     response = await client.post(
         f"/bundle/{proposed['bundle_id']}/accept",
         headers={"Sec-Fetch-Site": "same-origin", "Sec-Fetch-Mode": "cors"},
-        data={"_csrf": CSRF, "reviewed_through": shown.group(1) if shown else "0"},
+        data={"_csrf": CSRF, "reviewed_through": read},
     )
     assert response.status_code < 400
     await settle(client)
@@ -2258,19 +2273,43 @@ async def test_the_shut_page_names_the_command_that_reopens_it(service):
     assert "mailmindctl review --open" in shut.text
 
 
-async def test_excluding_lands_back_at_the_row_it_removed(client):
-    """A long table reviewed item by item must not snap to the top per click."""
+async def test_excluding_answers_with_what_became_of_the_row(client):
     proposed = await _propose(await Agent.connect(client))
-    page = (await client.get(f"/bundle/{proposed['bundle_id']}")).text
-    form = re.search(r"/bundle/\d+/exclude/(\d+)", page)
-    suggestion_id = form.group(1)
-    response = await as_a_person(
-        client,
-        f"/bundle/{proposed['bundle_id']}/exclude/{suggestion_id}",
-        follow_redirects=False,
-    )
-    assert response.status_code == 303
-    assert "#m" in response.headers["location"] or "#s" in response.headers["location"]
+    (item,) = (await shown(client, proposed["bundle_id"]))["items"]
+    path = f"/api/bundle/{proposed['bundle_id']}/exclude/{item['suggestion_id']}"
+
+    first = await as_a_person(client, path)
+    assert first.json() == {"status": "excluded", "problem": ""}
+    # Decided already, so refused in words rather than with a broken page.
+    again = await as_a_person(client, path)
+    assert again.status_code == 200
+
+
+@pytest.mark.parametrize(
+    "change", ["message/{message_id}/body", "bundle/{bundle_id}/exclude/{suggestion_id}"]
+)
+async def test_the_page_script_changes_nothing_without_the_form_token(client, change):
+    proposed = await _propose(await Agent.connect(client))
+    (item,) = (await shown(client, proposed["bundle_id"]))["items"]
+    path = "/api/" + change.format(bundle_id=proposed["bundle_id"], **item)
+    same_origin = {"Sec-Fetch-Site": "same-origin"}
+
+    assert (await client.post(path, headers=same_origin)).status_code == 403
+    assert (await client.post(path, data={"_csrf": CSRF})).status_code == 403
+    (after,) = (await shown(client, proposed["bundle_id"]))["items"]
+    assert (after["status"], after["task"]) == ("proposed", None)
+
+
+async def test_the_page_data_is_behind_the_key(client):
+    proposed = await _propose(await Agent.connect(client))
+    async with Browser(client.app) as stranger:
+        for path in (f"bundle/{proposed['bundle_id']}", "message/1/body", "events"):
+            assert (await stranger.get(f"/api/{path}")).status_code == 401, path
+
+
+async def test_a_bundle_that_is_not_there_is_a_404_not_a_page(client):
+    assert (await client.get("/bundle/999")).status_code == 404
+    assert (await client.get("/api/bundle/999")).status_code == 404
 
 
 async def test_an_agent_that_follows_its_own_link_is_told_to_fetch_a_person(service):
@@ -2586,15 +2625,16 @@ async def test_an_accepted_bundle_is_visible_on_the_queue_not_invisible(client):
 
 async def test_the_bundle_page_shows_the_apply_and_retry_finishes_it(client, backend):
     bundle_id, task_id = await _stranded_accepted(client, with_failed_task=True)
-    page = (await client.get(f"/bundle/{bundle_id}")).text
-    assert "being applied" in page.lower()
-    assert "the mailbox went away mid-apply" in page
+    page = await shown(client, bundle_id)
+    assert page["status"] == "accepted"
+    assert page["apply_task"]["id"] == task_id
+    assert page["apply_task"]["error"] == "the mailbox went away mid-apply"
 
     response = await as_a_person(client, f"/task/{task_id}/retry", follow_redirects=True)
     assert response.status_code == 200
     await settle(client)
     assert len(backend.folders["Archive"].messages) == 1
-    assert "applied" in (await client.get(f"/bundle/{bundle_id}")).text
+    assert (await shown(client, bundle_id))["status"] == "applied"
 
 
 async def test_a_failed_body_fetch_is_shown_next_to_the_button(client):
@@ -2615,9 +2655,10 @@ async def test_a_failed_body_fetch_is_shown_next_to_the_button(client):
         )
         scope.add(task)
         await scope.commit()
-    page = (await client.get(f"/bundle/{proposed['bundle_id']}")).text
-    assert "the server closed the connection" in page
-    assert "retry" in page
+    failed = [
+        i["task"] for i in (await shown(client, proposed["bundle_id"]))["items"] if i["task"]
+    ]
+    assert [t["error"] for t in failed] == ["the server closed the connection"]
 
 
 async def test_request_sync_and_task_status_carry_the_work_to_its_result(client):

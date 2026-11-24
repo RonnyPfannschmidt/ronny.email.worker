@@ -1,8 +1,7 @@
-"""The bundle page as a Svelte component: a spike, beside the page it may replace.
+"""The bundle page's server half: its data, its two small changes, and what happens live.
 
-The server still decides everything.  What is here is the same data as JSON, the same two
-changes behind the same CSRF dependency, and an event stream that carries facts about
-tasks rather than HTML.  Accept and reject are the existing forms.
+The server decides everything and the browser displays it.  The interface itself is in
+``frontend/``.  Accepting and rejecting stay ordinary forms.
 """
 
 from __future__ import annotations
@@ -12,7 +11,7 @@ from pathlib import Path
 
 import sqlalchemy as sa
 from fastapi import HTTPException, Request
-from fastapi.responses import HTMLResponse, StreamingResponse
+from fastapi.responses import HTMLResponse, Response, StreamingResponse
 
 from mailmind import tasks, views
 from mailmind.db import models as m
@@ -42,25 +41,36 @@ def _body(body: m.MessageBody) -> dict:
     }
 
 
-def mount(app, service, render, changes, reviewer) -> None:  # noqa: ANN001
-    @app.get("/next/bundle/{bundle_id}", response_class=HTMLResponse)
-    async def page(request: Request, bundle_id: int):  # noqa: ANN202
-        return render(
-            request, "next.html", bundle_id=bundle_id, script=script_for("src/bundle.js")
-        )
+def mount(app, service, render, chrome, changes, reviewer) -> None:  # noqa: ANN001
+    @app.get("/bundle/{bundle_id}", response_class=HTMLResponse)
+    async def page(request: Request, bundle_id: int, error: str | None = None) -> Response:
+        async with service.scope(readonly=True) as scope:
+            if await scope.get(m.Bundle, bundle_id) is None:
+                return HTMLResponse("no such bundle", status_code=404)
+            return render(
+                request,
+                "bundle.html",
+                bundle_id=bundle_id,
+                error=error,
+                script=script_for("src/bundle.js"),
+                **await chrome(scope),
+            )
 
-    @app.get("/next/api/bundle/{bundle_id}")
+    @app.get("/api/bundle/{bundle_id}")
     async def bundle(bundle_id: int) -> dict:
         async with service.scope() as scope:
             row = await scope.get(m.Bundle, bundle_id)
             if row is None:
                 raise HTTPException(404)
             if row.status is m.BundleStatus.proposed:
+                # The first of the two staleness checks: before it is shown.
                 await staleness.refresh_bundle(scope, row)
                 await scope.commit()
+            # limit=None: a reviewer is shown the whole of what they are accepting, and
+            # `reviewed_through` is only honest about a page that held all of it.
             detail = await views.bundle_detail(scope, bundle_id, limit=None)
             rows = detail.pop("items")["items"]
-            ids = [row["message_id"] for row in rows]
+            ids = [row["message_id"] for row in rows if row["message_id"] is not None]
             bodies = {
                 body.message_id: _body(body)
                 for body in await scope.all(
@@ -74,10 +84,11 @@ def mount(app, service, render, changes, reviewer) -> None:  # noqa: ANN001
                 row["findings"] = [f for a in row.pop("assessment", []) for f in a["findings"]]
                 row["body"] = bodies.get(row["message_id"])
                 row["task"] = fetches.get(row["message_id"])
-                row["problem"] = ""
-            return {**detail, "items": rows}
+            applies = await views.task_summaries(scope, None, kinds=[m.TaskKind.apply_bundle])
+            apply_task = next((t for t in applies if t["subject_id"] == bundle_id), None)
+            return {**detail, "items": rows, "apply_task": apply_task}
 
-    @app.get("/next/api/message/{message_id}/body")
+    @app.get("/api/message/{message_id}/body")
     async def message_body(message_id: int) -> dict:
         async with service.scope(readonly=True) as scope:
             body = await scope.scalar(
@@ -87,7 +98,7 @@ def mount(app, service, render, changes, reviewer) -> None:  # noqa: ANN001
                 raise HTTPException(404)
             return _body(body)
 
-    @app.post("/next/api/message/{message_id}/body", dependencies=changes)
+    @app.post("/api/message/{message_id}/body", dependencies=changes)
     async def fetch_body(message_id: int) -> dict:
         async with service.scope() as scope:
             placement = await scope.scalar(
@@ -108,7 +119,7 @@ def mount(app, service, render, changes, reviewer) -> None:  # noqa: ANN001
         service.notify_tasks()
         return view
 
-    @app.post("/next/api/bundle/{bundle_id}/exclude/{suggestion_id}", dependencies=changes)
+    @app.post("/api/bundle/{bundle_id}/exclude/{suggestion_id}", dependencies=changes)
     async def exclude(bundle_id: int, suggestion_id: int) -> dict:
         async with service.scope() as scope:
             suggestion = await scope.get(m.Suggestion, suggestion_id)
@@ -122,7 +133,7 @@ def mount(app, service, render, changes, reviewer) -> None:  # noqa: ANN001
             await scope.commit()
             return {"status": suggestion.status.value, "problem": problem}
 
-    @app.get("/next/api/events")
+    @app.get("/api/events")
     async def events(request: Request) -> StreamingResponse:
         async def stream():  # noqa: ANN202
             hub = request.app.state.task_runner.hub
@@ -132,6 +143,8 @@ def mount(app, service, render, changes, reviewer) -> None:  # noqa: ANN001
                 yield "event: ready\ndata: {}\n\n"
                 while True:
                     task_id = await queue.get()
+                    if task_id is None:
+                        return
                     async with service.scope(readonly=True) as scope:
                         task = await scope.get(m.Task, task_id)
                         view = views.task_view(task) if task is not None else None

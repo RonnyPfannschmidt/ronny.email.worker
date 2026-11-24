@@ -50,14 +50,23 @@ class Hub:
     """Task ids fan out to whoever is streaming; everything shares the loop."""
 
     def __init__(self) -> None:
-        self._streams: set[asyncio.Queue[int]] = set()
+        self._streams: set[asyncio.Queue[int | None]] = set()
+        self._closed = False
 
     def publish(self, task_id: int) -> None:
         for stream in self._streams:
             stream.put_nowait(task_id)
 
-    def subscribe(self) -> asyncio.Queue[int]:
-        stream: asyncio.Queue[int] = asyncio.Queue()
+    def close(self) -> None:
+        """Nobody will publish again: ``None`` is each stream's last word."""
+        self._closed = True
+        for stream in self._streams:
+            stream.put_nowait(None)
+
+    def subscribe(self) -> asyncio.Queue[int | None]:
+        stream: asyncio.Queue[int | None] = asyncio.Queue()
+        if self._closed:
+            stream.put_nowait(None)
         self._streams.add(stream)
         return stream
 
