@@ -490,6 +490,7 @@ class Placement(Base, TenantScoped):
     __table_args__ = (
         sa.UniqueConstraint("container_id", "container_generation", "uid"),
         sa.Index("ix_placement_live", "tenant_id", "container_id", "gone_at"),
+        sa.Index("ix_placement_message", "tenant_id", "message_id"),
     )
 
 
@@ -518,7 +519,10 @@ class MessageAddress(Base, TenantScoped):
 
     message: Mapped[Message] = relationship(lazy="selectin", back_populates="addresses")
 
-    __table_args__ = (sa.Index("ix_message_address", "tenant_id", "address"),)
+    __table_args__ = (
+        sa.Index("ix_message_address", "tenant_id", "address"),
+        sa.Index("ix_message_address_message", "tenant_id", "message_id"),
+    )
 
 
 class MessageBody(Base, TenantScoped):
@@ -718,6 +722,8 @@ class Suggestion(Base, TenantScoped):
 
     __table_args__ = (
         sa.UniqueConstraint("bundle_id", "message_id"),
+        sa.Index("ix_suggestion_bundle", "tenant_id", "bundle_id"),
+        sa.Index("ix_suggestion_message", "tenant_id", "message_id"),
         sa.CheckConstraint(
             "(message_id IS NOT NULL AND premise_uid IS NOT NULL) "
             "OR (message_id IS NULL AND premise_message_count IS NOT NULL)",
@@ -795,6 +801,8 @@ class Finding(Base, TenantScoped):
     evidence: Mapped[dict[str, Any]] = mapped_column(default=dict)
 
     assessment: Mapped[Assessment] = relationship(lazy="selectin", back_populates="findings")
+
+    __table_args__ = (sa.Index("ix_finding_assessment", "tenant_id", "assessment_id"),)
 
 
 # --------------------------------------------------------------------------- record

@@ -34,7 +34,7 @@ attachment of type `multipart/mixed`. Fixed at the source, and a migration undoe
 place: no re-download, because the combination of both flags with no cached body is
 diagnostic of the bug rather than of the mail.
 
-**"this database is at 0002choice and this build needs 0007task".** The code moved on
+**"this database is at 0002choice and this build needs 0008index".** The code moved on
 and the database did not — ordinary when mailmind runs from a checkout that `git pull`
 updates. `mailmindctl migrate` brings it up; nothing else does, so that no command
 quietly rewrites a mail cache the first time it runs. Stop the service first if one is

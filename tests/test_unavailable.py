@@ -63,7 +63,7 @@ def test_serve_against_a_behind_database_holds_a_page_and_exits_once_migrated(tm
                 assert proc.poll() is None, proc.stderr.read()
                 time.sleep(0.1)
         assert status == 503, page
-        assert "0006folder" in page and "0007task" in page, "it says which revisions"
+        assert "0006folder" in page and "0008index" in page, "it says which revisions"
         assert "mailmindctl migrate" in page, "and what to run"
         assert "Nothing has been touched" in page
 

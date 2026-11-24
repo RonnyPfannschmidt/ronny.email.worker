@@ -617,6 +617,24 @@ async def test_sweeping_an_intact_queue_costs_the_same_however_long_it_is(scope,
     assert await cost() == short
 
 
+async def test_following_a_relationship_does_not_read_the_whole_table(scope, world):
+    for table, column in (
+        ("placement", "message_id"),
+        ("message_address", "message_id"),
+        ("suggestion", "bundle_id"),
+        ("suggestion", "message_id"),
+        ("finding", "assessment_id"),
+    ):
+        plan = await scope.execute(
+            sa.text(
+                f"EXPLAIN QUERY PLAN SELECT * FROM {table} "  # noqa: S608
+                f"WHERE {column} IN (1, 2) AND tenant_id = 0"
+            )
+        )
+        detail = " ".join(row.detail for row in plan)
+        assert f"{column}=?" in detail, detail
+
+
 async def test_accepting_a_bundle_that_just_died_says_so_rather_than_refusing_forever(
     scope, world, backend
 ):

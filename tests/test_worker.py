@@ -294,7 +294,7 @@ async def test_a_database_migrated_under_a_live_service_flips_it_to_not_operatin
     await runner._tick_if_due()
 
     assert service.schema_problem is not None
-    assert "0007task" in service.schema_problem
+    assert "0008index" in service.schema_problem
     assert "restart" in service.schema_problem
     assert runner._stopping.is_set(), "the dispatcher must stop claiming"
 
