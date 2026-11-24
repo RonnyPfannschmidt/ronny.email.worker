@@ -45,13 +45,16 @@ def scoped(service, work):
     """One scope's worth of async setup or assertions, on a loop of its own.
 
     These tests drive the app through TestClient, which brings its own loop — so the
-    tests stay sync and dip into the database the same way the CLI does."""
+    tests stay sync and dip into the database the same way the CLI does: through an
+    engine of their own.  Sharing the app's pool while its loop is live can wait forever
+    on a lock the other loop holds, and ``run`` disposes the pool underneath it."""
+    aside = Service(service.config)
 
     async def go():
-        async with service.scope() as scope:
+        async with aside.scope() as scope:
             return await work(scope)
 
-    return service.run(go())
+    return aside.run(go())
 
 
 @pytest.fixture
@@ -305,17 +308,16 @@ def settle(client: TestClient, timeout: float = 10.0) -> None:
 
     service = client.app.state.task_runner.service
 
-    async def live() -> int:
-        async with service.scope() as scope:
-            return await scope.scalar(
-                sa.select(sa.func.count())
-                .select_from(m.Task)
-                .where(m.Task.status.in_((m.TaskStatus.queued, m.TaskStatus.running)))
-            )
+    async def live(scope) -> int:  # noqa: ANN001
+        return await scope.scalar(
+            sa.select(sa.func.count())
+            .select_from(m.Task)
+            .where(m.Task.status.in_((m.TaskStatus.queued, m.TaskStatus.running)))
+        )
 
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
-        if service.run(live()) == 0:
+        if scoped(service, live) == 0:
             return
         time.sleep(0.02)
     raise AssertionError("the task queue never went quiet")
