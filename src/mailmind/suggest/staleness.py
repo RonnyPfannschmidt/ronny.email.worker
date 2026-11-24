@@ -37,13 +37,17 @@ async def check(scope: TenantScope, suggestion: m.Suggestion) -> Freshness:
     if suggestion.message_id is None:
         return await _check_container(scope, container, suggestion)
 
-    placement = await scope.scalar(
-        sa.select(m.Placement).where(
-            m.Placement.container_id == container.id,
-            m.Placement.container_generation == suggestion.premise_container_generation,
-            m.Placement.uid == suggestion.premise_uid,
+    # Columns, not the row: loading a placement brings its message, its addresses, its
+    # folder and the account along, once per item.
+    placement = (
+        await scope.execute(
+            sa.select(m.Placement.gone_at, m.Placement.modseq, m.Placement.flags).where(
+                m.Placement.container_id == container.id,
+                m.Placement.container_generation == suggestion.premise_container_generation,
+                m.Placement.uid == suggestion.premise_uid,
+            )
         )
-    )
+    ).one_or_none()
     return _check_message(
         Premise(
             generation=suggestion.premise_container_generation,
