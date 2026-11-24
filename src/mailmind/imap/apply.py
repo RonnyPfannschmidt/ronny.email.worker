@@ -443,21 +443,28 @@ async def _update_cache(scope: TenantScope, bundle, suggestion, resulting_uid) -
         container.message_count = 0
         return
 
-    placement = await scope.scalar(
-        sa.select(m.Placement).where(
-            m.Placement.container_id == suggestion.source_container_id,
-            m.Placement.container_generation == suggestion.premise_container_generation,
-            m.Placement.uid == suggestion.premise_uid,
+    placement = (
+        await scope.execute(
+            sa.select(m.Placement.id, m.Placement.flags).where(
+                m.Placement.container_id == suggestion.source_container_id,
+                m.Placement.container_generation == suggestion.premise_container_generation,
+                m.Placement.uid == suggestion.premise_uid,
+            )
         )
-    )
+    ).one_or_none()
     if placement is None:
         return
     if bundle.operation in (m.Operation.move, m.Operation.delete):
-        placement.gone_at = dt.datetime.now(dt.UTC)
+        changed = {"gone_at": dt.datetime.now(dt.UTC)}
     elif bundle.operation is m.Operation.add_flag:
-        placement.flags = " ".join(sorted(set(placement.flags.split()) | {bundle.flag}))
+        changed = {"flags": " ".join(sorted(set(placement.flags.split()) | {bundle.flag}))}
     elif bundle.operation is m.Operation.remove_flag:
-        placement.flags = " ".join(sorted(set(placement.flags.split()) - {bundle.flag}))
+        changed = {"flags": " ".join(sorted(set(placement.flags.split()) - {bundle.flag}))}
+    else:
+        return
+    await scope.execute(
+        sa.update(m.Placement).where(m.Placement.id == placement.id).values(**changed)
+    )
 
 
 async def _record(
