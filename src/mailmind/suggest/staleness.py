@@ -37,13 +37,6 @@ async def check(scope: TenantScope, suggestion: m.Suggestion) -> Freshness:
     if suggestion.message_id is None:
         return await _check_container(scope, container, suggestion)
 
-    if container.generation != suggestion.premise_container_generation:
-        return Freshness(
-            False,
-            f"{container.name} was recreated since this was proposed, so the message it "
-            "referred to can no longer be identified",
-        )
-
     placement = await scope.scalar(
         sa.select(m.Placement).where(
             m.Placement.container_id == container.id,
@@ -51,26 +44,67 @@ async def check(scope: TenantScope, suggestion: m.Suggestion) -> Freshness:
             m.Placement.uid == suggestion.premise_uid,
         )
     )
-    if placement is None or placement.gone_at is not None:
-        return Freshness(False, f"the message has left {container.name}")
+    return _check_message(
+        Premise(
+            generation=suggestion.premise_container_generation,
+            modseq=suggestion.premise_modseq,
+            flags_hash=suggestion.premise_flags_hash,
+        ),
+        container_name=container.name,
+        container_generation=container.generation,
+        # A row that is gone and a row that never was are the same answer.
+        present=placement is not None and placement.gone_at is None,
+        modseq=placement.modseq if placement is not None else None,
+        flags=placement.flags if placement is not None else "",
+    )
 
-    if suggestion.premise_modseq is not None:
-        if placement.modseq != suggestion.premise_modseq:
+
+@attrs.frozen
+class Premise:
+    """What a message item believed when it was proposed."""
+
+    generation: int
+    modseq: int | None
+    flags_hash: str
+
+
+def _check_message(
+    premise: Premise,
+    *,
+    container_name: str,
+    container_generation: int,
+    present: bool,
+    modseq: int | None,
+    flags: str | None,
+) -> Freshness:
+    """The rule itself, on plain values, so one item and a whole queue share it."""
+    if container_generation != premise.generation:
+        return Freshness(
+            False,
+            f"{container_name} was recreated since this was proposed, so the message it "
+            "referred to can no longer be identified",
+        )
+
+    if not present:
+        return Freshness(False, f"the message has left {container_name}")
+
+    if premise.modseq is not None:
+        if modseq != premise.modseq:
             return Freshness(
                 False,
-                f"the message changed in {container.name} after this was proposed "
-                f"(flags are now: {placement.flags or 'none'})",
+                f"the message changed in {container_name} after this was proposed "
+                f"(flags are now: {flags or 'none'})",
             )
         return FRESH
 
     # No CONDSTORE on this account, so the premise is the weaker one: flags and nothing
     # else.  Changes this cannot see are exactly why the operation will report only a
     # best-effort guarantee when it applies.
-    if flags_hash(placement.flags) != suggestion.premise_flags_hash:
+    if flags_hash(flags or "") != premise.flags_hash:
         return Freshness(
             False,
-            f"the message's flags changed in {container.name} after this was proposed "
-            f"(now: {placement.flags or 'none'})",
+            f"the message's flags changed in {container_name} after this was proposed "
+            f"(now: {flags or 'none'})",
         )
     return FRESH
 
@@ -191,6 +225,65 @@ async def _close_if_nothing_survived(scope: TenantScope, bundle: m.Bundle) -> No
     )
 
 
+async def _suspect_bundles(scope: TenantScope, account_ids: set[int] | None) -> set[int]:
+    """Proposed bundles that are not plainly intact.
+
+    Intact means at least one live item, all of them message items and all of them fresh.
+    A folder item asks a different question, and a bundle with nothing live may only be
+    waiting to be closed: a sync can kill the items without closing the bundle.
+    """
+    proposed = sa.select(m.Bundle.id).where(m.Bundle.status == m.BundleStatus.proposed)
+    if account_ids is not None:
+        proposed = proposed.where(m.Bundle.account_id.in_(account_ids))
+
+    items = (
+        sa.select(
+            m.Suggestion.bundle_id,
+            m.Suggestion.message_id,
+            m.Suggestion.premise_container_generation,
+            m.Suggestion.premise_modseq,
+            m.Suggestion.premise_flags_hash,
+            m.Container.name,
+            m.Container.generation,
+            m.Placement.id.label("placement_id"),
+            m.Placement.gone_at,
+            m.Placement.modseq,
+            m.Placement.flags,
+        )
+        .join(m.Container, m.Container.id == m.Suggestion.source_container_id)
+        .outerjoin(
+            m.Placement,
+            sa.and_(
+                m.Placement.container_id == m.Suggestion.source_container_id,
+                m.Placement.container_generation == m.Suggestion.premise_container_generation,
+                m.Placement.uid == m.Suggestion.premise_uid,
+            ),
+        )
+        .where(
+            m.Suggestion.bundle_id.in_(proposed),
+            m.Suggestion.status.in_((m.SuggestionStatus.proposed, m.SuggestionStatus.accepted)),
+        )
+    )
+    alive: set[int] = set()
+    dying: set[int] = set()
+    for row in await scope.execute(items):
+        alive.add(row.bundle_id)
+        if row.message_id is None or not _check_message(
+            Premise(
+                generation=row.premise_container_generation,
+                modseq=row.premise_modseq,
+                flags_hash=row.premise_flags_hash,
+            ),
+            container_name=row.name,
+            container_generation=row.generation,
+            present=row.placement_id is not None and row.gone_at is None,
+            modseq=row.modseq,
+            flags=row.flags,
+        ):
+            dying.add(row.bundle_id)
+    return (set(await scope.all(proposed)) - alive) | dying
+
+
 async def sweep_queue(
     scope: TenantScope,
     account_ids: set[int] | None = None,
@@ -198,19 +291,18 @@ async def sweep_queue(
 ) -> int:
     """Refresh every bundle still awaiting review, and return how many closed.
 
-    Drawing the queue is the moment somebody is about to act on it, so it is also the
-    moment a bundle that quietly died should stop being offered.  Without this a bundle
-    whose messages all moved keeps its place in the list until somebody opens it, which is
-    exactly the click this is meant to save them.
+    The runner does this on its tick.  Without it a bundle whose messages all moved keeps
+    its place in the list until somebody opens it, which is exactly the click this is
+    meant to save them.
 
-    The work is one freshness check per live item of each proposed bundle.  A review queue
-    is a human queue — a handful of bundles somebody is going to read — so this is bounded
-    by what a person can get through, not by the size of the mailbox.
+    Only bundles that may have died are loaded.  A few dozen bundles of a few dozen items
+    each is an ordinary queue, and checking those one item at a time took twelve seconds.
     """
-    stmt = sa.select(m.Bundle).where(m.Bundle.status == m.BundleStatus.proposed)
-    if account_ids is not None:
-        stmt = stmt.where(m.Bundle.account_id.in_(account_ids))
     closed = 0
+    suspects = await _suspect_bundles(scope, account_ids)
+    if not suspects:
+        return closed
+    stmt = sa.select(m.Bundle).where(m.Bundle.id.in_(suspects)).order_by(m.Bundle.id)
     for bundle in await scope.all(stmt):
         await refresh_bundle(scope, bundle)
         if bundle.status is m.BundleStatus.stale:

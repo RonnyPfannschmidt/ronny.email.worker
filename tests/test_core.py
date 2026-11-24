@@ -550,13 +550,9 @@ async def test_a_bundle_nobody_decided_and_nothing_survived_closes_itself(
     assert [b for b in waiting if b["bundle_id"] == bundle.id] == []
 
 
-async def test_drawing_the_queue_retires_what_died_in_it(scope, world, backend):
-    """Somebody looking at the queue is about to act on it.
-
-    So that is the moment a dead bundle stops being offered, rather than after they open
-    it to find out. Otherwise the queue shows work that cannot be done and the only way to
-    learn that is the click this saves.
-    """
+async def test_sweeping_the_queue_retires_what_died_in_it(scope, world, backend):
+    """Otherwise the queue shows work that cannot be done, and the only way to learn that
+    is the click this saves."""
     from mailmind.suggest import staleness
 
     bundle = await _bundle(scope, world, ["newsletter"])
@@ -566,6 +562,59 @@ async def test_drawing_the_queue_retires_what_died_in_it(scope, world, backend):
     assert await staleness.sweep_queue(scope) == 1
     assert bundle.status is m.BundleStatus.stale
     assert (await views.bundle_summaries(scope, [m.BundleStatus.proposed]))["bundles"] == []
+
+
+async def test_sweeping_marks_the_item_that_died_and_keeps_the_bundle(scope, world, backend):
+    from mailmind.suggest import staleness
+
+    bundle = await _bundle(scope, world, ["newsletter", "ordinary"])
+    backend.out_of_band_move("INBOX", world["uids"]["newsletter"], "Archive")
+    await sync.sync_container(scope, world["account"], world["containers"]["INBOX"], backend)
+
+    assert await staleness.sweep_queue(scope) == 0
+    assert bundle.status is m.BundleStatus.proposed
+    assert {s.message_id: s.status for s in bundle.suggestions} == {
+        world["seed"]["newsletter"]: m.SuggestionStatus.stale,
+        world["seed"]["ordinary"]: m.SuggestionStatus.proposed,
+    }
+
+
+async def test_sweeping_closes_a_bundle_whose_items_a_sync_already_killed(
+    scope, world, backend
+):
+    """Nothing live is left to look stale, so a sweep that only looked at live items would
+    leave the bundle in the queue for good."""
+    from mailmind.suggest import staleness
+
+    bundle = await _bundle(scope, world, ["newsletter", "ordinary"])
+    backend.force_uidvalidity_change("INBOX")
+    await sync.sync_container(scope, world["account"], world["containers"]["INBOX"], backend)
+    assert bundle.status is m.BundleStatus.proposed
+
+    assert await staleness.sweep_queue(scope) == 1
+    assert bundle.status is m.BundleStatus.stale
+
+
+async def test_sweeping_an_intact_queue_costs_the_same_however_long_it_is(scope, world):
+    """It was a handful of queries per item, and twelve seconds on a real queue."""
+    from mailmind.suggest import staleness
+
+    queries = []
+    engine = scope.session.get_bind()
+    await scope.flush()
+    sa.event.listen(engine, "before_cursor_execute", lambda *args: queries.append(args[2]))
+
+    async def cost() -> int:
+        queries.clear()
+        assert await staleness.sweep_queue(scope) == 0
+        return len(queries)
+
+    await _bundle(scope, world, ["newsletter"])
+    await scope.commit()
+    short = await cost()
+    await _bundle(scope, world, [n for n in CORPUS if n != "newsletter"])
+    await scope.commit()
+    assert await cost() == short
 
 
 async def test_accepting_a_bundle_that_just_died_says_so_rather_than_refusing_forever(

@@ -1404,6 +1404,18 @@ async def test_a_rejection_can_carry_a_reason_and_is_as_easy_as_accepting(client
     assert len(backend.folders["Archive"].messages) == 0
 
 
+async def test_the_queue_still_draws_when_a_bundle_is_due_to_expire(client, service):
+    """Drawing it is a read, and expiring is the runner's: this page used to try to write
+    through a scope that refuses to, and answer 500."""
+    bundle_id = (await _propose(await Agent.connect(client)))["bundle_id"]
+    async with service.scope() as scope:
+        bundle = await scope.get(m.Bundle, bundle_id)
+        bundle.expires_at = dt.datetime.now(dt.UTC) - dt.timedelta(days=1)
+        await scope.commit()
+
+    assert (await client.get("/")).status_code == 200
+
+
 async def test_the_queue_lists_what_is_waiting(client):
     await _propose(await Agent.connect(client))
     page = (await client.get("/")).text

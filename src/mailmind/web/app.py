@@ -593,15 +593,11 @@ def create_app(
     @app.get("/", response_class=HTMLResponse)
     async def queue(request: Request):  # noqa: ANN202
         async with service.scope(readonly=True) as scope:
-            await suggest.expire_due(scope)
             header = await chrome(scope)
             current = header["current_account"]
             # None means every account, which is only reachable when there are none at all.
             here = {current["id"]} if current else None
-            # A bundle whose messages all moved on is not work anybody can do, so it stops
-            # being offered here rather than after somebody opens it to find out.
-            await staleness.sweep_queue(scope, here)
-            await scope.commit()
+            # Expiry and staleness are the runner's, once a minute: this scope cannot write.
             bundles = (
                 await views.bundle_summaries(scope, [m.BundleStatus.proposed], account_ids=here)
             )["bundles"]
