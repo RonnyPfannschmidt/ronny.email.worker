@@ -7,6 +7,16 @@
   let { csrf } = $props();
   let queue = $state(null);
   let error = $state("");
+  let picked = $state([]);
+  let reason = $state("");
+  let rejecting = $state(false);
+  let refused = $state([]);
+
+  // Only what is on the page: a bundle decided elsewhere leaves with its tick.
+  const chosen = $derived(
+    (queue?.bundles ?? []).map((each) => each.bundle_id).filter((id) => picked.includes(id)),
+  );
+  const several = (count) => `${count} bundle${count === 1 ? "" : "s"}`;
 
   const load = oneAtATime(async () => {
     try {
@@ -33,10 +43,32 @@
     }
   }
 
+  async function reject(event) {
+    event.preventDefault();
+    rejecting = true;
+    error = "";
+    try {
+      const fields = chosen.map((id) => ["bundle", id]);
+      ({ refused } = await post("/api/queue/reject", csrf, [...fields, ["reason", reason]]));
+      picked = [];
+      reason = "";
+      await load();
+    } catch (problem) {
+      error = problem.message;
+    } finally {
+      rejecting = false;
+    }
+  }
+
   onMount(() => listen(load, taskChanged, load));
 </script>
 
 <h1>Awaiting review</h1>
+{#each refused as each (each.bundle_id)}
+  <div class="banner error">
+    Not rejected: <a href="/bundle/{each.bundle_id}">bundle {each.bundle_id}</a> — {each.problem}
+  </div>
+{/each}
 {#if error}<div class="banner error">{error}</div>{/if}
 
 {#if !queue}
@@ -52,11 +84,22 @@
   {#if queue.bundles.length}
     <table>
       <thead>
-        <tr><th>What would happen</th><th>Messages</th><th>From</th><th>Why</th><th></th></tr>
+        <tr>
+          <th></th><th>What would happen</th><th>Messages</th><th>From</th><th>Why</th><th></th>
+        </tr>
       </thead>
       <tbody>
         {#each queue.bundles as bundle (bundle.bundle_id)}
           <tr>
+            <td>
+              <input
+                type="checkbox"
+                aria-label="choose bundle {bundle.bundle_id}"
+                value={bundle.bundle_id}
+                bind:group={picked}
+                disabled={rejecting}
+              />
+            </td>
             <td class="effect"><Effect {bundle} /></td>
             <td>
               {bundle.item_count}
@@ -69,6 +112,11 @@
         {/each}
       </tbody>
     </table>
+    <form class="actions" onsubmit={reject}>
+      <input bind:value={reason} placeholder="why not (optional)" size="30" />
+      <button disabled={!chosen.length || rejecting}>Reject {several(chosen.length)}</button>
+      <span class="small muted">To accept one, review it.</span>
+    </form>
   {:else}
     <p class="muted">Nothing to review{queue.account ? ` in ${queue.account}` : ""}.</p>
   {/if}

@@ -5,8 +5,12 @@ async function answer(response) {
 
 export const get = (path) => fetch(path).then(answer);
 
-export const post = (path, csrf) =>
-  fetch(path, { method: "POST", body: new URLSearchParams({ _csrf: csrf }) }).then(answer);
+/** `fields` are pairs, so that a name can be there more than once. */
+export const post = (path, csrf, fields = []) =>
+  fetch(path, {
+    method: "POST",
+    body: new URLSearchParams([["_csrf", csrf], ...fields]),
+  }).then(answer);
 
 /** Calls `onReady` on every (re)connection, so whatever was missed is read again. */
 export function listen(onReady, onTask, onQueue) {

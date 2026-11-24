@@ -614,6 +614,73 @@ async def test_a_click_still_waiting_survives_the_page_reading_again(page, bundl
     await page.get_by_text("refused, late").wait_for(timeout=5_000)
 
 
+async def test_rejecting_the_ticked_bundles_from_the_queue(page, bundle_at):
+    base, bundle_id, backend = bundle_at
+    async with another_process(backend) as scope:
+        bundle, producer = await _mine(scope, bundle_id)
+        account = await scope.get(m.Account, bundle.account_id)
+        ids = await scope.all(sa.select(m.Message.id).order_by(m.Message.id))
+
+        async def propose(summary):  # noqa: ANN001, ANN202
+            made = await suggest.propose_bundle(
+                scope,
+                producer=producer,
+                account=account,
+                operation=m.Operation.add_flag,
+                flag="\\Seen",
+                message_ids=ids[:2],
+                summary=summary,
+                reason="r",
+            )
+            await scope.commit()
+            return made
+
+        second, third = await propose("second"), await propose("third")
+        await page.goto(f"{base}/")
+        tick = lambda one: page.get_by_label(f"choose bundle {one}", exact=True)  # noqa: E731
+        await tick(second.id).check()
+        await page.evaluate("document.body.dataset.mark = 1")
+        assert await page.get_by_role("button", name="Accept").count() == 0
+
+        # What arrives is not ticked, and what is withdrawn takes its tick along.
+        await tick(third.id).check()
+        fourth = await propose("fourth")
+        await tick(fourth.id).wait_for(timeout=10_000)
+        assert not await tick(fourth.id).is_checked()
+        await page.get_by_role("button", name="Reject 2 bundles").wait_for()
+        await suggest.withdraw(scope, third, producer, "mine")
+        await scope.commit()
+
+    button = page.get_by_role("button", name="Reject 1 bundle", exact=True)
+    await button.wait_for(timeout=10_000)
+    await page.get_by_placeholder("why not").fill("not now")
+    await button.click()
+    await tick(second.id).wait_for(state="detached", timeout=10_000)
+    assert await page.get_by_text("Not rejected").count() == 0, "a withdrawn one was sent"
+    none = page.get_by_role("button", name="Reject 0 bundles")
+    assert await none.is_disabled()
+    assert await tick(fourth.id).count() == await tick(bundle_id).count() == 1
+    assert await page.evaluate("document.body.dataset.mark") == "1", "the page was replaced"
+    async with another_process(backend) as scope:
+        gone = await scope.get(m.Bundle, second.id)
+        assert (gone.status, gone.decision_reason) == (m.BundleStatus.rejected, "not now")
+    assert page.problems == []
+
+
+async def test_a_bundle_decided_before_the_reject_arrives_is_reported(page, bundle_at):
+    base, bundle_id, _ = bundle_at
+
+    async def refuse(route):  # noqa: ANN001, ANN202
+        await route.fulfill(json={"refused": [{"bundle_id": bundle_id, "problem": "too late"}]})
+
+    await page.route("**/api/queue/reject", refuse)
+    await page.goto(f"{base}/")
+    await page.get_by_label(f"choose bundle {bundle_id}").check()
+    await page.get_by_role("button", name="Reject 1 bundle").click()
+    await page.get_by_text("Not rejected").wait_for()
+    assert "too late" in await page.locator(".banner.error").inner_text()
+
+
 async def test_the_queue_says_what_is_stuck_and_what_waits_elsewhere(page, bundle_at):
     base, _, _ = bundle_at
     summary = {**BUNDLE, "item_count": 3, "stale_count": 1}
