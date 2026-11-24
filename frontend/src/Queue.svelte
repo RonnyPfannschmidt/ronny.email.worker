@@ -11,16 +11,27 @@
   let reason = $state("");
   let rejecting = $state(false);
   let refused = $state([]);
+  let held = $state([]);
 
+  const ids = (bundles) => bundles.map((each) => each.bundle_id);
+  const rows = $derived((queue?.bundles ?? []).filter((each) => !held.includes(each.bundle_id)));
   // Only what is on the page: a bundle decided elsewhere leaves with its tick.
-  const chosen = $derived(
-    (queue?.bundles ?? []).map((each) => each.bundle_id).filter((id) => picked.includes(id)),
-  );
+  const chosen = $derived(ids(rows).filter((id) => picked.includes(id)));
   const several = (count) => `${count} bundle${count === 1 ? "" : "s"}`;
+
+  function take(fresh) {
+    // Rows do not move under a pointer that is ticking them: while something is ticked,
+    // what arrives waits to be asked for.
+    const shown = ids(rows);
+    const arrived = ids(fresh.bundles).filter((id) => !shown.includes(id));
+    const ticking = ids(fresh.bundles).some((id) => chosen.includes(id));
+    held = ticking ? arrived : [];
+    queue = fresh;
+  }
 
   const load = oneAtATime(async () => {
     try {
-      queue = await get("/api/queue");
+      take(await get("/api/queue"));
       error = "";
     } catch (problem) {
       error = problem.message;
@@ -74,14 +85,7 @@
 {#if !queue}
   <p class="muted">loading</p>
 {:else}
-  {#if queue.elsewhere.length}
-    <p class="small muted">
-      Also waiting: {queue.elsewhere.map((each) => `${each.waiting} in ${each.name}`).join(", ")} —
-      bundles expire if nobody reviews them.
-    </p>
-  {/if}
-
-  {#if queue.bundles.length}
+  {#if rows.length}
     <table>
       <thead>
         <tr>
@@ -89,7 +93,7 @@
         </tr>
       </thead>
       <tbody>
-        {#each queue.bundles as bundle (bundle.bundle_id)}
+        {#each rows as bundle (bundle.bundle_id)}
           <tr>
             <td>
               <input
@@ -115,10 +119,21 @@
     <form class="actions" onsubmit={reject}>
       <input bind:value={reason} placeholder="why not (optional)" size="30" />
       <button disabled={!chosen.length || rejecting}>Reject {several(chosen.length)}</button>
+      {#if held.length}
+        <button type="button" onclick={() => (held = [])}>Show {held.length} new</button>
+      {/if}
       <span class="small muted">To accept one, review it.</span>
     </form>
   {:else}
     <p class="muted">Nothing to review{queue.account ? ` in ${queue.account}` : ""}.</p>
+  {/if}
+
+  <!-- Below the table: a line appearing above it would move the rows. -->
+  {#if queue.elsewhere.length}
+    <p class="small muted">
+      Also waiting: {queue.elsewhere.map((each) => `${each.waiting} in ${each.name}`).join(", ")} —
+      bundles expire if nobody reviews them.
+    </p>
   {/if}
 
   {#if queue.applying.length}

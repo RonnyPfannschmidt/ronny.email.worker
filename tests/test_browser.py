@@ -642,11 +642,17 @@ async def test_rejecting_the_ticked_bundles_from_the_queue(page, bundle_at):
         await page.evaluate("document.body.dataset.mark = 1")
         assert await page.get_by_role("button", name="Accept").count() == 0
 
-        # What arrives is not ticked, and what is withdrawn takes its tick along.
+        # What arrives waits, and what is withdrawn takes its tick along.
         await tick(third.id).check()
+        was = await tick(second.id).bounding_box()
         fourth = await propose("fourth")
-        await tick(fourth.id).wait_for(timeout=10_000)
+        await page.get_by_role("button", name="Show 1 new").wait_for(timeout=10_000)
+        assert await tick(fourth.id).count() == 0
+        assert await tick(second.id).bounding_box() == was, "the rows moved"
+        await page.get_by_role("button", name="Show 1 new").click()
         assert not await tick(fourth.id).is_checked()
+        fifth = await propose("fifth")
+        await page.get_by_role("button", name="Show 1 new").wait_for(timeout=10_000)
         await page.get_by_role("button", name="Reject 2 bundles").wait_for()
         await suggest.withdraw(scope, third, producer, "mine")
         await scope.commit()
@@ -659,7 +665,10 @@ async def test_rejecting_the_ticked_bundles_from_the_queue(page, bundle_at):
     assert await page.get_by_text("Not rejected").count() == 0, "a withdrawn one was sent"
     none = page.get_by_role("button", name="Reject 0 bundles")
     assert await none.is_disabled()
+    # Nothing is ticked any more, so nothing is held back.
+    await tick(fifth.id).wait_for()
     assert await tick(fourth.id).count() == await tick(bundle_id).count() == 1
+    assert await page.get_by_role("button", name="Show").count() == 0
     assert await page.evaluate("document.body.dataset.mark") == "1", "the page was replaced"
     async with another_process(backend) as scope:
         gone = await scope.get(m.Bundle, second.id)
