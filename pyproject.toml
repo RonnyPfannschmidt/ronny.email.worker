@@ -69,6 +69,16 @@ docs = [
 [tool.hatch.version]
 source = "vcs"
 
+[tool.hatch.build]
+# Built and git-ignored, so hatch has to be told it ships.
+artifacts = ["src/mailmind/web/static/app/**"]
+
+# Builds the interface for a wheel or an sdist.  Never for an editable install.
+[tool.hatch.build.hooks.custom]
+
+[tool.hatch.build.targets.sdist]
+exclude = ["frontend/node_modules"]
+
 [tool.hatch.build.targets.wheel]
 packages = ["src/mailmind"]
 

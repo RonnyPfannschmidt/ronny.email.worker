@@ -1,0 +1,11 @@
+*
+!frontend
+frontend/node_modules
+!src
+src/mailmind/web/static/app
+**/__pycache__
+!pyproject.toml
+!uv.lock
+!hatch_build.py
+!README.md
+!LICENSE

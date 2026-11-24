@@ -217,6 +217,10 @@ __marimo__/
 # Streamlit
 .streamlit/secrets.toml
 
+# The built interface: from frontend/, by npm or by the wheel build.
+node_modules/
+/src/mailmind/web/static/app/
+
 # mailmind local state — the config names a host and a username, and the database holds
 # cached mail. Neither belongs in a repository.
 mailmind.toml

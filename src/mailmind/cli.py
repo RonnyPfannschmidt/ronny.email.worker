@@ -875,12 +875,20 @@ def _watched_paths(named: tuple[str, ...]) -> list[Path]:
     return paths
 
 
+def _built_interface() -> Path:
+    from mailmind.web.next import ASSETS
+
+    return ASSETS
+
+
 async def _watch_and_exit(server, watch_paths: tuple[str, ...]) -> None:  # noqa: ANN001
     """Exit-on-change: the process is disposable, the supervisor is the restarter."""
     import watchfiles
 
     paths = _watched_paths(watch_paths)
-    async for changes in watchfiles.awatch(*paths):
+    # The built interface is read per request, so rebuilding it needs no restart.
+    ignored = watchfiles.DefaultFilter(ignore_paths=[_built_interface()])
+    async for changes in watchfiles.awatch(*paths, watch_filter=ignored):
         names = sorted({Path(changed).name for _, changed in changes})
         click.echo(
             f"source changed ({', '.join(names[:5])}) — exiting so the supervisor "

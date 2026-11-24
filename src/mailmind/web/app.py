@@ -36,6 +36,7 @@ from mailmind.mcp import server as mcp_server
 from mailmind.service import Service
 from mailmind.suggest import model as suggest
 from mailmind.suggest import staleness
+from mailmind.web import next as next_ui
 from mailmind.worker import TaskRunner
 
 TEMPLATES = Jinja2Templates(directory=str(Path(__file__).parent / "templates"))
@@ -638,6 +639,8 @@ def create_app(
                 live_tasks=live,
                 **header,
             )
+
+    next_ui.mount(app, service, render, changes, reviewer)
 
     @app.get("/bundle/{bundle_id}", response_class=HTMLResponse)
     async def bundle_page(request: Request, bundle_id: int, error: str | None = None):  # noqa: ANN202

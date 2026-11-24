@@ -1,0 +1,16 @@
+{% extends "base.html" %}
+{% block title %}review — mailmind{% endblock %}
+{% block head %}
+<meta name="turbo-visit-control" content="reload">
+{% if script %}<script type="module" src="{{ script }}"></script>{% endif %}
+{% endblock %}
+{% block content %}
+{% if script %}
+<div id="app" data-bundle="{{ bundle_id }}" data-csrf="{{ csrf }}"></div>
+<noscript>This page needs its script. <a href="/bundle/{{ bundle_id }}">The plain page</a> does not.</noscript>
+{% else %}
+<h1>The interface is not built</h1>
+<p>In a checkout: <code>cd frontend &amp;&amp; npm ci --ignore-scripts &amp;&amp; npm run build</code>,
+then reload this page. <a href="/bundle/{{ bundle_id }}">The plain page</a> works meanwhile.</p>
+{% endif %}
+{% endblock %}
