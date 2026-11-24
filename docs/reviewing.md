@@ -24,6 +24,9 @@ What is waiting, for the account you are working in. Each entry is a bundle: one
 over an enumerated list of messages, with the summary and reason its producer wrote.
 `mailmindctl status` answers the same question without a browser.
 
+Several can be ticked and rejected together, with one reason. Accepting has no such shortcut:
+it is done from the page that shows what would happen.
+
 ## A bundle
 
 The page shows the whole effect before anything happens — every message, where it is now,

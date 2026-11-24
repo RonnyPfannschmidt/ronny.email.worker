@@ -2,16 +2,17 @@
 
 The server decides everything and the browser displays it: what the pages show is here as
 data, with the changes their scripts ask for and the stream that says what happened.
-Accepting and rejecting stay ordinary forms.
+Accepting stays an ordinary form on the page of the one bundle it is about.
 """
 
 from __future__ import annotations
 
 import json
 from pathlib import Path
+from typing import Annotated
 
 import sqlalchemy as sa
-from fastapi import HTTPException, Request
+from fastapi import Form, HTTPException, Request
 from fastapi.responses import HTMLResponse, StreamingResponse
 
 from mailmind import tasks, views
@@ -112,6 +113,28 @@ def mount(app, service, render, chrome, changes, reviewer) -> None:  # noqa: ANN
                     limit=10,
                 ),
             }
+
+    @app.post("/api/queue/reject", dependencies=changes)
+    async def reject(
+        bundle: Annotated[list[int], Form()], reason: Annotated[str, Form()] = ""
+    ) -> dict:
+        """Several at once, because a rejection changes nothing in a mailbox.
+
+        There is deliberately no accepting here: that is about what its page showed.
+        """
+        refused = []
+        async with service.scope() as scope:
+            person = await reviewer(scope)
+            for bundle_id in dict.fromkeys(bundle):
+                row = await scope.get(m.Bundle, bundle_id)
+                try:
+                    if row is None:
+                        raise suggest.ProposalRefused("no such bundle")
+                    await suggest.reject(scope, row, person, reason.strip() or None)
+                except suggest.ProposalRefused as exc:
+                    refused.append({"bundle_id": bundle_id, "problem": str(exc)})
+            await scope.commit()
+        return {"refused": refused}
 
     @app.get("/api/accounts")
     async def accounts() -> dict:

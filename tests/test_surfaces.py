@@ -1421,6 +1421,40 @@ async def test_a_rejection_can_carry_a_reason_and_is_as_easy_as_accepting(client
     assert len(backend.folders["Archive"].messages) == 0
 
 
+async def test_several_bundles_are_rejected_at_once_with_one_reason(client, service, backend):
+    agent = await Agent.connect(client)
+    ids = [(await _propose(agent))["bundle_id"] for _ in range(3)]
+    response = await as_a_person(
+        client, "/api/queue/reject", data={"bundle": [*ids[:2], ids[0]], "reason": " no "}
+    )
+    assert response.json() == {"refused": []}
+    for bundle_id in ids[:2]:
+        page = await shown(client, bundle_id)
+        assert (page["status"], page["decision_reason"]) == ("rejected", "no")
+    assert [b["bundle_id"] for b in (await waiting(client))["bundles"]] == [ids[2]]
+    async with service.scope(readonly=True) as scope:
+        rejections = await scope.all(
+            sa.select(m.AuditEvent.subject_id).where(m.AuditEvent.verb == "bundle_rejected")
+        )
+    assert sorted(rejections) == ids[:2]
+    assert len(backend.folders["Archive"].messages) == 0
+
+
+async def test_what_cannot_be_rejected_is_named_and_the_rest_still_is(client):
+    agent = await Agent.connect(client)
+    decided = (await _propose(agent))["bundle_id"]
+    await as_a_person(client, f"/bundle/{decided}/reject", data={"reason": "first"})
+    still_open = (await _propose(agent))["bundle_id"]
+    response = await as_a_person(
+        client, "/api/queue/reject", data={"bundle": [decided, 999, still_open]}
+    )
+    problems = {each["bundle_id"]: each["problem"] for each in response.json()["refused"]}
+    assert set(problems) == {decided, 999}
+    assert problems[999] == "no such bundle"
+    assert (await shown(client, decided))["decision_reason"] == "first"
+    assert (await shown(client, still_open))["status"] == "rejected"
+
+
 async def test_the_queue_still_draws_when_a_bundle_is_due_to_expire(client, service):
     """Drawing it is a read, and expiring is the runner's: this page used to try to write
     through a scope that refuses to, and answer 500."""
@@ -2301,6 +2335,7 @@ async def test_excluding_answers_with_what_became_of_the_row(client):
         "bundle/{bundle_id}/exclude/{suggestion_id}",
         "account/1/sync",
         "task/1/retry",
+        "queue/reject",
     ],
 )
 async def test_the_page_script_changes_nothing_without_the_form_token(client, change):
