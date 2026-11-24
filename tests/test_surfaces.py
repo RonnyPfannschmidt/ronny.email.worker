@@ -18,9 +18,9 @@ import secrets
 from urllib.parse import parse_qs, urlparse
 
 import attrs
+import httpx
 import pytest
 import sqlalchemy as sa
-from fastapi.testclient import TestClient
 
 from mailmind import views
 from mailmind.config import AccountConfig, Config, ConfigError, Limits, Login
@@ -41,22 +41,6 @@ from tests.targets.fake import FakeBackend
 TOKEN = "test-token-for-opencode"
 
 
-def scoped(service, work):
-    """One scope's worth of async setup or assertions, on a loop of its own.
-
-    These tests drive the app through TestClient, which brings its own loop — so the
-    tests stay sync and dip into the database the same way the CLI does: through an
-    engine of their own.  Sharing the app's pool while its loop is live can wait forever
-    on a lock the other loop holds, and ``run`` disposes the pool underneath it."""
-    aside = Service(service.config)
-
-    async def go():
-        async with aside.scope() as scope:
-            return await work(scope)
-
-    return aside.run(go())
-
-
 @pytest.fixture
 def backend():
     backend = FakeBackend()
@@ -69,10 +53,24 @@ def backend():
 
 
 @pytest.fixture
-def service(tmp_path, backend):
+async def make_service():
+    """Services whose pools are handed back before the test's loop goes."""
+    made = []
+
+    def make(*args, **kwargs) -> Service:
+        made.append(Service(*args, **kwargs))
+        return made[-1]
+
+    yield make
+    for service in made:
+        await service.dispose()
+
+
+@pytest.fixture
+async def service(tmp_path, backend, make_service):
     url = f"sqlite:///{tmp_path / 'mm.db'}"
     upgrade_to_head(url)
-    service = Service(
+    service = make_service(
         Config(
             database_url=url,
             limits=Limits(max_messages_per_request=3),
@@ -87,7 +85,7 @@ def service(tmp_path, backend):
         backend_factory=lambda _config: backend,
     )
 
-    async def _seed(scope):
+    async with service.scope() as scope:
         account = scope.add(
             m.Account(name="test", host="h", username="u", password_url="env://X")
         )
@@ -109,8 +107,6 @@ def service(tmp_path, backend):
         for container in await sync.discover_containers(scope, account, backend):
             await sync.sync_container(scope, account, container, backend)
         await scope.commit()
-
-    scoped(service, _seed)
     return service
 
 
@@ -122,29 +118,72 @@ SESSION_KEY = "test-session-key-for-the-reviewer"
 CSRF = csrf_token(SESSION_KEY)
 
 
-def opened(app, base_url: str = "http://127.0.0.1:8765") -> TestClient:
+class Browser(httpx.AsyncClient):
+    """Whoever is at the other end of the HTTP, on the same loop as the app itself."""
+
+    def __init__(self, app, base_url: str = "http://127.0.0.1:8765") -> None:  # noqa: ANN001
+        # A host the MCP endpoint's rebinding protection accepts.
+        super().__init__(
+            transport=httpx.ASGITransport(app=app), base_url=base_url, follow_redirects=True
+        )
+        self.app = app
+
+
+@contextlib.asynccontextmanager
+async def running(app):  # noqa: ANN001, ANN201
+    """The app's lifespan, entered and left by one task.
+
+    A fixture's setup and teardown are different tasks, and a task group refuses to be
+    left by a task that did not enter it.
+    """
+    started = asyncio.get_running_loop().create_future()
+    stopping = asyncio.Event()
+
+    async def live() -> None:
+        async with app.router.lifespan_context(app):
+            started.set_result(None)
+            await stopping.wait()
+
+    task = asyncio.create_task(live())
+    await asyncio.wait({task, started}, return_when=asyncio.FIRST_COMPLETED)
+    if not started.done():
+        await task
+    try:
+        yield
+    finally:
+        stopping.set()
+        await task
+
+
+@contextlib.asynccontextmanager
+async def served(app, base_url: str = "http://127.0.0.1:8765"):  # noqa: ANN001, ANN201
+    """A running app, and somebody who has found the port and nothing else."""
+    async with running(app), Browser(app, base_url) as browser:
+        yield browser
+
+
+@contextlib.asynccontextmanager
+async def opened(app, base_url: str = "http://127.0.0.1:8765"):  # noqa: ANN001, ANN201
     """A client that has followed the link, the way somebody starting this would.
 
     The cookie sticks to the client afterwards, so every test past this point is a person
     with the review UI open rather than something that found the port.
     """
-    client = TestClient(app, base_url=base_url)
-    client.get(f"/?{SESSION_KEY_PARAM}={SESSION_KEY}", follow_redirects=True)
-    return client
+    async with served(app, base_url) as browser:
+        (await browser.get(f"/?{SESSION_KEY_PARAM}={SESSION_KEY}")).raise_for_status()
+        yield browser
 
 
 @pytest.fixture
-def client(service):
-    # A host the MCP endpoint's rebinding protection accepts.
-    app = create_app(service, session_key=SESSION_KEY)
-    with opened(app) as client:
+async def client(service):
+    async with opened(create_app(service, session_key=SESSION_KEY)) as client:
         yield client
 
 
 class Agent:
     """A minimal MCP client over streamable HTTP."""
 
-    def __init__(self, client: TestClient, token: str | None = TOKEN) -> None:
+    def __init__(self, client: Browser, token: str | None) -> None:
         self.client = client
         self.headers = {
             "Accept": "application/json, text/event-stream",
@@ -153,11 +192,16 @@ class Agent:
         if token:
             self.headers["Authorization"] = f"Bearer {token}"
         self._id = 0
-        self._initialise()
 
-    def _post(self, method: str, params: dict | None = None) -> dict:
+    @classmethod
+    async def connect(cls, client: Browser, token: str | None = TOKEN) -> Agent:
+        agent = cls(client, token)
+        await agent._initialise()
+        return agent
+
+    async def _post(self, method: str, params: dict | None = None) -> dict:
         self._id += 1
-        response = self.client.post(
+        response = await self.client.post(
             "/mcp/",
             headers=self.headers,
             json={
@@ -179,8 +223,8 @@ class Agent:
 
         return json.loads(body) if body else {}
 
-    def _initialise(self) -> None:
-        self._post(
+    async def _initialise(self) -> None:
+        await self._post(
             "initialize",
             {
                 "protocolVersion": "2025-06-18",
@@ -188,17 +232,17 @@ class Agent:
                 "clientInfo": {"name": "test", "version": "0"},
             },
         )
-        self.client.post(
+        await self.client.post(
             "/mcp/",
             headers=self.headers,
             json={"jsonrpc": "2.0", "method": "notifications/initialized"},
         )
 
-    def tools(self) -> list[str]:
-        return [t["name"] for t in self._post("tools/list")["result"]["tools"]]
+    async def tools(self) -> list[str]:
+        return [t["name"] for t in (await self._post("tools/list"))["result"]["tools"]]
 
-    def call(self, name: str, **arguments) -> dict:
-        result = self._post("tools/call", {"name": name, "arguments": arguments})
+    async def call(self, name: str, **arguments) -> dict:
+        result = await self._post("tools/call", {"name": name, "arguments": arguments})
         if "error" in result:
             raise AssertionError(result["error"])
         payload = result["result"]
@@ -222,16 +266,16 @@ class Agent:
         "summarize_lists": "lists",
     }
 
-    def rows(self, name: str, **arguments) -> list:
+    async def rows(self, name: str, **arguments) -> list:
         """A listing's rows, with the envelope checked on the way past rather than skipped.
 
         Every listing answers in one envelope, and a surface that quietly stopped saying
         what it had left out would otherwise pass every test that only wanted the rows.
         """
-        return self.unwrap(self.call(name, **arguments), self.ROWS[name])
+        return self.unwrap(await self.call(name, **arguments), self.ROWS[name])
 
-    def read_rows(self, uri: str, kind: str) -> list:
-        return self.unwrap(self.read(uri), kind)
+    async def read_rows(self, uri: str, kind: str) -> list:
+        return self.unwrap(await self.read(uri), kind)
 
     @staticmethod
     def unwrap(answer: dict, kind: str) -> list:
@@ -242,19 +286,19 @@ class Agent:
         assert answer["truncated"] is (answer["next_cursor"] is not None)
         return answer[kind]
 
-    def prompts(self) -> list[str]:
-        return [p["name"] for p in self._post("prompts/list")["result"]["prompts"]]
+    async def prompts(self) -> list[str]:
+        return [p["name"] for p in (await self._post("prompts/list"))["result"]["prompts"]]
 
-    def prompt(self, name: str, arguments: dict | None = None) -> str:
-        result = self._post("prompts/get", {"name": name, "arguments": arguments or {}})
+    async def prompt(self, name: str, arguments: dict | None = None) -> str:
+        result = await self._post("prompts/get", {"name": name, "arguments": arguments or {}})
         if "error" in result:
             raise AssertionError(result["error"])
         return "".join(message["content"]["text"] for message in result["result"]["messages"])
 
-    def read(self, uri: str):  # noqa: ANN201
+    async def read(self, uri: str):  # noqa: ANN201
         import json
 
-        result = self._post("resources/read", {"uri": uri})
+        result = await self._post("resources/read", {"uri": uri})
         if "error" in result:
             raise AssertionError(result["error"])
         return json.loads(result["result"]["contents"][0]["text"])
@@ -264,7 +308,7 @@ class ToolRefused(Exception):
     pass
 
 
-def as_a_person(client: TestClient, path: str, **kwargs):  # noqa: ANN201
+async def as_a_person(client: Browser, path: str, **kwargs):  # noqa: ANN201
     """POST the way a page this service served does: same-origin, carrying the form token.
 
     The review UI refuses anything else — the session cookie authenticates, and these are
@@ -277,50 +321,52 @@ def as_a_person(client: TestClient, path: str, **kwargs):  # noqa: ANN201
     headers.update(kwargs.pop("headers", {}))
     data = {"_csrf": CSRF}
     data.update(kwargs.pop("data", {}) or {})
-    return client.post(path, headers=headers, data=data, **kwargs)
+    return await client.post(path, headers=headers, data=data, **kwargs)
 
 
-def accepting(client: TestClient, bundle_id: int, **kwargs):  # noqa: ANN201
+async def accepting(client: Browser, bundle_id: int, **kwargs):  # noqa: ANN201
     """Accept the way a person does: from the page, carrying what the page showed.
 
     The accept form sends ``reviewed_through`` so that accepting means the list that was
     read rather than whatever the bundle holds when the form arrives.  A test that posts
     without it is a test of the refusal, not of accepting.
     """
-    page = client.get(f"/bundle/{bundle_id}").text
+    page = (await client.get(f"/bundle/{bundle_id}")).text
     shown = re.search(r'name="reviewed_through" value="(\d+)"', page)
     data = {"reviewed_through": shown.group(1) if shown else "0"}
     data.update(kwargs.pop("data", {}))
-    response = as_a_person(
+    response = await as_a_person(
         client, f"/bundle/{bundle_id}/accept", data=data, follow_redirects=True, **kwargs
     )
-    settle(client)
+    await settle(client)
     return response
 
 
-def settle(client: TestClient, timeout: float = 10.0) -> None:
+async def settle(client: Browser, timeout: float = 10.0) -> None:
     """Wait for the app's own runner to work the queue dry.
 
     Accepting enqueues; the lifespan's dispatcher applies. Tests that assert the effect
     wait for the queue rather than sleeping a guess.
     """
-    import time
-
-    service = client.app.state.task_runner.service
-
-    async def live(scope) -> int:  # noqa: ANN001
-        return await scope.scalar(
-            sa.select(sa.func.count())
-            .select_from(m.Task)
-            .where(m.Task.status.in_((m.TaskStatus.queued, m.TaskStatus.running)))
-        )
-
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        if scoped(service, live) == 0:
-            return
-        time.sleep(0.02)
-    raise AssertionError("the task queue never went quiet")
+    runner = client.app.state.task_runner
+    unfinished = (
+        sa.select(sa.func.count())
+        .select_from(m.Task)
+        .where(m.Task.status.in_((m.TaskStatus.queued, m.TaskStatus.running)))
+    )
+    # Subscribed before the first look, so a task finishing in between is not missed.
+    events = runner.hub.subscribe()
+    try:
+        async with asyncio.timeout(timeout):
+            while True:
+                async with runner.service.scope(readonly=True) as scope:
+                    if await scope.scalar(unfinished) == 0:
+                        return
+                await events.get()
+    except TimeoutError:
+        raise AssertionError("the task queue never went quiet") from None
+    finally:
+        runner.hub.unsubscribe(events)
 
 
 # ------------------------------------------------------------------ the surface
@@ -354,51 +400,53 @@ AGENT_TOOLS = {
 AGENT_PROMPTS = {"triage_mailbox", "assess_message", "hand_over"}
 
 
-def test_the_prompts_carry_the_guardrails_rather_than_leaving_them_to_luck(client):
+async def test_the_prompts_carry_the_guardrails_rather_than_leaving_them_to_luck(client):
     """05 asks what an agent needs to be useful here. These are the answer so far.
 
     They exist because the rules that matter — start with the shape, treat content as
     data, keep a bundle readable, say where to review — are properties of how the surface
     is used, and a tool description is a bad place to put a workflow.
     """
-    agent = Agent(client)
-    assert set(agent.prompts()) == AGENT_PROMPTS
+    agent = await Agent.connect(client)
+    assert set(await agent.prompts()) == AGENT_PROMPTS
 
     for name, arguments in [
         ("triage_mailbox", {"container_id": "1"}),
         ("assess_message", {"message_id": "1"}),
         ("hand_over", {}),
     ]:
-        text = agent.prompt(name, arguments)
+        text = await agent.prompt(name, arguments)
         # Every one of them, because a client picks one and never sees the others.
         assert "cannot change this mailbox" in text
         assert "DATA" in text
         assert "not given the key" in text, name
 
-    assert "summarize_senders" in agent.prompt("triage_mailbox", {"container_id": "1"})
-    assert "Do not propose" in agent.prompt("assess_message", {"message_id": "1"})
-    handover = agent.prompt("hand_over", {})
+    assert "summarize_senders" in await agent.prompt("triage_mailbox", {"container_id": "1"})
+    assert "Do not propose" in await agent.prompt("assess_message", {"message_id": "1"})
+    handover = await agent.prompt("hand_over", {})
     assert "local deployment" in handover
     assert "sandboxed" in handover
 
 
-def test_no_prompt_carries_the_key(client):
+async def test_no_prompt_carries_the_key(client):
     """They are text the model is handed, so they are the obvious place to leak it."""
-    agent = Agent(client)
+    agent = await Agent.connect(client)
     everything = "".join(
-        agent.prompt(name, args)
-        for name, args in [
-            ("triage_mailbox", {"container_id": "1"}),
-            ("assess_message", {"message_id": "1"}),
-            ("hand_over", {}),
+        [
+            await agent.prompt(name, args)
+            for name, args in [
+                ("triage_mailbox", {"container_id": "1"}),
+                ("assess_message", {"message_id": "1"}),
+                ("hand_over", {}),
+            ]
         ]
     )
     assert SESSION_KEY not in everything
 
 
-def test_the_agent_surface_is_exactly_look_and_say(client):
+async def test_the_agent_surface_is_exactly_look_and_say(client):
     """Not a permission it lacks — a capability absent from this side of the service."""
-    assert set(Agent(client).tools()) == AGENT_TOOLS
+    assert set(await (await Agent.connect(client)).tools()) == AGENT_TOOLS
     assert "apply" not in [c.value for c in m.Capability]
 
 
@@ -432,23 +480,21 @@ def test_the_mcp_module_does_not_import_the_applier():
 NO_GRANT = ("grant", "invalid_token")
 
 
-def test_without_a_token_there_is_no_view_at_all(client):
-    agent = Agent(client, token=None)
+async def test_without_a_token_there_is_no_view_at_all(client):
+    agent = await Agent.connect(client, token=None)
     try:
-        agent.rows("list_accounts")
+        await agent.rows("list_accounts")
     except (ToolRefused, AssertionError) as exc:
         assert any(wording in str(exc).lower() for wording in NO_GRANT), exc
     else:
         raise AssertionError("an unauthenticated caller got a view")
 
 
-def test_an_agent_sees_only_the_accounts_its_grant_covers(client, service):
-    async def _work(scope):
+async def test_an_agent_sees_only_the_accounts_its_grant_covers(client, service):
+    async with service.scope() as scope:
         scope.add(m.Account(name="other", host="h", username="u2", password_url="env://Y"))
         await scope.commit()
-
-    scoped(service, _work)
-    accounts = Agent(client).rows("list_accounts")
+    accounts = await (await Agent.connect(client)).rows("list_accounts")
     assert [a["name"] for a in accounts] == ["test"]
 
 
@@ -466,7 +512,7 @@ OTHER_MAIL = (
 
 
 @pytest.fixture
-def other_account(service):
+async def other_account(service):
     """A second account of the same tenant, which the grant does not cover.
 
     Tenancy is held below every query, so this is the boundary the loader criteria say
@@ -480,7 +526,7 @@ def other_account(service):
     elsewhere.add_folder("Archive", special_use="archive")
     elsewhere.add_message("INBOX", OTHER_MAIL)
 
-    async def _work(scope):
+    async with service.scope() as scope:
         account = scope.add(
             m.Account(name="other", host="h", username="u2", password_url="env://Y")
         )
@@ -521,10 +567,8 @@ def other_account(service):
             "suggestion_id": suggestion_id,
         }
 
-    return scoped(service, _work)
 
-
-def test_a_grant_expiry_is_honoured_rather_than_taking_the_endpoint_down(client, service):
+async def test_a_grant_expiry_is_honoured_rather_than_taking_the_endpoint_down(client, service):
     """An expiry used to be a TypeError, not an expiry.
 
     SQLite has no offset, so an aware ``expires_at`` was written without one and read back
@@ -532,33 +576,35 @@ def test_a_grant_expiry_is_honoured_rather_than_taking_the_endpoint_down(client,
     before any tool runs, so the first grant given an expiry would have broken every
     request rather than only its own.
     """
-    assert Agent(client).rows("list_accounts"), "a grant with no expiry was refused"
+    assert await (await Agent.connect(client)).rows("list_accounts"), (
+        "a grant with no expiry was refused"
+    )
 
-    def set_expiry(delta: dt.timedelta) -> None:
-        async def _work(scope):
+    async def set_expiry(delta: dt.timedelta) -> None:
+        async with service.scope() as scope:
             grant = await scope.scalar(sa.select(m.Grant))
             grant.expires_at = dt.datetime.now(dt.UTC) + delta
             await scope.commit()
 
-        scoped(service, _work)
+    await set_expiry(dt.timedelta(hours=1))
+    assert await (await Agent.connect(client)).rows("list_accounts"), (
+        "a grant that had not expired was refused"
+    )
 
-    set_expiry(dt.timedelta(hours=1))
-    assert Agent(client).rows("list_accounts"), "a grant that had not expired was refused"
-
-    set_expiry(-dt.timedelta(seconds=1))
+    await set_expiry(-dt.timedelta(seconds=1))
     with pytest.raises((ToolRefused, AssertionError)) as refused:
-        Agent(client).rows("list_accounts")
+        await (await Agent.connect(client)).rows("list_accounts")
     assert any(wording in str(refused.value).lower() for wording in NO_GRANT), refused.value
 
 
-def test_an_account_outside_the_grant_is_absent_from_every_tool(client, other_account):
+async def test_an_account_outside_the_grant_is_absent_from_every_tool(client, other_account):
     """Not only from the ones that take an account id.
 
     ``list_accounts`` was the only place this was ever asserted, and every tool that
     takes a message or a bundle id reached straight past it: a grant covering one account
     could read another account's mail by number.
     """
-    agent = Agent(client)
+    agent = await Agent.connect(client)
 
     for call in (
         lambda: agent.rows("list_containers", account_id=other_account["account_id"]),
@@ -578,55 +624,55 @@ def test_an_account_outside_the_grant_is_absent_from_every_tool(client, other_ac
         ),
     ):
         with pytest.raises(ToolRefused) as refused:
-            call()
+            await call()
         assert "no " in str(refused.value)
 
 
-def test_an_account_outside_the_grant_is_absent_from_search_and_resources(
+async def test_an_account_outside_the_grant_is_absent_from_search_and_resources(
     client, other_account
 ):
-    agent = Agent(client)
+    agent = await Agent.connect(client)
 
-    unnarrowed = agent.call("search_messages", query="Zorblatt")
+    unnarrowed = await agent.call("search_messages", query="Zorblatt")
     assert unnarrowed["messages"] == [], "an unnarrowed search saw another account's mail"
 
     with pytest.raises(AssertionError):
-        agent.read(f"mailmind://bundle/{other_account['bundle_id']}")
+        await agent.read(f"mailmind://bundle/{other_account['bundle_id']}")
     with pytest.raises(AssertionError):
-        agent.read(f"mailmind://suggestion/{other_account['suggestion_id']}")
+        await agent.read(f"mailmind://suggestion/{other_account['suggestion_id']}")
 
-    open_bundles = agent.read_rows("mailmind://bundles/open", "bundles")
+    open_bundles = await agent.read_rows("mailmind://bundles/open", "bundles")
     assert other_account["bundle_id"] not in [b["bundle_id"] for b in open_bundles]
 
 
-def test_observation_is_bounded_and_says_so(client):
-    agent = Agent(client)
-    account = agent.rows("list_accounts")[0]
+async def test_observation_is_bounded_and_says_so(client):
+    agent = await Agent.connect(client)
+    account = (await agent.rows("list_accounts"))[0]
     inbox = next(
         c
-        for c in agent.rows("list_containers", account_id=account["id"])
+        for c in await agent.rows("list_containers", account_id=account["id"])
         if c["name"] == "INBOX"
     )
-    result = agent.call("list_messages", container_id=inbox["id"], limit=100)
+    result = await agent.call("list_messages", container_id=inbox["id"], limit=100)
     assert result["returned"] == 3  # the configured cap, not the 100 asked for
     assert result["truncated"] is True
     assert result["total_matching"] == len(CORPUS)
     assert "summarize_senders" in result["note"]
 
 
-def test_a_listing_pages_to_the_end_over_the_wire(client):
+async def test_a_listing_pages_to_the_end_over_the_wire(client):
     """The cap here is three, and the corpus is larger, so this pages or it sees nothing."""
-    agent = Agent(client)
-    account = agent.rows("list_accounts")[0]
+    agent = await Agent.connect(client)
+    account = (await agent.rows("list_accounts"))[0]
     inbox = next(
         c
-        for c in agent.rows("list_containers", account_id=account["id"])
+        for c in await agent.rows("list_containers", account_id=account["id"])
         if c["name"] == "INBOX"
     )
 
     seen, cursor, pages = [], None, 0
     while True:
-        answer = agent.call("list_messages", container_id=inbox["id"], cursor=cursor)
+        answer = await agent.call("list_messages", container_id=inbox["id"], cursor=cursor)
         seen.extend(row["message_id"] for row in answer["messages"])
         pages += 1
         assert pages < 50
@@ -638,7 +684,7 @@ def test_a_listing_pages_to_the_end_over_the_wire(client):
     assert len(seen) == len(set(seen)) == len(CORPUS)
 
 
-def test_the_listing_resources_stay_listable_as_well_as_pageable(client):
+async def test_the_listing_resources_stay_listable_as_well_as_pageable(client):
     """Adding a cursor must not hide a resource.
 
     A template is returned by `resources/templates/list` and not by `resources/list`, so
@@ -646,8 +692,8 @@ def test_the_listing_resources_stay_listable_as_well_as_pageable(client):
     enumerates resources to find out what is there would have found nothing at all. Each
     is registered both ways, and both ways run the same body.
     """
-    agent = Agent(client)
-    listed = {r["uri"] for r in agent._post("resources/list")["result"]["resources"]}
+    agent = await Agent.connect(client)
+    listed = {r["uri"] for r in (await agent._post("resources/list"))["result"]["resources"]}
     assert {
         "mailmind://accounts",
         "mailmind://bundles/open",
@@ -656,7 +702,7 @@ def test_the_listing_resources_stay_listable_as_well_as_pageable(client):
 
     templates = {
         t["uriTemplate"]
-        for t in agent._post("resources/templates/list")["result"]["resourceTemplates"]
+        for t in (await agent._post("resources/templates/list"))["result"]["resourceTemplates"]
     }
     assert {
         "mailmind://accounts{?cursor}",
@@ -667,21 +713,21 @@ def test_the_listing_resources_stay_listable_as_well_as_pageable(client):
     } <= templates
 
 
-def test_a_resource_pages_through_its_uri(client):
+async def test_a_resource_pages_through_its_uri(client):
     """A resource read is one URI, so its cursor rides in the URI.
 
     `{?cursor}` is an optional RFC 6570 query variable, so the plain URI and the paged one
     are the same registration and a client that never pages is unaffected.
     """
-    agent = Agent(client)
-    account = agent.read_rows("mailmind://accounts", "accounts")[0]
-    first = agent.read(f"mailmind://containers/{account['id']}")
+    agent = await Agent.connect(client)
+    account = (await agent.read_rows("mailmind://accounts", "accounts"))[0]
+    first = await agent.read(f"mailmind://containers/{account['id']}")
     assert first["returned"] <= 3
 
     seen = list(first["containers"])
     cursor = first["next_cursor"]
     while cursor:
-        answer = agent.read(f"mailmind://containers/{account['id']}?cursor={cursor}")
+        answer = await agent.read(f"mailmind://containers/{account['id']}?cursor={cursor}")
         seen.extend(answer["containers"])
         cursor = answer["next_cursor"]
 
@@ -689,18 +735,18 @@ def test_a_resource_pages_through_its_uri(client):
     assert names == ["Archive", "INBOX", "Trash"]
 
 
-def test_a_cursor_from_another_request_is_refused_not_answered(client):
+async def test_a_cursor_from_another_request_is_refused_not_answered(client):
     """Answering it from a position that means nothing in the new question would be
     silent, and silently wrong."""
-    agent = Agent(client)
-    account = agent.rows("list_accounts")[0]
-    containers = agent.rows("list_containers", account_id=account["id"])
+    agent = await Agent.connect(client)
+    account = (await agent.rows("list_accounts"))[0]
+    containers = await agent.rows("list_containers", account_id=account["id"])
     inbox = next(c for c in containers if c["name"] == "INBOX")
-    first = agent.call("list_messages", container_id=inbox["id"])
+    first = await agent.call("list_messages", container_id=inbox["id"])
     assert first["next_cursor"]
 
     with pytest.raises(ToolRefused, match="different request"):
-        agent.call(
+        await agent.call(
             "list_messages",
             container_id=inbox["id"],
             cursor=first["next_cursor"],
@@ -708,22 +754,22 @@ def test_a_cursor_from_another_request_is_refused_not_answered(client):
         )
 
 
-def test_a_date_window_cuts_where_it_says_it_does(client):
+async def test_a_date_window_cuts_where_it_says_it_does(client):
     """Bound as a bare string these were compared to SQLite's datetime text.
 
     ``2026-08-19T09:00:00`` sorts after ``2026-08-19 09:00:00``, so ``before`` used to
     include the message sitting exactly on the boundary instead of excluding it.
     """
-    agent = Agent(client)
-    account = agent.rows("list_accounts")[0]
+    agent = await Agent.connect(client)
+    account = (await agent.rows("list_accounts"))[0]
     inbox = next(
         c
-        for c in agent.rows("list_containers", account_id=account["id"])
+        for c in await agent.rows("list_containers", account_id=account["id"])
         if c["name"] == "INBOX"
     )
 
-    def window(**kwargs):
-        return agent.call("list_messages", container_id=inbox["id"], **kwargs)
+    async def window(**kwargs):
+        return await agent.call("list_messages", container_id=inbox["id"], **kwargs)
 
     # The corpus starts at 2026-08-17 09:00Z with two messages before the 19th, which is a
     # real message sitting exactly on the boundary below. Everything else is counted
@@ -731,54 +777,56 @@ def test_a_date_window_cuts_where_it_says_it_does(client):
     # one-file change.
     older = 2
     boundary = "2026-08-19T09:00:00Z"
-    assert window(before=boundary)["total_matching"] == older, "before must exclude its edge"
-    assert window(since=boundary)["total_matching"] == len(CORPUS) - older, (
+    assert (await window(before=boundary))["total_matching"] == older, (
+        "before must exclude its edge"
+    )
+    assert (await window(since=boundary))["total_matching"] == len(CORPUS) - older, (
         "since must include its edge"
     )
 
     # A bare date means midnight, so the whole of the 19th is still to come.
-    assert window(before="2026-08-19")["total_matching"] == older
-    assert window(since="2026-08-19")["total_matching"] == len(CORPUS) - older
+    assert (await window(before="2026-08-19"))["total_matching"] == older
+    assert (await window(since="2026-08-19"))["total_matching"] == len(CORPUS) - older
 
     # An offset is honoured rather than ignored: 11:00+02:00 is 09:00Z.
-    assert window(before="2026-08-19T11:00:00+02:00")["total_matching"] == 2
+    assert (await window(before="2026-08-19T11:00:00+02:00"))["total_matching"] == 2
 
     with pytest.raises(ToolRefused) as refused:
-        window(before="last tuesday")
+        await window(before="last tuesday")
     assert "ISO 8601" in str(refused.value)
 
 
-def test_summarising_senders_is_one_call_not_an_enumeration(client):
-    agent = Agent(client)
-    account = agent.rows("list_accounts")[0]
+async def test_summarising_senders_is_one_call_not_an_enumeration(client):
+    agent = await Agent.connect(client)
+    account = (await agent.rows("list_accounts"))[0]
     inbox = next(
         c
-        for c in agent.rows("list_containers", account_id=account["id"])
+        for c in await agent.rows("list_containers", account_id=account["id"])
         if c["name"] == "INBOX"
     )
-    summary = agent.call("summarize_senders", container_id=inbox["id"])
+    summary = await agent.call("summarize_senders", container_id=inbox["id"])
     # Bounded like every other observation, and by the same configured limit: this fixture
     # allows three, so what comes back is three of nine and says so.
     assert summary["total_matching"] == len(_corpus_senders())
     senders = summary["senders"]
     assert all(s["count"] >= 1 for s in senders)
     assert {s["from_address"] for s in senders} <= _corpus_senders()
-    lists = agent.call("summarize_lists", container_id=inbox["id"])
+    lists = await agent.call("summarize_lists", container_id=inbox["id"])
     assert [entry["list_id"] for entry in lists["lists"]] == ["Weekly <weekly.list.example>"]
     assert lists["lists"][0]["has_unsubscribe"] is True
 
 
-def test_a_summary_that_leaves_something_out_says_how_much(client):
+async def test_a_summary_that_leaves_something_out_says_how_much(client):
     """05 again: an observation must never look complete when it is not, and summarising
     is an observation. It used to be the one that did not say."""
-    agent = Agent(client)
-    account = agent.rows("list_accounts")[0]
+    agent = await Agent.connect(client)
+    account = (await agent.rows("list_accounts"))[0]
     inbox = next(
         c
-        for c in agent.rows("list_containers", account_id=account["id"])
+        for c in await agent.rows("list_containers", account_id=account["id"])
         if c["name"] == "INBOX"
     )
-    summary = agent.call("summarize_senders", container_id=inbox["id"], limit=2)
+    summary = await agent.call("summarize_senders", container_id=inbox["id"], limit=2)
     assert summary["returned"] == 2
     assert summary["total_matching"] > 2
     assert summary["truncated"] is True
@@ -792,23 +840,23 @@ def _corpus_senders() -> set[str]:
     return {parse_message(raw).from_address for raw in CORPUS.values()}
 
 
-def test_a_message_arrives_marked_as_data(client):
-    agent = Agent(client)
-    account = agent.rows("list_accounts")[0]
+async def test_a_message_arrives_marked_as_data(client):
+    agent = await Agent.connect(client)
+    account = (await agent.rows("list_accounts"))[0]
     inbox = next(
         c
-        for c in agent.rows("list_containers", account_id=account["id"])
+        for c in await agent.rows("list_containers", account_id=account["id"])
         if c["name"] == "INBOX"
     )
-    messages = agent.call("list_messages", container_id=inbox["id"])["messages"]
-    detail = agent.call("get_message", message_id=messages[0]["message_id"])
+    messages = (await agent.call("list_messages", container_id=inbox["id"]))["messages"]
+    detail = await agent.call("get_message", message_id=messages[0]["message_id"])
     assert "data" in detail["content_warning"]
     assert detail["assessment"]["assessment"][0]["origin"] == "mechanical"
 
 
-def test_search_is_served_from_the_local_cache(client):
-    agent = Agent(client)
-    result = agent.call("search_messages", query="Lunch")
+async def test_search_is_served_from_the_local_cache(client):
+    agent = await Agent.connect(client)
+    result = await agent.call("search_messages", query="Lunch")
     # Both the original and the spoofed reply to it.
     assert result["returned"] == 2
     assert all("Lunch" in msg["subject"] for msg in result["messages"])
@@ -817,12 +865,14 @@ def test_search_is_served_from_the_local_cache(client):
 # -------------------------------------------------------- proposing and review
 
 
-def test_an_agent_can_propose_from_a_search_without_listing_the_messages_first(client):
+async def test_an_agent_can_propose_from_a_search_without_listing_the_messages_first(client):
     """The point of the whole thing: no paging a mailing list into a list of ids."""
-    agent = Agent(client)
-    account = agent.rows("list_accounts")[0]
-    containers = {c["name"]: c for c in agent.rows("list_containers", account_id=account["id"])}
-    proposed = agent.call(
+    agent = await Agent.connect(client)
+    account = (await agent.rows("list_accounts"))[0]
+    containers = {
+        c["name"]: c for c in await agent.rows("list_containers", account_id=account["id"])
+    }
+    proposed = await agent.call(
         "propose_bundle",
         account_id=account["id"],
         operation="move",
@@ -837,12 +887,14 @@ def test_an_agent_can_propose_from_a_search_without_listing_the_messages_first(c
     assert "Nothing has changed in the mailbox" in proposed["note"]
 
 
-def test_naming_the_messages_and_a_query_at_once_is_refused_on_the_agent_surface(client):
-    agent = Agent(client)
-    account = agent.rows("list_accounts")[0]
-    containers = {c["name"]: c for c in agent.rows("list_containers", account_id=account["id"])}
+async def test_naming_the_messages_and_a_query_at_once_is_refused_on_the_agent_surface(client):
+    agent = await Agent.connect(client)
+    account = (await agent.rows("list_accounts"))[0]
+    containers = {
+        c["name"]: c for c in await agent.rows("list_containers", account_id=account["id"])
+    }
     with pytest.raises(ToolRefused, match="not both"):
-        agent.call(
+        await agent.call(
             "propose_bundle",
             account_id=account["id"],
             operation="move",
@@ -854,14 +906,14 @@ def test_naming_the_messages_and_a_query_at_once_is_refused_on_the_agent_surface
         )
 
 
-def test_an_agent_told_a_query_was_narrowed_is_told_by_how_much(client, service, backend):
+async def test_an_agent_told_a_query_was_narrowed_is_told_by_how_much(client, service, backend):
     """05: an observation that never looks complete when it is not — and neither does this.
 
     One of the two matches is already in Archive, so it is left out rather than refusing
     the bundle, and the answer says so instead of quietly returning one of two.
     """
 
-    async def _work(scope):
+    async with service.scope() as scope:
         account = await scope.scalar(sa.select(m.Account))
         containers = {c.name: c for c in await scope.all(sa.select(m.Container))}
         uid = await scope.scalar(
@@ -874,12 +926,12 @@ def test_an_agent_told_a_query_was_narrowed_is_told_by_how_much(client, service,
         await sync.sync_container(scope, account, containers["Archive"], backend)
         await scope.commit()
 
-    scoped(service, _work)
-
-    agent = Agent(client)
-    account_id = agent.rows("list_accounts")[0]["id"]
-    containers = {c["name"]: c for c in agent.rows("list_containers", account_id=account_id)}
-    proposed = agent.call(
+    agent = await Agent.connect(client)
+    account_id = (await agent.rows("list_accounts"))[0]["id"]
+    containers = {
+        c["name"]: c for c in await agent.rows("list_containers", account_id=account_id)
+    }
+    proposed = await agent.call(
         "propose_bundle",
         account_id=account_id,
         operation="move",
@@ -894,45 +946,45 @@ def test_an_agent_told_a_query_was_narrowed_is_told_by_how_much(client, service,
     assert "already in Archive" in proposed["query"]["note"]
 
 
-def test_an_agent_growing_a_bundle_is_told_it_is_still_only_a_proposal(client):
-    agent = Agent(client)
-    proposed = _propose(agent)
-    grown = agent.call("add_to_bundle", bundle_id=proposed["bundle_id"], query="Lunch")
+async def test_an_agent_growing_a_bundle_is_told_it_is_still_only_a_proposal(client):
+    agent = await Agent.connect(client)
+    proposed = await _propose(agent)
+    grown = await agent.call("add_to_bundle", bundle_id=proposed["bundle_id"], query="Lunch")
     assert grown["items"] == proposed["items"] + 2
     assert grown["status"] == "proposed"
     assert grown["query"]["proposed"] == 2
     assert "Nothing has changed in the mailbox" in grown["note"]
 
 
-def test_an_agent_cannot_add_to_a_bundle_another_producer_made(client, service):
-    agent = Agent(client)
-    proposed = _propose(agent)
+async def test_an_agent_cannot_add_to_a_bundle_another_producer_made(client, service):
+    agent = await Agent.connect(client)
+    proposed = await _propose(agent)
 
-    async def _work(scope):
+    async with service.scope() as scope:
         bundle = await scope.get(m.Bundle, proposed["bundle_id"])
         somebody_else = scope.add(m.Producer(kind=m.ProducerKind.agent, name="somebody-else"))
         await scope.flush()
         bundle.producer_id = somebody_else.id
         await scope.commit()
 
-    scoped(service, _work)
-
     with pytest.raises(ToolRefused, match="only be added to by the producer"):
-        agent.call("add_to_bundle", bundle_id=proposed["bundle_id"], query="Lunch")
+        await agent.call("add_to_bundle", bundle_id=proposed["bundle_id"], query="Lunch")
 
 
-def test_a_bundle_that_grew_cannot_be_accepted_from_the_page_drawn_before_it(client, backend):
+async def test_a_bundle_that_grew_cannot_be_accepted_from_the_page_drawn_before_it(
+    client, backend
+):
     """The consent gap, closed end to end: the person reads, the agent adds, the accept
     refuses and says what arrived."""
-    agent = Agent(client)
-    proposed = _propose(agent)
+    agent = await Agent.connect(client)
+    proposed = await _propose(agent)
 
-    page = client.get(f"/bundle/{proposed['bundle_id']}").text
+    page = (await client.get(f"/bundle/{proposed['bundle_id']}")).text
     shown = re.search(r'name="reviewed_through" value="(\d+)"', page).group(1)
 
-    agent.call("add_to_bundle", bundle_id=proposed["bundle_id"], query="Lunch")
+    await agent.call("add_to_bundle", bundle_id=proposed["bundle_id"], query="Lunch")
 
-    refused = as_a_person(
+    refused = await as_a_person(
         client,
         f"/bundle/{proposed['bundle_id']}/accept",
         data={"reviewed_through": shown},
@@ -942,16 +994,18 @@ def test_a_bundle_that_grew_cannot_be_accepted_from_the_page_drawn_before_it(cli
     assert len(backend.folders["Archive"].messages) == 0, "it applied anyway"
 
     # Reading it again is the whole resolution: the page now shows what arrived.
-    assert "added later" in client.get(f"/bundle/{proposed['bundle_id']}").text
-    accepting(client, proposed["bundle_id"])
+    assert "added later" in (await client.get(f"/bundle/{proposed['bundle_id']}")).text
+    await accepting(client, proposed["bundle_id"])
     assert len(backend.folders["Archive"].messages) == 3
 
 
-def test_the_review_page_says_a_bundle_was_found_by_searching(client):
-    agent = Agent(client)
-    account = agent.rows("list_accounts")[0]
-    containers = {c["name"]: c for c in agent.rows("list_containers", account_id=account["id"])}
-    proposed = agent.call(
+async def test_the_review_page_says_a_bundle_was_found_by_searching(client):
+    agent = await Agent.connect(client)
+    account = (await agent.rows("list_accounts"))[0]
+    containers = {
+        c["name"]: c for c in await agent.rows("list_containers", account_id=account["id"])
+    }
+    proposed = await agent.call(
         "propose_bundle",
         account_id=account["id"],
         operation="move",
@@ -960,22 +1014,26 @@ def test_the_review_page_says_a_bundle_was_found_by_searching(client):
         summary="Newsletter issues",
         reason="Bulk mail",
     )
-    page = client.get(f"/bundle/{proposed['bundle_id']}").text
+    page = (await client.get(f"/bundle/{proposed['bundle_id']}")).text
     assert "found by searching for" in page
     assert "the search is not run again" in page
 
 
-def _propose(agent: Agent) -> dict:
-    account = agent.rows("list_accounts")[0]
-    containers = {c["name"]: c for c in agent.rows("list_containers", account_id=account["id"])}
+async def _propose(agent: Agent) -> dict:
+    account = (await agent.rows("list_accounts"))[0]
+    containers = {
+        c["name"]: c for c in await agent.rows("list_containers", account_id=account["id"])
+    }
     # Named rather than summarised for: this fixture caps observation at three, so the
     # summary is legitimately truncated and the newsletter may not be in it.
-    messages = agent.call(
-        "list_messages",
-        container_id=containers["INBOX"]["id"],
-        from_address="news@list.example",
+    messages = (
+        await agent.call(
+            "list_messages",
+            container_id=containers["INBOX"]["id"],
+            from_address="news@list.example",
+        )
     )["messages"]
-    return agent.call(
+    return await agent.call(
         "propose_bundle",
         account_id=account["id"],
         operation="move",
@@ -986,18 +1044,22 @@ def _propose(agent: Agent) -> dict:
     )
 
 
-def test_an_agent_can_file_into_a_folder_that_does_not_exist_yet(client, backend):
+async def test_an_agent_can_file_into_a_folder_that_does_not_exist_yet(client, backend):
     """The folder is part of the proposal, not something done on the way to making one."""
-    agent = Agent(client)
-    account = agent.rows("list_accounts")[0]
-    containers = {c["name"]: c for c in agent.rows("list_containers", account_id=account["id"])}
-    messages = agent.call(
-        "list_messages",
-        container_id=containers["INBOX"]["id"],
-        from_address="news@list.example",
+    agent = await Agent.connect(client)
+    account = (await agent.rows("list_accounts"))[0]
+    containers = {
+        c["name"]: c for c in await agent.rows("list_containers", account_id=account["id"])
+    }
+    messages = (
+        await agent.call(
+            "list_messages",
+            container_id=containers["INBOX"]["id"],
+            from_address="news@list.example",
+        )
     )["messages"]
 
-    result = agent.call(
+    result = await agent.call(
         "propose_bundle",
         account_id=account["id"],
         operation="move",
@@ -1012,28 +1074,30 @@ def test_an_agent_can_file_into_a_folder_that_does_not_exist_yet(client, backend
     # The whole point: proposing a folder is not making one.
     assert "Lists/example" not in backend.folders
 
-    listed = {c["name"]: c for c in agent.rows("list_containers", account_id=account["id"])}
+    listed = {
+        c["name"]: c for c in await agent.rows("list_containers", account_id=account["id"])
+    }
     assert listed["Lists/example"]["exists_on_server"] is False
     assert listed["INBOX"]["exists_on_server"] is True
 
 
-def test_an_agent_can_propose_discarding_an_empty_folder_and_nothing_happens(
+async def test_an_agent_can_propose_discarding_an_empty_folder_and_nothing_happens(
     client, service, backend
 ):
     backend.add_folder("Old")
 
-    async def _work(scope):
+    async with service.scope() as scope:
         account_row = await scope.scalar(sa.select(m.Account))
         await sync.discover_containers(scope, account_row, backend)
         await scope.commit()
 
-    scoped(service, _work)
+    agent = await Agent.connect(client)
+    account = (await agent.rows("list_accounts"))[0]
+    containers = {
+        c["name"]: c for c in await agent.rows("list_containers", account_id=account["id"])
+    }
 
-    agent = Agent(client)
-    account = agent.rows("list_accounts")[0]
-    containers = {c["name"]: c for c in agent.rows("list_containers", account_id=account["id"])}
-
-    result = agent.call(
+    result = await agent.call(
         "propose_discard",
         account_id=account["id"],
         container_ids=[containers["Old"]["id"]],
@@ -1046,26 +1110,32 @@ def test_an_agent_can_propose_discarding_an_empty_folder_and_nothing_happens(
     assert "Nothing has changed" in result["note"]
     assert "Old" in backend.folders
 
-    bundle = agent.read(result["resource"])
+    bundle = await agent.read(result["resource"])
     assert bundle["operation"] == "discard_container"
     assert bundle["items"]["items"][0]["container"] == "Old"
     assert bundle["items"]["items"][0]["message_id"] is None
 
-    item = agent.read(f"mailmind://suggestion/{bundle['items']['items'][0]['suggestion_id']}")
+    item = await agent.read(
+        f"mailmind://suggestion/{bundle['items']['items'][0]['suggestion_id']}"
+    )
     assert item["premise"]["message_count"] == 0
     assert item["premise"]["uid"] is None
 
 
-def test_an_agent_cannot_sync_a_folder_that_is_only_proposed(client):
-    agent = Agent(client)
-    account = agent.rows("list_accounts")[0]
-    containers = {c["name"]: c for c in agent.rows("list_containers", account_id=account["id"])}
-    messages = agent.call(
-        "list_messages",
-        container_id=containers["INBOX"]["id"],
-        from_address="news@list.example",
+async def test_an_agent_cannot_sync_a_folder_that_is_only_proposed(client):
+    agent = await Agent.connect(client)
+    account = (await agent.rows("list_accounts"))[0]
+    containers = {
+        c["name"]: c for c in await agent.rows("list_containers", account_id=account["id"])
+    }
+    messages = (
+        await agent.call(
+            "list_messages",
+            container_id=containers["INBOX"]["id"],
+            from_address="news@list.example",
+        )
     )["messages"]
-    agent.call(
+    await agent.call(
         "propose_bundle",
         account_id=account["id"],
         operation="move",
@@ -1074,53 +1144,55 @@ def test_an_agent_cannot_sync_a_folder_that_is_only_proposed(client):
         summary="s",
         reason="r",
     )
-    listed = {c["name"]: c for c in agent.rows("list_containers", account_id=account["id"])}
+    listed = {
+        c["name"]: c for c in await agent.rows("list_containers", account_id=account["id"])
+    }
 
     with pytest.raises(Exception, match="nothing on the server"):
-        agent.call("request_sync", container_id=listed["Lists/example"]["id"])
+        await agent.call("request_sync", container_id=listed["Lists/example"]["id"])
 
 
-def test_proposing_changes_nothing_and_says_so(client, backend):
-    result = _propose(Agent(client))
+async def test_proposing_changes_nothing_and_says_so(client, backend):
+    result = await _propose(await Agent.connect(client))
     assert result["status"] == "proposed"
     assert "Nothing has changed" in result["note"]
     assert len(backend.folders["Archive"].messages) == 0
 
 
-def test_a_suggestion_is_readable_as_a_resource(client):
-    agent = Agent(client)
-    proposed = _propose(agent)
+async def test_a_suggestion_is_readable_as_a_resource(client):
+    agent = await Agent.connect(client)
+    proposed = await _propose(agent)
 
-    index = agent.read_rows("mailmind://bundles/open", "bundles")
+    index = await agent.read_rows("mailmind://bundles/open", "bundles")
     assert [b["bundle_id"] for b in index] == [proposed["bundle_id"]]
 
-    bundle = agent.read(proposed["resource"])
+    bundle = await agent.read(proposed["resource"])
     assert bundle["operation"] == "move"
     assert bundle["items"]["items"][0]["currently_in"] == "INBOX"
     assert bundle["items"]["items"][0]["would_move_to"] == "Archive"
 
-    suggestion = agent.read(
+    suggestion = await agent.read(
         f"mailmind://suggestion/{bundle['items']['items'][0]['suggestion_id']}"
     )
     assert suggestion["premise"]["uid"] > 0
     assert suggestion["status"] == "proposed"
 
 
-def test_an_agent_can_record_an_assessment_but_only_as_interpretation(client, service):
-    agent = Agent(client)
-    account = agent.rows("list_accounts")[0]
+async def test_an_agent_can_record_an_assessment_but_only_as_interpretation(client, service):
+    agent = await Agent.connect(client)
+    account = (await agent.rows("list_accounts"))[0]
     inbox = next(
         c
-        for c in agent.rows("list_containers", account_id=account["id"])
+        for c in await agent.rows("list_containers", account_id=account["id"])
         if c["name"] == "INBOX"
     )
-    message = agent.call("list_messages", container_id=inbox["id"])["messages"][0]
-    agent.call(
+    message = (await agent.call("list_messages", container_id=inbox["id"]))["messages"][0]
+    await agent.call(
         "add_assessment",
         message_id=message["message_id"],
         findings=[{"code": "pressure", "detail": "reads as urgency", "evidence": {}}],
     )
-    detail = agent.call("get_message", message_id=message["message_id"])
+    detail = await agent.call("get_message", message_id=message["message_id"])
     recorded = detail["assessment"]["assessment"]
     classes = {f["class"] for a in recorded for f in a["findings"]}
     assert classes == {"mechanical", "interpretation"}
@@ -1130,17 +1202,17 @@ def test_an_agent_can_record_an_assessment_but_only_as_interpretation(client, se
     assert all(f["class"] == "interpretation" for f in producer_findings)
 
 
-def test_the_review_page_shows_the_effect_and_names_the_self_assessment(client):
-    agent = Agent(client)
-    proposed = _propose(agent)
-    bundle = agent.read(proposed["resource"])
-    agent.call(
+async def test_the_review_page_shows_the_effect_and_names_the_self_assessment(client):
+    agent = await Agent.connect(client)
+    proposed = await _propose(agent)
+    bundle = await agent.read(proposed["resource"])
+    await agent.call(
         "add_assessment",
         message_id=bundle["items"]["items"][0]["message_id"],
         findings=[{"code": "bulk", "detail": "a newsletter"}],
     )
 
-    page = client.get(f"/bundle/{proposed['bundle_id']}").text
+    page = (await client.get(f"/bundle/{proposed['bundle_id']}")).text
     assert "INBOX" in page and "Archive" in page
     assert "Issue 402" in page
     # 02's rule, stated where it cannot be enforced.
@@ -1148,16 +1220,22 @@ def test_the_review_page_shows_the_effect_and_names_the_self_assessment(client):
     assert "opencode" in page
 
 
-def test_the_review_page_says_a_folder_would_be_made_before_anything_moves(client, backend):
-    agent = Agent(client)
-    account = agent.rows("list_accounts")[0]
-    containers = {c["name"]: c for c in agent.rows("list_containers", account_id=account["id"])}
-    messages = agent.call(
-        "list_messages",
-        container_id=containers["INBOX"]["id"],
-        from_address="news@list.example",
+async def test_the_review_page_says_a_folder_would_be_made_before_anything_moves(
+    client, backend
+):
+    agent = await Agent.connect(client)
+    account = (await agent.rows("list_accounts"))[0]
+    containers = {
+        c["name"]: c for c in await agent.rows("list_containers", account_id=account["id"])
+    }
+    messages = (
+        await agent.call(
+            "list_messages",
+            container_id=containers["INBOX"]["id"],
+            from_address="news@list.example",
+        )
     )["messages"]
-    proposed = agent.call(
+    proposed = await agent.call(
         "propose_bundle",
         account_id=account["id"],
         operation="move",
@@ -1167,29 +1245,29 @@ def test_the_review_page_says_a_folder_would_be_made_before_anything_moves(clien
         reason="Bulk mail with a List-Id",
     )
 
-    page = client.get(f"/bundle/{proposed['bundle_id']}").text
+    page = (await client.get(f"/bundle/{proposed['bundle_id']}")).text
     assert "Lists/example" in page
     assert "does not exist yet" in page, "the reviewer has to be told what they are making"
 
-    response = accepting(client, proposed["bundle_id"])
+    response = await accepting(client, proposed["bundle_id"])
     assert response.status_code == 200
     assert "Lists/example" in backend.folders
     assert len(backend.folders["Lists/example"].messages) == len(messages)
 
 
-def test_a_discard_is_reviewed_and_accepted_like_anything_else(client, service, backend):
+async def test_a_discard_is_reviewed_and_accepted_like_anything_else(client, service, backend):
     backend.add_folder("Old")
 
-    async def _work(scope):
+    async with service.scope() as scope:
         await sync.discover_containers(scope, await scope.scalar(sa.select(m.Account)), backend)
         await scope.commit()
 
-    scoped(service, _work)
-
-    agent = Agent(client)
-    account = agent.rows("list_accounts")[0]
-    containers = {c["name"]: c for c in agent.rows("list_containers", account_id=account["id"])}
-    proposed = agent.call(
+    agent = await Agent.connect(client)
+    account = (await agent.rows("list_accounts"))[0]
+    containers = {
+        c["name"]: c for c in await agent.rows("list_containers", account_id=account["id"])
+    }
+    proposed = await agent.call(
         "propose_discard",
         account_id=account["id"],
         container_ids=[containers["Old"]["id"]],
@@ -1197,43 +1275,47 @@ def test_a_discard_is_reviewed_and_accepted_like_anything_else(client, service, 
         reason="Nothing has ever been filed in it",
     )
 
-    page = client.get(f"/bundle/{proposed['bundle_id']}").text
+    page = (await client.get(f"/bundle/{proposed['bundle_id']}")).text
     assert "Old" in page
     assert "cannot lose mail" in page, "why an empty folder is the only one offered"
     assert "Old" in backend.folders, "reading the page changes nothing"
 
-    response = accepting(client, proposed["bundle_id"])
+    response = await accepting(client, proposed["bundle_id"])
     assert response.status_code == 200
     assert "Old" not in backend.folders
     assert "applied" in response.text
 
 
-def test_accepting_in_the_ui_actually_moves_the_mail(client, backend):
-    agent = Agent(client)
-    proposed = _propose(agent)
+async def test_accepting_in_the_ui_actually_moves_the_mail(client, backend):
+    agent = await Agent.connect(client)
+    proposed = await _propose(agent)
     assert len(backend.folders["Archive"].messages) == 0
 
-    response = accepting(client, proposed["bundle_id"])
+    response = await accepting(client, proposed["bundle_id"])
     assert response.status_code == 200
     assert len(backend.folders["Archive"].messages) == 1
     assert "applied" in response.text
 
 
-def test_accepting_a_delete_in_the_ui_files_it_in_trash(client, backend):
+async def test_accepting_a_delete_in_the_ui_files_it_in_trash(client, backend):
     """Delete had no test at all, and no test is how the two ends stopped agreeing.
 
     Nothing expunges: 01 says mail has no undo, so a delete is a move into Trash and the
     message is still there afterwards.
     """
-    agent = Agent(client)
-    account = agent.rows("list_accounts")[0]
-    containers = {c["name"]: c for c in agent.rows("list_containers", account_id=account["id"])}
+    agent = await Agent.connect(client)
+    account = (await agent.rows("list_accounts"))[0]
+    containers = {
+        c["name"]: c for c in await agent.rows("list_containers", account_id=account["id"])
+    }
     assert containers["Trash"]["special_use"] == TRASH, (
         "the container the applier looks for is not the one the backend reported"
     )
 
-    messages = agent.call("list_messages", container_id=containers["INBOX"]["id"])["messages"]
-    proposed = agent.call(
+    messages = (await agent.call("list_messages", container_id=containers["INBOX"]["id"]))[
+        "messages"
+    ]
+    proposed = await agent.call(
         "propose_bundle",
         account_id=account["id"],
         operation="delete",
@@ -1242,37 +1324,35 @@ def test_accepting_a_delete_in_the_ui_files_it_in_trash(client, backend):
         reason="Nothing here is wanted",
     )
 
-    response = accepting(client, proposed["bundle_id"])
+    response = await accepting(client, proposed["bundle_id"])
     assert response.status_code == 200
     assert "no Trash container is known" not in response.text
     assert len(backend.folders["Trash"].messages) == 1
     assert "applied" in response.text
 
 
-def test_the_ui_refuses_to_accept_around_something_that_moved(client, backend, service):
-    agent = Agent(client)
-    proposed = _propose(agent)
+async def test_the_ui_refuses_to_accept_around_something_that_moved(client, backend, service):
+    agent = await Agent.connect(client)
+    proposed = await _propose(agent)
 
     # The person filed it themselves, in their own mail client.
     uid = next(iter(backend.folders["INBOX"].messages))
     backend.out_of_band_move("INBOX", uid, "Archive")
 
-    async def _work(scope):
+    async with service.scope() as scope:
         account = await scope.scalar(sa.select(m.Account).where(m.Account.name == "test"))
         inbox = await scope.scalar(sa.select(m.Container).where(m.Container.name == "INBOX"))
         await sync.sync_container(scope, account, inbox, backend)
         await scope.commit()
 
-    scoped(service, _work)
-
-    page = client.get(f"/bundle/{proposed['bundle_id']}").text
+    page = (await client.get(f"/bundle/{proposed['bundle_id']}")).text
     if "moved since this was proposed" in page:
         assert "acknowledge_stale" in page
-    response = accepting(client, proposed["bundle_id"])
+    response = await accepting(client, proposed["bundle_id"])
     assert response.status_code == 200
 
 
-def test_a_bundle_whose_every_message_moved_leaves_the_queue_by_itself(
+async def test_a_bundle_whose_every_message_moved_leaves_the_queue_by_itself(
     client, backend, service
 ):
     """The stuck bundle, from where a person meets it.
@@ -1281,44 +1361,39 @@ def test_a_bundle_whose_every_message_moved_leaves_the_queue_by_itself(
     apply, so accepting cannot work; rejecting would have recorded a refusal nobody made.
     The queue used to keep showing it either way.
     """
-    agent = Agent(client)
-    proposed = _propose(agent)
+    agent = await Agent.connect(client)
+    proposed = await _propose(agent)
 
-    async def _uids(scope):
+    async with service.scope() as scope:
         bundle = await scope.get(m.Bundle, proposed["bundle_id"])
-        return [s.premise_uid for s in bundle.suggestions]
-
-    uids = scoped(service, _uids)
+        uids = [s.premise_uid for s in bundle.suggestions]
     for uid in uids:
         backend.out_of_band_move("INBOX", uid, "Trash")
 
-    async def _sync(scope):
+    async with service.scope() as scope:
         account = await scope.scalar(sa.select(m.Account).where(m.Account.name == "test"))
         inbox = await scope.scalar(sa.select(m.Container).where(m.Container.name == "INBOX"))
         await sync.sync_container(scope, account, inbox, backend)
         await scope.commit()
 
-    scoped(service, _sync)
-
-    page = client.get(f"/bundle/{proposed['bundle_id']}").text
+    page = (await client.get(f"/bundle/{proposed['bundle_id']}")).text
     assert "closed itself" in page
     assert "Accept — do this to the mailbox" not in page, "a dead bundle offers no buttons"
 
-    async def _status(scope):
-        return (await scope.get(m.Bundle, proposed["bundle_id"])).status
-
-    assert scoped(service, _status) is m.BundleStatus.stale
+    async with service.scope() as scope:
+        bundle = await scope.get(m.Bundle, proposed["bundle_id"])
+        assert bundle.status is m.BundleStatus.stale
 
     # Gone from what is waiting, and nothing was done to the mailbox on the way out.
-    queue = client.get("/").text
+    queue = (await client.get("/")).text
     assert "Newsletter issues" not in queue.split("Awaiting review")[-1].split("<h2")[0]
     assert len(backend.folders["Archive"].messages) == 0
 
 
-def test_a_rejection_can_carry_a_reason_and_is_as_easy_as_accepting(client, backend):
-    agent = Agent(client)
-    proposed = _propose(agent)
-    response = as_a_person(
+async def test_a_rejection_can_carry_a_reason_and_is_as_easy_as_accepting(client, backend):
+    agent = await Agent.connect(client)
+    proposed = await _propose(agent)
+    response = await as_a_person(
         client,
         f"/bundle/{proposed['bundle_id']}/reject",
         data={"reason": "I want to keep reading these"},
@@ -1329,9 +1404,9 @@ def test_a_rejection_can_carry_a_reason_and_is_as_easy_as_accepting(client, back
     assert len(backend.folders["Archive"].messages) == 0
 
 
-def test_the_queue_lists_what_is_waiting(client):
-    _propose(Agent(client))
-    page = client.get("/").text
+async def test_the_queue_lists_what_is_waiting(client):
+    await _propose(await Agent.connect(client))
+    page = (await client.get("/")).text
     assert "Awaiting review" in page
     assert "Archive" in page
 
@@ -1339,39 +1414,37 @@ def test_the_queue_lists_what_is_waiting(client):
 # ------------------------------------------------------- reading and filing by hand
 
 
-def _inbox(client) -> int:  # noqa: ANN001
+async def _inbox(client) -> int:  # noqa: ANN001
     """The folder id, found the way the page offers it rather than by asking an agent."""
-    match = re.search(r'href="/mail/(\d+)">INBOX<', client.get("/mail").text)
+    match = re.search(r'href="/mail/(\d+)">INBOX<', (await client.get("/mail")).text)
     assert match
     return int(match.group(1))
 
 
-def _picked(client, container_id: int) -> list[str]:  # noqa: ANN001
+async def _picked(client, container_id: int) -> list[str]:  # noqa: ANN001
     """The message ids a person would be ticking, read off the folder page."""
-    page = client.get(f"/mail/{container_id}").text
+    page = (await client.get(f"/mail/{container_id}")).text
     return re.findall(r'name="message_id" value="(\d+)"', page)
 
 
-def _container(service, name: str) -> int:  # noqa: ANN001
-    async def work(scope):  # noqa: ANN001, ANN202
+async def _container(service, name: str) -> int:  # noqa: ANN001
+    async with service.scope() as scope:
         return (await scope.scalar(sa.select(m.Container).where(m.Container.name == name))).id
 
-    return scoped(service, work)
 
-
-def test_the_mail_page_puts_inbox_first(client):
+async def test_the_mail_page_puts_inbox_first(client):
     """Sorted by name, INBOX sits under I among however many folders there are."""
-    page = client.get("/mail").text
+    page = (await client.get("/mail")).text
     assert page.index(">INBOX<") < page.index(">Archive<") < page.index(">Trash<")
 
 
-def test_a_person_can_read_a_folder_without_an_agent_proposing_anything(client):
+async def test_a_person_can_read_a_folder_without_an_agent_proposing_anything(client):
     """The read view is the cache, drawn for whoever holds the key.
 
     It exists so that filing by hand is possible at all; that it is not a second way into
     the mailbox is what the tests below are about.
     """
-    page = client.get(f"/mail/{_inbox(client)}")
+    page = await client.get(f"/mail/{await _inbox(client)}")
     assert page.status_code == 200
     # The address rather than the name attached to it, per 08.
     assert "news@list.example" in page.text
@@ -1379,7 +1452,7 @@ def test_a_person_can_read_a_folder_without_an_agent_proposing_anything(client):
     assert "showing" in page.text
 
 
-def test_reading_a_message_by_hand_marks_nothing_and_fetches_nothing_on_its_own(
+async def test_reading_a_message_by_hand_marks_nothing_and_fetches_nothing_on_its_own(
     client, service
 ):
     """01: this is not where mail is read, and a triage view must not drift into one.
@@ -1389,39 +1462,37 @@ def test_reading_a_message_by_hand_marks_nothing_and_fetches_nothing_on_its_own(
     somebody's server.
     """
     listed = re.findall(
-        r'href="/mail/message/(\d+)"', client.get(f"/mail/{_inbox(client)}").text
+        r'href="/mail/message/(\d+)"', (await client.get(f"/mail/{await _inbox(client)}")).text
     )
     assert listed
-    page = client.get(f"/mail/message/{listed[0]}")
+    page = await client.get(f"/mail/message/{listed[0]}")
     assert page.status_code == 200
     assert "fetch the text" in page.text
 
-    async def flags(scope):  # noqa: ANN001, ANN202
+    async with service.scope() as scope:
         placement = await scope.scalar(
             views.live_placements().where(m.Placement.message_id == int(listed[0]))
         )
-        return placement.flags
-
-    assert "\\Seen" not in scoped(service, flags)
+        assert "\\Seen" not in placement.flags
 
 
-def test_filing_by_hand_proposes_rather_than_moving(client, service, backend):
+async def test_filing_by_hand_proposes_rather_than_moving(client, service, backend):
     """The whole of why this view is allowed to exist.
 
     A person picking messages produces a bundle like any other — read on the review page,
     applied by the same accept. Nothing reaches the mailbox on the way through.
     """
-    inbox = _inbox(client)
-    picked = _picked(client, inbox)
+    inbox = await _inbox(client)
+    picked = await _picked(client, inbox)
     assert len(picked) >= 2
 
-    landed = as_a_person(
+    landed = await as_a_person(
         client,
         f"/mail/{inbox}/file",
         data={
             "message_id": picked[:2],
             "operation": "move",
-            "target_container_id": str(_container(service, "Archive")),
+            "target_container_id": str(await _container(service, "Archive")),
         },
         follow_redirects=True,
     )
@@ -1431,95 +1502,93 @@ def test_filing_by_hand_proposes_rather_than_moving(client, service, backend):
     assert "picked out of INBOX" in landed.text
     assert len(backend.folders["Archive"].messages) == 0
     # Proposed by the person, and waiting like anything else.
-    assert "reviewer" in client.get("/").text
+    assert "reviewer" in (await client.get("/")).text
 
 
-def test_a_bundle_filed_by_hand_is_accepted_the_same_way_and_then_moves(
+async def test_a_bundle_filed_by_hand_is_accepted_the_same_way_and_then_moves(
     client, service, backend
 ):
-    inbox = _inbox(client)
-    landed = as_a_person(
+    inbox = await _inbox(client)
+    landed = await as_a_person(
         client,
         f"/mail/{inbox}/file",
         data={
-            "message_id": _picked(client, inbox)[:1],
+            "message_id": (await _picked(client, inbox))[:1],
             "operation": "move",
-            "target_container_id": str(_container(service, "Archive")),
+            "target_container_id": str(await _container(service, "Archive")),
         },
         follow_redirects=True,
     )
     bundle_id = int(re.search(r"/bundle/(\d+)", str(landed.url)).group(1))
 
-    accepting(client, bundle_id)
+    await accepting(client, bundle_id)
     assert len(backend.folders["Archive"].messages) == 1
 
 
-def test_filing_nothing_says_so_rather_than_proposing_an_empty_bundle(client):
-    inbox = _inbox(client)
-    refused = as_a_person(
+async def test_filing_nothing_says_so_rather_than_proposing_an_empty_bundle(client):
+    inbox = await _inbox(client)
+    refused = await as_a_person(
         client, f"/mail/{inbox}/file", data={"operation": "move"}, follow_redirects=True
     )
     assert "nothing was selected" in refused.text
 
 
-def test_a_refused_hand_filing_leaves_no_half_written_bundle_behind(client, service):
+async def test_a_refused_hand_filing_leaves_no_half_written_bundle_behind(client, service):
     """propose_bundle writes the bundle row before it checks the messages named.
 
     A refusal has to take that row with it, or a folder page quietly fills the review
     queue with bundles nobody meant to propose.
     """
-    inbox = _inbox(client)
+    inbox = await _inbox(client)
     # Into the folder they are already in: refused, because an id is a claim about a
     # message and that one does not hold.
-    as_a_person(
+    await as_a_person(
         client,
         f"/mail/{inbox}/file",
         data={
-            "message_id": _picked(client, inbox)[:1],
+            "message_id": (await _picked(client, inbox))[:1],
             "operation": "move",
             "target_container_id": str(inbox),
         },
         follow_redirects=True,
     )
 
-    async def bundles(scope):  # noqa: ANN001, ANN202
-        return len(await scope.all(sa.select(m.Bundle)))
-
-    assert scoped(service, bundles) == 0
+    async with service.scope() as scope:
+        assert len(await scope.all(sa.select(m.Bundle))) == 0
 
 
-def test_a_hand_filed_delete_names_trash_and_nothing_else(client, service, backend):
+async def test_a_hand_filed_delete_names_trash_and_nothing_else(client, service, backend):
     """The destination fields are on the form whichever button was pressed.
 
     A delete that carried one would draw as "delete to Archive" on the review page, which
     is not what a delete does — it goes to Trash, and nothing expunges.
     """
-    inbox = _inbox(client)
-    landed = as_a_person(
+    inbox = await _inbox(client)
+    landed = await as_a_person(
         client,
         f"/mail/{inbox}/file",
         data={
-            "message_id": _picked(client, inbox)[:1],
+            "message_id": (await _picked(client, inbox))[:1],
             "operation": "delete",
-            "target_container_id": str(_container(service, "Archive")),
+            "target_container_id": str(await _container(service, "Archive")),
         },
         follow_redirects=True,
     )
     assert "Archive" not in landed.text.split("<h1", 1)[1].split("</h1>", 1)[0]
 
-    accepting(client, int(re.search(r"/bundle/(\d+)", str(landed.url)).group(1)))
+    await accepting(client, int(re.search(r"/bundle/(\d+)", str(landed.url)).group(1)))
     assert len(backend.folders["Trash"].messages) == 1
     assert len(backend.folders["Archive"].messages) == 0
 
 
-def test_the_mail_view_is_behind_the_key_like_every_other_page(service, backend):
+async def test_the_mail_view_is_behind_the_key_like_every_other_page(service, backend):
     app = create_app(service, session_key=SESSION_KEY)
-    with TestClient(app, base_url="http://127.0.0.1:8765") as stranger:
-        assert stranger.get("/mail").status_code == 401
+    async with served(app) as stranger:
+        assert (await stranger.get("/mail")).status_code == 401
     assert not is_machine_path("/mail")
 
 
-def test_the_mcp_endpoint_answers_on_the_address_it_was_told_to_serve(service, backend):
+async def test_the_mcp_endpoint_answers_on_the_address_it_was_told_to_serve(service, backend):
     """``serve --host`` has to reach the configuration, not only uvicorn.
 
     The endpoint builds its DNS-rebinding allow-list out of the configured bind address,
@@ -1532,27 +1601,29 @@ def test_the_mcp_endpoint_answers_on_the_address_it_was_told_to_serve(service, b
         backend_factory=lambda _config: backend,
     )
     app = create_app(elsewhere, session_key=SESSION_KEY)
-    with opened(app, "http://127.0.0.2:9000") as moved:
-        assert [a["name"] for a in Agent(moved).rows("list_accounts")] == ["test"]
+    async with opened(app, "http://127.0.0.2:9000") as moved:
+        assert [
+            a["name"] for a in await (await Agent.connect(moved)).rows("list_accounts")
+        ] == ["test"]
 
 
-def test_the_queue_shows_the_account_being_worked_in_and_no_other(client, other_account):
+async def test_the_queue_shows_the_account_being_worked_in_and_no_other(client, other_account):
     """Local review has no login, so the account is what a person chooses instead.
 
     A view rather than a boundary: the reviewer owns all of it, and a link to a bundle in
     another account still opens. What the choice decides is what the queue is *about*.
     """
-    agent = Agent(client)
-    mine = _propose(agent)["bundle_id"]
+    agent = await Agent.connect(client)
+    mine = (await _propose(agent))["bundle_id"]
     theirs = other_account["bundle_id"]
 
     # Nothing chosen yet, so the first account by name — "other" sorts before "test".
-    queue = client.get("/").text
+    queue = (await client.get("/")).text
     assert "working in" in queue
     assert f"/bundle/{theirs}" in queue
     assert f"/bundle/{mine}" not in queue
 
-    switched = as_a_person(
+    switched = await as_a_person(
         client,
         "/accounts/choose",
         data={"account_id": other_account["test_account_id"]},
@@ -1563,13 +1634,13 @@ def test_the_queue_shows_the_account_being_worked_in_and_no_other(client, other_
     assert f"/bundle/{theirs}" not in switched.text
 
     # The choice is the person's and outlives the request that made it.
-    assert f"/bundle/{mine}" in client.get("/").text
+    assert f"/bundle/{mine}" in (await client.get("/")).text
 
     # Not a boundary: the other account's bundle is still readable by its link.
-    assert client.get(f"/bundle/{theirs}").status_code == 200
+    assert (await client.get(f"/bundle/{theirs}")).status_code == 200
 
 
-def test_a_chosen_account_that_goes_away_takes_the_choice_and_not_the_producer(service):
+async def test_a_chosen_account_that_goes_away_takes_the_choice_and_not_the_producer(service):
     """`ON DELETE SET NULL` on the choice.
 
     Removing an account should drop a preference and never a producer, because the
@@ -1577,7 +1648,7 @@ def test_a_chosen_account_that_goes_away_takes_the_choice_and_not_the_producer(s
     yet — this asserts the clause is there so that it can be.
     """
 
-    async def _seed(scope):
+    async with service.scope() as scope:
         spare = scope.add(
             m.Account(name="spare", host="h", username="u3", password_url="env://Z")
         )
@@ -1585,27 +1656,21 @@ def test_a_chosen_account_that_goes_away_takes_the_choice_and_not_the_producer(s
         await scope.flush()
         person.current_account_id = spare.id
         await scope.commit()
-        return spare.id, person.id
+        spare_id, person_id = spare.id, person.id
 
-    spare_id, person_id = scoped(service, _seed)
-
-    async def _remove(scope):
+    async with service.scope() as scope:
         await scope.execute(sa.delete(m.Account).where(m.Account.id == spare_id))
         await scope.commit()
 
-    scoped(service, _remove)
-
-    async def _check(scope):
+    async with service.scope() as scope:
         person = await scope.get(m.Producer, person_id)
         assert person is not None, "the producer went with the account"
         assert person.current_account_id is None
         # And the fallback puts the reviewer back in a real account.
         assert (await app_module.chosen_account(scope)).name == "test"
 
-    scoped(service, _check)
 
-
-def test_an_unauthenticated_review_ui_refuses_to_listen_to_the_network(service, backend):
+async def test_an_unauthenticated_review_ui_refuses_to_listen_to_the_network(service, backend):
     """Its session cookie is a bearer token and this is plain HTTP.
 
     The login keeps an agent on this machine out of the review UI. It is not what makes
@@ -1640,11 +1705,11 @@ def test_an_unauthenticated_review_ui_refuses_to_listen_to_the_network(service, 
     assert "public_url" in str(unreachable.value)
 
     app = create_app(proxied(public_url="https://mail.example.com"), session_key=SESSION_KEY)
-    with opened(app) as client:
-        assert client.get("/").status_code == 200
+    async with opened(app) as client:
+        assert (await client.get("/")).status_code == 200
 
 
-def test_an_account_that_exists_only_in_the_database_can_still_connect(service, backend):
+async def test_an_account_that_exists_only_in_the_database_can_still_connect(service, backend):
     """Which is every account the review UI will ever add.
 
     Connections used to be built by looking the account's name back up in the
@@ -1654,7 +1719,7 @@ def test_an_account_that_exists_only_in_the_database_can_still_connect(service, 
     """
     from mailmind.service import account_config
 
-    async def _work(scope):
+    async with service.scope() as scope:
         row = scope.add(
             m.Account(
                 name="never-configured",
@@ -1669,15 +1734,13 @@ def test_an_account_that_exists_only_in_the_database_can_still_connect(service, 
         assert row.name not in {a.name for a in service.config.accounts}
         async with service.backend(row) as opened_backend:
             assert opened_backend is backend
-        return account_config(row)
-
-    derived = scoped(service, _work)
+        derived = account_config(row)
     assert (derived.host, derived.port, derived.use_ssl) == ("imap.invalid", 1143, False)
     assert derived.login.username == "someone@example.org"
     assert derived.login.password == "env://NEVER_CONFIGURED"
 
 
-def test_the_mcp_endpoint_is_advertised_at_the_path_that_answers(client):
+async def test_the_mcp_endpoint_is_advertised_at_the_path_that_answers(client):
     """The trailing slash is not decoration.
 
     The endpoint is mounted at `/mcp/`, so a POST to `/mcp` gets a 307 — which a client is
@@ -1699,10 +1762,10 @@ def test_the_mcp_endpoint_is_advertised_at_the_path_that_answers(client):
         "Content-Type": "application/json",
         "Authorization": f"Bearer {TOKEN}",
     }
-    assert client.post("/mcp/", headers=headers, json=body).status_code == 200
+    assert (await client.post("/mcp/", headers=headers, json=body)).status_code == 200
     # follow_redirects=False, because the test client follows them by default and would
     # hide exactly the hop a real client might not make.
-    redirected = client.post("/mcp", headers=headers, json=body, follow_redirects=False)
+    redirected = await client.post("/mcp", headers=headers, json=body, follow_redirects=False)
     assert redirected.status_code == 307
     assert redirected.headers["location"].endswith("/mcp/")
 
@@ -1724,7 +1787,7 @@ class DiesPartway(FakeBackend):
         return super().select(container, readonly=readonly)
 
 
-def test_a_sync_that_dies_partway_keeps_the_folders_it_finished(tmp_path):
+async def test_a_sync_that_dies_partway_keeps_the_folders_it_finished(tmp_path, make_service):
     """A first sync of a real mailbox is long, and it used to be all-or-nothing.
 
     One transaction around the whole account also held SQLite's write lock for the
@@ -1740,28 +1803,26 @@ def test_a_sync_that_dies_partway_keeps_the_folders_it_finished(tmp_path):
         backend.add_message("INBOX", raw)
     backend.add_message("Archive", CORPUS["ordinary"])
 
-    service = Service(Config(database_url=url), backend_factory=lambda _config: backend)
+    service = make_service(Config(database_url=url), backend_factory=lambda _config: backend)
 
-    async def _seed(scope):
+    async with service.scope() as scope:
         account = scope.add(
             m.Account(name="real", host="h", username="u", password_url="env://X")
         )
         await scope.commit()
-        return account.id
+        account_id = account.id
 
-    account_id = scoped(service, _seed)
-
-    with opened(create_app(service, session_key=SESSION_KEY)) as client:
-        died = as_a_person(client, f"/accounts/{account_id}/sync")
+    async with opened(create_app(service, session_key=SESSION_KEY)) as client:
+        died = await as_a_person(client, f"/accounts/{account_id}/sync")
         # The person pressed a button, so what comes back is a page, not a stack trace.
         assert died.status_code < 400
-        settle(client)
+        await settle(client)
 
-    async def _check(scope):
+    async with service.scope() as scope:
         account = await scope.get(m.Account, account_id)
         assert account.health is m.AccountHealth.down, "the mailbox failed and nothing said so"
         assert "the connection went away" in account.health_detail
-        return {
+        cached = {
             c.name: n
             for c, n in await scope.execute(
                 sa.select(m.Container, sa.func.count(m.Placement.id))
@@ -1769,14 +1830,12 @@ def test_a_sync_that_dies_partway_keeps_the_folders_it_finished(tmp_path):
                 .group_by(m.Container.id)
             )
         }
-
-    cached = scoped(service, _check)
     assert cached["INBOX"] == len(CORPUS), "the folders that finished were thrown away"
     assert cached["Archive"] == 1
     assert cached["Zzz"] == 0
 
 
-def test_a_mailbox_that_cannot_be_reached_says_so_on_the_page(tmp_path):
+async def test_a_mailbox_that_cannot_be_reached_says_so_on_the_page(tmp_path, make_service):
     """Pressing sync against a host that will not answer was an internal server error.
 
     The connection is made when the button is pressed, so the failure lands in the route
@@ -1791,9 +1850,9 @@ def test_a_mailbox_that_cannot_be_reached_says_so_on_the_page(tmp_path):
             "cannot reach imap.example.org:993: certificate verify failed: Hostname mismatch"
         )
 
-    service = Service(Config(database_url=url), backend_factory=unreachable)
+    service = make_service(Config(database_url=url), backend_factory=unreachable)
 
-    async def _seed(scope):
+    async with service.scope() as scope:
         account = scope.add(
             m.Account(
                 name="real",
@@ -1803,49 +1862,49 @@ def test_a_mailbox_that_cannot_be_reached_says_so_on_the_page(tmp_path):
             )
         )
         await scope.commit()
-        return account.id
+        account_id = account.id
 
-    account_id = scoped(service, _seed)
-
-    with opened(create_app(service, session_key=SESSION_KEY)) as client:
-        pressed = as_a_person(client, f"/accounts/{account_id}/sync", follow_redirects=True)
+    async with opened(create_app(service, session_key=SESSION_KEY)) as client:
+        pressed = await as_a_person(
+            client, f"/accounts/{account_id}/sync", follow_redirects=True
+        )
         assert pressed.status_code == 200, "a mailbox being down is not a bug in the request"
-        settle(client)
+        await settle(client)
         # The failure is the sync task's now; the page shows it where the button is.
-        page = client.get("/accounts").text
+        page = (await client.get("/accounts")).text
         assert "Hostname mismatch" in page, "the page does not say what went wrong"
 
-    async def _account(scope):
-        return await scope.get(m.Account, account_id)
-
-    account = scoped(service, _account)
+    async with service.scope() as scope:
+        account = await scope.get(m.Account, account_id)
     assert account.health is m.AccountHealth.down
     assert "cannot reach imap.example.org:993" in account.health_detail
 
 
-def test_the_review_ui_is_shut_until_the_link_is_followed(service, backend):
+async def test_the_review_ui_is_shut_until_the_link_is_followed(service, backend):
     """A login for local too. Not a password — a key, minted at startup and shown to
     whoever started it, which is never given to the agent."""
     app = create_app(service, session_key=SESSION_KEY)
-    with TestClient(app, base_url="http://127.0.0.1:8765") as person:
-        shut = person.get("/")
+    async with served(app) as person:
+        shut = await person.get("/")
         assert shut.status_code == 401
         assert "you were not given that key" in shut.text
-        assert person.get("/accounts").status_code == 401
+        assert (await person.get("/accounts")).status_code == 401
         # And the obvious guess is no better than none.
-        assert person.get(f"/?{SESSION_KEY_PARAM}=letmein").status_code == 401
+        assert (await person.get(f"/?{SESSION_KEY_PARAM}=letmein")).status_code == 401
 
         # Now follow the link that was printed where this was started.
-        person.get(f"/?{SESSION_KEY_PARAM}={SESSION_KEY}", follow_redirects=True)
-        assert person.get("/").status_code == 200
-        assert person.get("/accounts").status_code == 200
+        await person.get(f"/?{SESSION_KEY_PARAM}={SESSION_KEY}", follow_redirects=True)
+        assert (await person.get("/")).status_code == 200
+        assert (await person.get("/accounts")).status_code == 200
 
 
-def test_following_the_link_leaves_the_key_out_of_the_address(service):
+async def test_following_the_link_leaves_the_key_out_of_the_address(service):
     """It should stop being in the history, the title bar and anything that logs a URL."""
     app = create_app(service, session_key=SESSION_KEY)
-    with TestClient(app, base_url="http://127.0.0.1:8765") as person:
-        landed = person.get(f"/?{SESSION_KEY_PARAM}={SESSION_KEY}", follow_redirects=False)
+    async with served(app) as person:
+        landed = await person.get(
+            f"/?{SESSION_KEY_PARAM}={SESSION_KEY}", follow_redirects=False
+        )
         assert landed.status_code == 303
         assert landed.headers["location"] == "/"
         assert SESSION_KEY not in landed.headers["location"]
@@ -1854,27 +1913,27 @@ def test_following_the_link_leaves_the_key_out_of_the_address(service):
         assert "HttpOnly" in cookie and "samesite=strict" in cookie.lower()
 
         # Other query parameters survive the trade, since links carry them.
-        landed = person.get(
+        landed = await person.get(
             f"/bundle/1?{SESSION_KEY_PARAM}={SESSION_KEY}&error=nope", follow_redirects=False
         )
         assert landed.headers["location"] == "/bundle/1?error=nope"
 
 
-def test_the_key_is_never_told_to_the_agent(client, service):
+async def test_the_key_is_never_told_to_the_agent(client, service):
     """The asymmetry is the whole point: the agent can send a person to the review UI and
     cannot go itself."""
-    agent = Agent(client)
+    agent = await Agent.connect(client)
     everything = json.dumps(
         {
-            "tools": [agent.rows("list_accounts")],
-            "resources": [agent.read_rows("mailmind://accounts", "accounts")],
-            "proposal": _propose(agent),
+            "tools": [await agent.rows("list_accounts")],
+            "resources": [await agent.read_rows("mailmind://accounts", "accounts")],
+            "proposal": await _propose(agent),
         }
     )
     assert SESSION_KEY not in everything
 
     # Including in the instructions, which is where the address does live.
-    initialised = agent._post(  # noqa: SLF001
+    initialised = await agent._post(  # noqa: SLF001
         "initialize",
         {
             "protocolVersion": "2025-06-18",
@@ -1896,14 +1955,14 @@ NOT_A_GESTURE = {
 
 
 @pytest.mark.parametrize("why", list(NOT_A_GESTURE))
-def test_the_review_ui_refuses_a_change_that_is_not_same_origin(client, backend, why):
+async def test_the_review_ui_refuses_a_change_that_is_not_same_origin(client, backend, why):
     """One POST to the address the agent is handed used to accept a bundle and move mail.
 
     The session cookie authenticates; this is the CSRF half — a change must come from a
     page this service served, said by fetch metadata a script cannot forge (or a matching
     Origin where a browser is too old to send any). See docs/security-model.md.
     """
-    proposed = _propose(Agent(client))
+    proposed = await _propose(await Agent.connect(client))
     spoiled = NOT_A_GESTURE[why]
     headers = {}
     if spoiled is not None:
@@ -1916,7 +1975,7 @@ def test_the_review_ui_refuses_a_change_that_is_not_same_origin(client, backend,
             # Exercise the no-fetch-metadata fallback: the Origin alone must match.
             headers.pop("Sec-Fetch-Site")
 
-    refused = client.post(
+    refused = await client.post(
         f"/bundle/{proposed['bundle_id']}/accept",
         headers=headers,
         data={"_csrf": CSRF},
@@ -1926,10 +1985,10 @@ def test_the_review_ui_refuses_a_change_that_is_not_same_origin(client, backend,
     assert len(backend.folders["Archive"].messages) == 0, "it applied anyway"
 
 
-def test_the_review_ui_refuses_a_change_without_the_form_token(client, backend):
+async def test_the_review_ui_refuses_a_change_without_the_form_token(client, backend):
     """Same-origin is necessary and not sufficient: the form token is the other half."""
-    proposed = _propose(Agent(client))
-    refused = client.post(
+    proposed = await _propose(await Agent.connect(client))
+    refused = await client.post(
         f"/bundle/{proposed['bundle_id']}/accept",
         headers={
             "Sec-Fetch-Site": "same-origin",
@@ -1941,27 +2000,27 @@ def test_the_review_ui_refuses_a_change_without_the_form_token(client, backend):
     assert len(backend.folders["Archive"].messages) == 0, "it applied anyway"
 
 
-def test_a_framework_fetch_from_our_own_page_gets_through(client, backend):
+async def test_a_framework_fetch_from_our_own_page_gets_through(client, backend):
     """A same-origin fetch (Turbo's form submission) is a person's action, not an agent's.
 
     ``sec-fetch-mode: cors`` with ``sec-fetch-site: same-origin`` is exactly what a
     framework submitting a form with fetch sends; refusing it was the old gesture check,
     replaced on purpose.
     """
-    proposed = _propose(Agent(client))
-    page = client.get(f"/bundle/{proposed['bundle_id']}").text
+    proposed = await _propose(await Agent.connect(client))
+    page = (await client.get(f"/bundle/{proposed['bundle_id']}")).text
     shown = re.search(r'name="reviewed_through" value="(\d+)"', page)
-    response = client.post(
+    response = await client.post(
         f"/bundle/{proposed['bundle_id']}/accept",
         headers={"Sec-Fetch-Site": "same-origin", "Sec-Fetch-Mode": "cors"},
         data={"_csrf": CSRF, "reviewed_through": shown.group(1) if shown else "0"},
     )
     assert response.status_code < 400
-    settle(client)
+    await settle(client)
     assert len(backend.folders["Archive"].messages) == 1
 
 
-def test_a_browser_that_withholds_the_origin_is_still_a_person(client, backend):
+async def test_a_browser_that_withholds_the_origin_is_still_a_person(client, backend):
     """Chrome sends `Origin: null` for a same-origin form POST under some referrer
     policies — ours was one — and the UI refused every button in itself.
 
@@ -1969,13 +2028,13 @@ def test_a_browser_that_withholds_the_origin_is_still_a_person(client, backend):
     or opaque origin is not evidence against that, and treating it as evidence locked the
     person out of their own mail.
     """
-    proposed = _propose(Agent(client))
-    accepted = accepting(client, proposed["bundle_id"], headers={"Origin": "null"})
+    proposed = await _propose(await Agent.connect(client))
+    accepted = await accepting(client, proposed["bundle_id"], headers={"Origin": "null"})
     assert accepted.status_code < 400
     assert len(backend.folders["Archive"].messages) == 1, "the accept did not apply"
 
 
-def test_the_referrer_policy_leaves_the_origin_alone(client):
+async def test_the_referrer_policy_leaves_the_origin_alone(client):
     """The header that caused the above, pinned so it cannot come back.
 
     A browser derives a form POST's Origin from the referrer policy, so `no-referrer`
@@ -1983,36 +2042,34 @@ def test_the_referrer_policy_leaves_the_origin_alone(client):
     referrer to nobody but us, which is the part that matters with strangers' links on
     the page.
     """
-    policy = client.get("/").headers["referrer-policy"]
+    policy = (await client.get("/")).headers["referrer-policy"]
     assert policy == "same-origin", "no-referrer nulls the origin of our own form posts"
 
 
-def test_a_refused_change_leaves_a_mark(client, service):
+async def test_a_refused_change_leaves_a_mark(client, service):
     """The refusal is the interesting half: nothing changed, but something tried."""
-    proposed = _propose(Agent(client))
-    assert client.post(f"/bundle/{proposed['bundle_id']}/accept").status_code == 403
+    proposed = await _propose(await Agent.connect(client))
+    assert (await client.post(f"/bundle/{proposed['bundle_id']}/accept")).status_code == 403
 
-    async def _work(scope):
-        return await scope.scalar(
+    async with service.scope() as scope:
+        event = await scope.scalar(
             sa.select(m.AuditEvent).where(m.AuditEvent.verb == "ui_change_refused")
         )
-
-    event = scoped(service, _work)
     assert event is not None, "a refused change should be findable afterwards"
     assert event.payload["path"].endswith("/accept")
     assert "origin" in event.payload["problem"]
 
 
-def test_a_person_at_a_browser_still_gets_through(client, backend):
+async def test_a_person_at_a_browser_still_gets_through(client, backend):
     """The other half: the check has to let the actual case work."""
-    proposed = _propose(Agent(client))
-    response = accepting(client, proposed["bundle_id"])
+    proposed = await _propose(await Agent.connect(client))
+    response = await accepting(client, proposed["bundle_id"])
     assert response.status_code == 200
     assert len(backend.folders["Archive"].messages) == 1
 
 
-def test_the_review_pages_forbid_remote_content(client):
-    response = client.get("/")
+async def test_the_review_pages_forbid_remote_content(client):
+    response = await client.get("/")
     csp = response.headers["content-security-policy"]
     assert "img-src 'none'" in csp
     assert "default-src 'none'" in csp
@@ -2022,15 +2079,14 @@ def test_the_review_pages_forbid_remote_content(client):
     assert "unsafe-inline" not in csp.replace("style-src 'self' 'unsafe-inline'", "")
 
 
-def test_the_script_is_served_and_stays_behind_the_key(client, service):
+async def test_the_script_is_served_and_stays_behind_the_key(client):
     """/static is a page asset, not a machine path — no session, no script."""
-    served = client.get("/static/turbo.js")
+    served = await client.get("/static/turbo.js")
     assert served.status_code == 200
     assert "javascript" in served.headers["content-type"]
 
-    app = create_app(service, session_key=SESSION_KEY)
-    with TestClient(app, base_url="http://127.0.0.1:8765") as stranger:
-        assert stranger.get("/static/turbo.js").status_code == 401
+    async with Browser(client.app) as stranger:
+        assert (await stranger.get("/static/turbo.js")).status_code == 401
 
 
 # =====================================================================================
@@ -2052,9 +2108,9 @@ def pkce() -> tuple[str, str]:
     return verifier, base64.urlsafe_b64encode(digest).decode().rstrip("=")
 
 
-def register(client, name: str = "OpenCode") -> str:
+async def register(client, name: str = "OpenCode") -> str:
     """What a client does when it has never been here before."""
-    response = client.post(
+    response = await client.post(
         "/register",
         json={
             "redirect_uris": [REDIRECT],
@@ -2068,9 +2124,9 @@ def register(client, name: str = "OpenCode") -> str:
     return response.json()["client_id"]
 
 
-def ask(client, client_id: str, challenge: str) -> str:
+async def ask(client, client_id: str, challenge: str) -> str:
     """Start the flow, and return the consent request it parks."""
-    response = client.get(
+    response = await client.get(
         "/authorize",
         params={
             "client_id": client_id,
@@ -2088,9 +2144,9 @@ def ask(client, client_id: str, challenge: str) -> str:
     return parse_qs(urlparse(location).query)["request"][0]
 
 
-def agree(client, request_id: str, *, capabilities=("observe", "suggest"), accounts=(1,)):
+async def agree(client, request_id: str, *, capabilities=("observe", "suggest"), accounts=(1,)):
     """Somebody at the browser ticking boxes and pressing allow."""
-    response = as_a_person(
+    response = await as_a_person(
         client,
         "/consent",
         data={
@@ -2107,8 +2163,8 @@ def agree(client, request_id: str, *, capabilities=("observe", "suggest"), accou
     return handed_back["code"][0]
 
 
-def redeem(client, client_id: str, code: str, verifier: str) -> dict:
-    response = client.post(
+async def redeem(client, client_id: str, code: str, verifier: str) -> dict:
+    response = await client.post(
         "/token",
         data={
             "grant_type": "authorization_code",
@@ -2122,13 +2178,13 @@ def redeem(client, client_id: str, code: str, verifier: str) -> dict:
     return response.json()
 
 
-def log_in(client, **agreed) -> dict:
+async def log_in(client, **agreed) -> dict:
     """The whole walk, for tests that are about what happens afterwards."""
     verifier, challenge = pkce()
-    client_id = register(client)
-    request_id = ask(client, client_id, challenge)
-    code = agree(client, request_id, **agreed)
-    return {"client_id": client_id, **redeem(client, client_id, code, verifier)}
+    client_id = await register(client)
+    request_id = await ask(client, client_id, challenge)
+    code = await agree(client, request_id, **agreed)
+    return {"client_id": client_id, **await redeem(client, client_id, code, verifier)}
 
 
 # --------------------------------------------------------------- what is behind the key
@@ -2150,7 +2206,7 @@ def test_the_page_where_somebody_decides_is_not_a_machine_endpoint():
         assert not is_machine_path(guarded), guarded
 
 
-def test_the_consent_page_says_what_it_is_agreeing_to(client):
+async def test_the_consent_page_says_what_it_is_agreeing_to(client):
     """The page a person actually reads, actually rendered.
 
     Worth its own test because every other test here walks straight past it: the flow can
@@ -2158,9 +2214,9 @@ def test_the_consent_page_says_what_it_is_agreeing_to(client):
     only in front of somebody.
     """
     _, challenge = pkce()
-    request_id = ask(client, register(client), challenge)
+    request_id = await ask(client, await register(client), challenge)
 
-    page = client.get(f"/consent?request={request_id}")
+    page = await client.get(f"/consent?request={request_id}")
     assert page.status_code == 200
 
     # The name it chose for itself, and the fact that it chose it.
@@ -2181,22 +2237,22 @@ def test_the_consent_page_says_what_it_is_agreeing_to(client):
         assert "checked" not in box
 
 
-def test_the_shut_page_names_the_command_that_reopens_it(service):
+async def test_the_shut_page_names_the_command_that_reopens_it(service):
     """Locked out (a restart, a strict cookie) the person is told the way back in."""
     app = create_app(service, session_key=SESSION_KEY)
-    with TestClient(app, base_url="http://127.0.0.1:8765") as stranger:
-        shut = stranger.get("/")
+    async with served(app) as stranger:
+        shut = await stranger.get("/")
     assert shut.status_code == 401
     assert "mailmindctl review --open" in shut.text
 
 
-def test_excluding_lands_back_at_the_row_it_removed(client):
+async def test_excluding_lands_back_at_the_row_it_removed(client):
     """A long table reviewed item by item must not snap to the top per click."""
-    proposed = _propose(Agent(client))
-    page = client.get(f"/bundle/{proposed['bundle_id']}").text
+    proposed = await _propose(await Agent.connect(client))
+    page = (await client.get(f"/bundle/{proposed['bundle_id']}")).text
     form = re.search(r"/bundle/\d+/exclude/(\d+)", page)
     suggestion_id = form.group(1)
-    response = as_a_person(
+    response = await as_a_person(
         client,
         f"/bundle/{proposed['bundle_id']}/exclude/{suggestion_id}",
         follow_redirects=False,
@@ -2205,15 +2261,11 @@ def test_excluding_lands_back_at_the_row_it_removed(client):
     assert "#m" in response.headers["location"] or "#s" in response.headers["location"]
 
 
-def test_an_agent_that_follows_its_own_link_is_told_to_fetch_a_person(service):
+async def test_an_agent_that_follows_its_own_link_is_told_to_fetch_a_person(service):
     """The consent page is not a page an agent can answer for itself."""
-    from fastapi.testclient import TestClient
-
-    from mailmind.web.app import create_app
-
     # No cookie: this client never followed the link a person was shown.
-    stranger = TestClient(create_app(service, session_key="unused"))
-    refused = stranger.get("/consent?request=whatever")
+    async with served(create_app(service, session_key="unused")) as stranger:
+        refused = await stranger.get("/consent?request=whatever")
     assert refused.status_code == 401
     assert "not given that key" in refused.text
 
@@ -2221,13 +2273,13 @@ def test_an_agent_that_follows_its_own_link_is_told_to_fetch_a_person(service):
 # ------------------------------------------------------------------------- discovery
 
 
-def test_an_unauthenticated_call_says_where_to_log_in(client):
+async def test_an_unauthenticated_call_says_where_to_log_in(client):
     """The 401 is the whole of how a client finds out it can log in.
 
     Before this, an agent with no token got a 200 and a refusal from inside a tool, which
     tells a client nothing it can act on.
     """
-    response = client.post(
+    response = await client.post(
         "/mcp/",
         headers={"Accept": "application/json, text/event-stream"},
         json={"jsonrpc": "2.0", "id": 1, "method": "tools/list"},
@@ -2236,37 +2288,37 @@ def test_an_unauthenticated_call_says_where_to_log_in(client):
     challenge = response.headers["www-authenticate"]
     assert "resource_metadata=" in challenge
 
-    metadata = client.get("/.well-known/oauth-protected-resource/mcp").json()
+    metadata = (await client.get("/.well-known/oauth-protected-resource/mcp")).json()
     assert metadata["resource"].endswith("/mcp")
     served_by = metadata["authorization_servers"][0].rstrip("/")
-    assert client.get("/.well-known/oauth-authorization-server").status_code == 200
+    assert (await client.get("/.well-known/oauth-authorization-server")).status_code == 200
     assert served_by
 
 
 # ------------------------------------------------------------------------ the walk
 
 
-def test_an_agent_logs_in_and_gets_the_grant_it_was_given(client):
-    issued = log_in(client)
+async def test_an_agent_logs_in_and_gets_the_grant_it_was_given(client):
+    issued = await log_in(client)
     assert issued["token_type"] == "Bearer"
     assert issued["refresh_token"]
 
-    agent = Agent(client, token=issued["access_token"])
-    assert [a["name"] for a in agent.rows("list_accounts")] == ["test"]
+    agent = await Agent.connect(client, token=issued["access_token"])
+    assert [a["name"] for a in await agent.rows("list_accounts")] == ["test"]
 
 
-def test_what_the_agent_gets_is_what_the_person_ticked(client):
+async def test_what_the_agent_gets_is_what_the_person_ticked(client):
     """The agent does not ask for capabilities, so it cannot ask for too many.
 
     Untick `suggest` and proposing is not a thing that grant can do — and it fails saying
     so, which is a legible thing for a model to read.
     """
-    issued = log_in(client, capabilities=("observe",))
-    agent = Agent(client, token=issued["access_token"])
+    issued = await log_in(client, capabilities=("observe",))
+    agent = await Agent.connect(client, token=issued["access_token"])
 
-    assert agent.rows("list_accounts"), "observing was ticked and did not work"
+    assert await agent.rows("list_accounts"), "observing was ticked and did not work"
     with pytest.raises(ToolRefused) as refused:
-        agent.call(
+        await agent.call(
             "propose_bundle",
             account_id=1,
             operation="delete",
@@ -2277,17 +2329,17 @@ def test_what_the_agent_gets_is_what_the_person_ticked(client):
     assert "suggest" in str(refused.value)
 
 
-def test_allowing_with_no_mail_ticked_bounces_back_to_the_page(client, service):
+async def test_allowing_with_no_mail_ticked_bounces_back_to_the_page(client, service):
     """Allow with nothing ticked is almost always a mistake, so the page asks again.
 
     No accounts on a grant still means no mail rather than all of it — the command line
     can mint such a grant — but the consent page will not create one silently.
     """
     verifier, challenge = pkce()
-    client_id = register(client)
-    request_id = ask(client, client_id, challenge)
+    client_id = await register(client)
+    request_id = await ask(client, client_id, challenge)
 
-    response = as_a_person(
+    response = await as_a_person(
         client,
         "/consent",
         data={
@@ -2303,16 +2355,16 @@ def test_allowing_with_no_mail_ticked_bounces_back_to_the_page(client, service):
     assert "You ticked no mail" in parse_qs(bounced.query)["error"][0]
 
     # The request is still answerable — ticking an account now completes the login.
-    code = agree(client, request_id, accounts=(1,))
-    assert redeem(client, client_id, code, verifier)["access_token"]
+    code = await agree(client, request_id, accounts=(1,))
+    assert (await redeem(client, client_id, code, verifier))["access_token"]
 
 
-def test_refusing_hands_the_client_an_answer_rather_than_silence(client):
+async def test_refusing_hands_the_client_an_answer_rather_than_silence(client):
     verifier, challenge = pkce()
-    client_id = register(client)
-    request_id = ask(client, client_id, challenge)
+    client_id = await register(client)
+    request_id = await ask(client, client_id, challenge)
 
-    response = as_a_person(
+    response = await as_a_person(
         client,
         "/consent",
         data={"request_id": request_id, "decision": "refuse"},
@@ -2322,14 +2374,14 @@ def test_refusing_hands_the_client_an_answer_rather_than_silence(client):
     assert "access_denied" in response.headers["location"]
 
 
-def test_a_code_is_redeemable_once(client):
+async def test_a_code_is_redeemable_once(client):
     verifier, challenge = pkce()
-    client_id = register(client)
-    request_id = ask(client, client_id, challenge)
-    code = agree(client, request_id)
+    client_id = await register(client)
+    request_id = await ask(client, client_id, challenge)
+    code = await agree(client, request_id)
 
-    assert redeem(client, client_id, code, verifier)["access_token"]
-    again = client.post(
+    assert (await redeem(client, client_id, code, verifier))["access_token"]
+    again = await client.post(
         "/token",
         data={
             "grant_type": "authorization_code",
@@ -2345,11 +2397,11 @@ def test_a_code_is_redeemable_once(client):
 # ---------------------------------------------------------------------- afterwards
 
 
-def test_refreshing_rotates_and_the_old_one_stops_working(client):
-    issued = log_in(client)
+async def test_refreshing_rotates_and_the_old_one_stops_working(client):
+    issued = await log_in(client)
     first = issued["refresh_token"]
 
-    rotated = client.post(
+    rotated = await client.post(
         "/token",
         data={
             "grant_type": "refresh_token",
@@ -2362,8 +2414,10 @@ def test_refreshing_rotates_and_the_old_one_stops_working(client):
     assert second["refresh_token"] != first
 
     # The new access token works and the spent refresh token does not.
-    assert Agent(client, token=second["access_token"]).rows("list_accounts")
-    replayed = client.post(
+    assert await (await Agent.connect(client, token=second["access_token"])).rows(
+        "list_accounts"
+    )
+    replayed = await client.post(
         "/token",
         data={
             "grant_type": "refresh_token",
@@ -2374,111 +2428,111 @@ def test_refreshing_rotates_and_the_old_one_stops_working(client):
     assert replayed.status_code == 400, replayed.text
 
 
-def test_refreshing_does_not_multiply_what_a_person_agreed_to(client, service):
+async def test_refreshing_does_not_multiply_what_a_person_agreed_to(client, service):
     """Tokens rotate; the decision does not.
 
     This is the reason a token is not a grant. If it were, an hourly refresh would leave
     the agents page listing a fresh consent every hour and "what did I agree to" would
     stop being answerable.
     """
-    issued = log_in(client)
+    issued = await log_in(client)
 
-    async def _count(scope):
-        return len(await scope.all(sa.select(m.Grant)))
+    async def grants() -> int:
+        async with service.scope() as scope:
+            return len(await scope.all(sa.select(m.Grant)))
 
-    before = scoped(service, _count)
+    before = await grants()
 
     for _ in range(3):
         issued = {
             "client_id": issued["client_id"],
-            **client.post(
-                "/token",
-                data={
-                    "grant_type": "refresh_token",
-                    "refresh_token": issued["refresh_token"],
-                    "client_id": issued["client_id"],
-                },
+            **(
+                await client.post(
+                    "/token",
+                    data={
+                        "grant_type": "refresh_token",
+                        "refresh_token": issued["refresh_token"],
+                        "client_id": issued["client_id"],
+                    },
+                )
             ).json(),
         }
 
-    assert scoped(service, _count) == before
+    assert await grants() == before
 
 
-def test_revoking_on_the_agents_page_stops_a_token_that_was_working(client, service):
-    issued = log_in(client)
-    agent = Agent(client, token=issued["access_token"])
-    assert agent.rows("list_accounts"), "the grant did not work before it was revoked"
+async def test_revoking_on_the_agents_page_stops_a_token_that_was_working(client, service):
+    issued = await log_in(client)
+    agent = await Agent.connect(client, token=issued["access_token"])
+    assert await agent.rows("list_accounts"), "the grant did not work before it was revoked"
 
-    listed = client.get("/agents")
+    listed = await client.get("/agents")
     assert "OpenCode" in listed.text
 
-    async def _work(scope):
+    async with service.scope() as scope:
         grant = await scope.scalar(sa.select(m.Grant).where(m.Grant.client_id.is_not(None)))
-        return grant.id
-
-    grant_id = scoped(service, _work)
-    as_a_person(client, f"/agents/{grant_id}/revoke")
+        grant_id = grant.id
+    await as_a_person(client, f"/agents/{grant_id}/revoke")
 
     with pytest.raises((ToolRefused, AssertionError)):
-        Agent(client, token=issued["access_token"]).rows("list_accounts")
+        await (await Agent.connect(client, token=issued["access_token"])).rows("list_accounts")
 
 
-def test_a_token_minted_on_the_command_line_still_works(client):
+async def test_a_token_minted_on_the_command_line_still_works(client):
     """The regression that would be quietest.
 
     Turning authentication on hands the SDK the right to refuse anything it does not
     recognise, and every client configured the old way holds exactly such a token.
     """
-    assert [a["name"] for a in Agent(client, token=TOKEN).rows("list_accounts")] == ["test"]
+    assert [
+        a["name"]
+        for a in await (await Agent.connect(client, token=TOKEN)).rows("list_accounts")
+    ] == ["test"]
 
 
-def test_an_expired_access_token_is_refused(client, service):
-    issued = log_in(client)
+async def test_an_expired_access_token_is_refused(client, service):
+    issued = await log_in(client)
 
-    async def _work(scope):
+    async with service.scope() as scope:
         row = await scope.scalar(
             sa.select(m.OAuthToken).where(m.OAuthToken.kind == m.OAuthTokenKind.access)
         )
         row.expires_at = dt.datetime.now(dt.UTC) - dt.timedelta(seconds=1)
         await scope.commit()
 
-    scoped(service, _work)
-
     with pytest.raises((ToolRefused, AssertionError)):
-        Agent(client, token=issued["access_token"]).rows("list_accounts")
+        await (await Agent.connect(client, token=issued["access_token"])).rows("list_accounts")
 
 
-def test_a_stale_consent_request_cannot_be_answered(client, service):
+async def test_a_stale_consent_request_cannot_be_answered(client, service):
     verifier, challenge = pkce()
-    client_id = register(client)
-    request_id = ask(client, client_id, challenge)
+    client_id = await register(client)
+    request_id = await ask(client, client_id, challenge)
 
-    async def _work(scope):
+    async with service.scope() as scope:
         row = await scope.scalar(
             sa.select(m.OAuthAuthorization).where(m.OAuthAuthorization.request_id == request_id)
         )
         row.expires_at = dt.datetime.now(dt.UTC) - dt.timedelta(seconds=1)
         await scope.commit()
 
-    scoped(service, _work)
-
-    assert client.get(f"/consent?request={request_id}").status_code == 404
+    assert (await client.get(f"/consent?request={request_id}")).status_code == 404
     assert oauth.REQUEST_TTL > dt.timedelta(0)
 
 
 # ------------------------------------------------------------- background tasks
 
 
-def _stranded_accepted(client, *, with_failed_task: bool) -> tuple[int, int | None]:
+async def _stranded_accepted(client, *, with_failed_task: bool) -> tuple[int, int | None]:
     """An accepted bundle whose apply has not happened — with or without a failed task.
 
     Built directly rather than through the routes, so the live dispatcher (which only
     claims *queued* tasks) leaves the state alone while the page renders.
     """
     service = client.app.state.task_runner.service
-    proposed = _propose(Agent(client))
+    proposed = await _propose(await Agent.connect(client))
 
-    async def _work(scope):
+    async with service.scope() as scope:
         bundle = await scope.get(m.Bundle, proposed["bundle_id"])
         reviewer_row = await scope.scalar(
             sa.select(m.Producer).where(m.Producer.kind == m.ProducerKind.person)
@@ -2507,38 +2561,36 @@ def _stranded_accepted(client, *, with_failed_task: bool) -> tuple[int, int | No
         await scope.commit()
         return proposed["bundle_id"], task_id
 
-    return scoped(service, _work)
 
-
-def test_an_accepted_bundle_is_visible_on_the_queue_not_invisible(client):
+async def test_an_accepted_bundle_is_visible_on_the_queue_not_invisible(client):
     """The stuck-state hole, closed at the page: accepted work has a section of its own."""
-    bundle_id, task_id = _stranded_accepted(client, with_failed_task=True)
-    page = client.get("/").text
+    bundle_id, task_id = await _stranded_accepted(client, with_failed_task=True)
+    page = (await client.get("/")).text
     assert "Being applied" in page
     assert f"/bundle/{bundle_id}" in page
     assert "the mailbox went away mid-apply" in page, "the failure is shown, not hidden"
     assert f"/task/{task_id}/retry" in page, "and there is a way to try again"
 
 
-def test_the_bundle_page_shows_the_apply_and_retry_finishes_it(client, backend):
-    bundle_id, task_id = _stranded_accepted(client, with_failed_task=True)
-    page = client.get(f"/bundle/{bundle_id}").text
+async def test_the_bundle_page_shows_the_apply_and_retry_finishes_it(client, backend):
+    bundle_id, task_id = await _stranded_accepted(client, with_failed_task=True)
+    page = (await client.get(f"/bundle/{bundle_id}")).text
     assert "being applied" in page.lower()
     assert "the mailbox went away mid-apply" in page
 
-    response = as_a_person(client, f"/task/{task_id}/retry", follow_redirects=True)
+    response = await as_a_person(client, f"/task/{task_id}/retry", follow_redirects=True)
     assert response.status_code == 200
-    settle(client)
+    await settle(client)
     assert len(backend.folders["Archive"].messages) == 1
-    assert "applied" in client.get(f"/bundle/{bundle_id}").text
+    assert "applied" in (await client.get(f"/bundle/{bundle_id}")).text
 
 
-def test_a_failed_body_fetch_is_shown_next_to_the_button(client):
+async def test_a_failed_body_fetch_is_shown_next_to_the_button(client):
     """The silent contextlib.suppress hole, closed on the page."""
     service = client.app.state.task_runner.service
-    proposed = _propose(Agent(client))
+    proposed = await _propose(await Agent.connect(client))
 
-    async def _work(scope):
+    async with service.scope() as scope:
         bundle = await scope.get(m.Bundle, proposed["bundle_id"])
         suggestion = sorted(bundle.suggestions, key=lambda s: s.id)[0]
         task = m.Task(
@@ -2551,50 +2603,52 @@ def test_a_failed_body_fetch_is_shown_next_to_the_button(client):
         )
         scope.add(task)
         await scope.commit()
-
-    scoped(service, _work)
-    page = client.get(f"/bundle/{proposed['bundle_id']}").text
+    page = (await client.get(f"/bundle/{proposed['bundle_id']}")).text
     assert "the server closed the connection" in page
     assert "retry" in page
 
 
-def test_request_sync_and_task_status_carry_the_work_to_its_result(client):
+async def test_request_sync_and_task_status_carry_the_work_to_its_result(client):
     """The agent's shape of the same queue: enqueue, poll, read the report."""
-    agent = Agent(client)
-    account = agent.rows("list_accounts")[0]
-    containers = {c["name"]: c for c in agent.rows("list_containers", account_id=account["id"])}
-    asked = agent.call("request_sync", container_id=containers["INBOX"]["id"])
+    agent = await Agent.connect(client)
+    account = (await agent.rows("list_accounts"))[0]
+    containers = {
+        c["name"]: c for c in await agent.rows("list_containers", account_id=account["id"])
+    }
+    asked = await agent.call("request_sync", container_id=containers["INBOX"]["id"])
     assert asked["status"] in ("queued", "running")
     assert "task_id" in asked
 
-    settle(client)
-    outcome = agent.call("task_status", task_id=asked["task_id"])
+    await settle(client)
+    outcome = await agent.call("task_status", task_id=asked["task_id"])
     assert outcome["status"] == "done"
     assert outcome["result"]["folders"] == 1
 
-    joined = agent.call("request_sync", container_id=containers["INBOX"]["id"])
-    settle(client)
+    joined = await agent.call("request_sync", container_id=containers["INBOX"]["id"])
+    await settle(client)
     assert joined["coalesced"] is False, "a finished sync does not satisfy a fresh ask"
 
 
-def test_request_body_becomes_a_task_and_then_the_body(client):
-    agent = Agent(client)
-    account = agent.rows("list_accounts")[0]
-    containers = {c["name"]: c for c in agent.rows("list_containers", account_id=account["id"])}
-    listed = agent.call("list_messages", container_id=containers["INBOX"]["id"], limit=1)
+async def test_request_body_becomes_a_task_and_then_the_body(client):
+    agent = await Agent.connect(client)
+    account = (await agent.rows("list_accounts"))[0]
+    containers = {
+        c["name"]: c for c in await agent.rows("list_containers", account_id=account["id"])
+    }
+    listed = await agent.call("list_messages", container_id=containers["INBOX"]["id"], limit=1)
     message_id = listed["messages"][0]["message_id"]
 
-    first = agent.call("request_body", message_id=message_id)
+    first = await agent.call("request_body", message_id=message_id)
     assert "task_id" in first and first["status"] in ("queued", "running")
-    settle(client)
-    again = agent.call("request_body", message_id=message_id)
+    await settle(client)
+    again = await agent.call("request_body", message_id=message_id)
     assert again.get("body"), "once cached, the body is the answer"
 
 
 async def test_progress_reaches_the_page_as_a_turbo_stream(service):
     """One event off the wire: the SSE endpoint speaks <turbo-stream>.
 
-    Driven at the ASGI level: TestClient buffers whole responses, so an endless stream
+    Driven at the ASGI level: ASGITransport buffers whole responses, so an endless stream
     can never be read through it — here the raw response messages are read until the
     first event and the request is cancelled, which is also what a closing tab does.
     """
@@ -2658,27 +2712,29 @@ async def test_progress_reaches_the_page_as_a_turbo_stream(service):
         assert "3/9" in event and "INBOX" in event
 
 
-def test_a_schema_problem_answers_every_surface_with_503_not_tracebacks(client):
+async def test_a_schema_problem_answers_every_surface_with_503_not_tracebacks(client):
     """What the drift check buys at the page: one honest answer everywhere."""
     service = client.app.state.task_runner.service
     service.schema_problem = "this database is at 0006folder and this build needs 0007task"
     try:
-        page = client.get("/")
+        page = await client.get("/")
         assert page.status_code == 503
         assert "0007task" in page.text
         assert "mailmindctl migrate" in page.text
-        assert client.post("/accounts/choose", data={"account_id": "1"}).status_code == 503
-        assert client.get("/mcp/").status_code == 503, "machine paths say it too"
+        assert (
+            await client.post("/accounts/choose", data={"account_id": "1"})
+        ).status_code == 503
+        assert (await client.get("/mcp/")).status_code == 503, "machine paths say it too"
     finally:
         service.schema_problem = None
-    assert client.get("/").status_code == 200, "and it is only about the schema"
+    assert (await client.get("/")).status_code == 200, "and it is only about the schema"
 
 
-def test_a_prompt_given_an_unsubstituted_placeholder_still_answers(client):
+async def test_a_prompt_given_an_unsubstituted_placeholder_still_answers(client):
     """opencode sends the literal `$1` when its prompt-argument UI is skipped; MCP
     prompt arguments are strings anyway. An instruction comes back, not a traceback."""
-    agent = Agent(client)
-    answer = agent._post(
+    agent = await Agent.connect(client)
+    answer = await agent._post(
         "prompts/get",
         {"name": "triage_mailbox", "arguments": {"container_id": "$1"}},
     )
@@ -2687,7 +2743,7 @@ def test_a_prompt_given_an_unsubstituted_placeholder_still_answers(client):
     assert "list_containers" in text, "it says how to find the real id"
     assert "$1" not in text
 
-    numbered = agent._post(
+    numbered = await agent._post(
         "prompts/get",
         {"name": "triage_mailbox", "arguments": {"container_id": "3"}},
     )
