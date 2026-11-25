@@ -646,29 +646,35 @@ async def test_rejecting_the_ticked_bundles_from_the_queue(page, bundle_at):
         await tick(third.id).check()
         was = await tick(second.id).bounding_box()
         fourth = await propose("fourth")
-        await page.get_by_role("button", name="Show 1 new").wait_for(timeout=10_000)
+        await page.get_by_role("button", name="Update the list: 1 new").wait_for(timeout=10_000)
         assert await tick(fourth.id).count() == 0
         assert await tick(second.id).bounding_box() == was, "the rows moved"
-        await page.get_by_role("button", name="Show 1 new").click()
+        await page.get_by_role("button", name="Update the list: 1 new").click()
         assert not await tick(fourth.id).is_checked()
         fifth = await propose("fifth")
-        await page.get_by_role("button", name="Show 1 new").wait_for(timeout=10_000)
+        await page.get_by_role("button", name="Update the list: 1 new").wait_for(timeout=10_000)
         await page.get_by_role("button", name="Reject 2 bundles").wait_for()
+        below = await tick(second.id).bounding_box()
         await suggest.withdraw(scope, third, producer, "mine")
         await scope.commit()
 
     button = page.get_by_role("button", name="Reject 1 bundle", exact=True)
     await button.wait_for(timeout=10_000)
+    # What is gone keeps its row, so nothing below it moved, and cannot be ticked.
+    await page.get_by_role("button", name="Update the list: 1 new, 1 gone").wait_for()
+    assert await tick(third.id).is_disabled()
+    assert await tick(second.id).bounding_box() == below, "the rows moved"
     await page.get_by_placeholder("why not").fill("not now")
     await button.click()
     await tick(second.id).wait_for(state="detached", timeout=10_000)
     assert await page.get_by_text("Not rejected").count() == 0, "a withdrawn one was sent"
+    assert await tick(third.id).count() == 0
     none = page.get_by_role("button", name="Reject 0 bundles")
     assert await none.is_disabled()
     # Nothing is ticked any more, so nothing is held back.
     await tick(fifth.id).wait_for()
     assert await tick(fourth.id).count() == await tick(bundle_id).count() == 1
-    assert await page.get_by_role("button", name="Show").count() == 0
+    assert await page.get_by_role("button", name="Update the list").count() == 0
     assert await page.evaluate("document.body.dataset.mark") == "1", "the page was replaced"
     async with another_process(backend) as scope:
         gone = await scope.get(m.Bundle, second.id)
@@ -716,11 +722,23 @@ async def test_the_queue_is_walked_ticked_and_opened_from_the_keyboard(page, bun
     assert await press("Control+j") == 1, "a browser shortcut is not ours"
 
     # The row the keyboard is on leaves: the place is kept, and the next key lands there.
-    await press("j")
+    await press("j", "x")
     queue["bundles"] = [waiting[0], waiting[2]]
     events.put_nowait(None)
     await box(2).wait_for(state="detached")
     assert await press("j") == 3
+
+    # While something is ticked a row stays, and the keys pass over what cannot be ticked.
+    queue["bundles"] = waiting
+    events.put_nowait(None)
+    await box(2).wait_for()
+    await box(1).check()
+    queue["bundles"] = [waiting[0], waiting[2]]
+    events.put_nowait(None)
+    await page.get_by_role("button", name="Update the list: 1 gone").wait_for()
+    assert [await press(k) for k in "jkj"] == [3, 1, 3]
+    await page.get_by_role("button", name="Update the list: 1 gone").click()
+    await box(2).wait_for(state="detached")
 
     reason = page.get_by_placeholder("why not")
     await reason.click()
@@ -731,6 +749,49 @@ async def test_the_queue_is_walked_ticked_and_opened_from_the_keyboard(page, bun
     await box(3).focus()
     await page.keyboard.press("Enter")
     await page.wait_for_url("**/bundle/3")
+
+
+async def test_coming_back_from_a_bundle_finds_the_place_again(page, bundle_at):
+    base, _, _ = bundle_at
+    waiting = [{**BUNDLE, "bundle_id": n, "item_count": 3, "stale_count": 0} for n in (1, 2, 3)]
+    queue = {
+        "account": "test",
+        "elsewhere": [],
+        "bundles": waiting,
+        "applying": [],
+        "recent": [],
+    }
+
+    async def serve(route):  # noqa: ANN001, ANN202
+        await route.fulfill(json=queue)
+
+    await page.route("**/api/queue", serve)
+
+    async def focused_on_return():  # noqa: ANN202
+        await page.goto(f"{base}/")
+        await page.get_by_label("choose bundle 3", exact=True).wait_for()
+        await page.wait_for_timeout(200)
+        return await page.evaluate("document.activeElement.value")
+
+    assert await focused_on_return() is None, "only on the way back"
+
+    await page.get_by_label("choose bundle 2", exact=True).focus()
+    await page.keyboard.press("Enter")
+    await page.wait_for_url("**/bundle/2")
+    assert await focused_on_return() == "2"
+
+    # The usual way back: what was opened has been decided.
+    await page.get_by_role("link", name="review", exact=True).nth(1).click()
+    await page.wait_for_url("**/bundle/2")
+    queue["bundles"] = [waiting[0], waiting[2]]
+    assert await focused_on_return() == "3"
+
+    # The bundle is found wherever arrivals have pushed it.
+    await page.get_by_role("link", name="review", exact=True).nth(1).click()
+    await page.wait_for_url("**/bundle/3")
+    queue["bundles"] = [{**waiting[0], "bundle_id": 9}, *waiting]
+    assert await focused_on_return() == "3"
+    assert await focused_on_return() is None, "the place is used once"
 
 
 async def test_enter_on_a_button_is_the_buttons(page, bundle_at):

@@ -1,5 +1,5 @@
 <script>
-  import { onMount } from "svelte";
+  import { onMount, tick } from "svelte";
   import { get, listen, oneAtATime, post, taskIsLive } from "./api.js";
   import Effect from "./Effect.svelte";
   import Task from "./Task.svelte";
@@ -11,30 +11,62 @@
   let reason = $state("");
   let rejecting = $state(false);
   let refused = $state([]);
-  let held = $state([]);
+  let rows = $state([]);
   let body = $state(null);
   // Where the keyboard is, kept so that a row leaving does not lose the place.
   let at = -1;
 
   const ids = (bundles) => bundles.map((each) => each.bundle_id);
-  const rows = $derived((queue?.bundles ?? []).filter((each) => !held.includes(each.bundle_id)));
-  // Only what is on the page: a bundle decided elsewhere leaves with its tick.
-  const chosen = $derived(ids(rows).filter((id) => picked.includes(id)));
+  // Only what can still be decided: a bundle decided elsewhere leaves with its tick.
+  const chosen = $derived(
+    ids(rows.filter((each) => !each.gone)).filter((id) => picked.includes(id)),
+  );
+  const held = $derived(
+    (queue?.bundles ?? []).filter((each) => !ids(rows).includes(each.bundle_id)).length,
+  );
+  const gone = $derived(rows.filter((each) => each.gone).length);
   const several = (count) => `${count} bundle${count === 1 ? "" : "s"}`;
 
+  // Rows do not move under a pointer that is ticking them: while something is ticked, what
+  // arrives waits to be asked for and what goes keeps its row.
   function take(fresh) {
-    // Rows do not move under a pointer that is ticking them: while something is ticked,
-    // what arrives waits to be asked for.
-    const shown = ids(rows);
-    const arrived = ids(fresh.bundles).filter((id) => !shown.includes(id));
-    const ticking = ids(fresh.bundles).some((id) => chosen.includes(id));
-    held = ticking ? arrived : [];
+    if (chosen.length) {
+      const open = new Map(fresh.bundles.map((each) => [each.bundle_id, each]));
+      rows = rows.map((each) => open.get(each.bundle_id) ?? { ...each, gone: true });
+    } else rows = fresh.bundles;
     queue = fresh;
+  }
+
+  const PLACE = "mailmind-queue-place";
+
+  // A convenience: without storage, coming back starts at the top.
+  function leave(event) {
+    const row = event.target.closest("a") && event.target.closest("tr");
+    if (!row) return;
+    const index = [...body.rows].indexOf(row);
+    try {
+      sessionStorage.setItem(PLACE, JSON.stringify({ index, id: rows[index].bundle_id }));
+    } catch {}
+  }
+
+  function comeBack() {
+    try {
+      const place = JSON.parse(sessionStorage.getItem(PLACE));
+      sessionStorage.removeItem(PLACE);
+      if (!place || !body) return;
+      const index = ids(rows).indexOf(place.id);
+      go(index < 0 ? Math.min(place.index, rows.length - 1) : index, 1);
+    } catch {}
   }
 
   const load = oneAtATime(async () => {
     try {
+      const first = !queue;
       take(await get("/api/queue"));
+      if (first) {
+        await tick();
+        comeBack();
+      }
       error = "";
     } catch (problem) {
       error = problem.message;
@@ -74,9 +106,12 @@
     }
   }
 
-  function go(to) {
-    const boxes = body.querySelectorAll("input");
-    at = Math.max(0, Math.min(to, boxes.length - 1));
+  function go(to, step) {
+    const boxes = [...body.rows].map((row) => row.querySelector("input"));
+    if (to < 0) to = 0;
+    while (boxes[to]?.disabled) to += step;
+    if (!boxes[to]) return;
+    at = to;
     boxes[at].focus();
   }
 
@@ -86,8 +121,8 @@
     if (target.matches("input:not([type=checkbox]), textarea, select")) return;
     const row = target.closest("tbody") === body ? target.closest("tr") : null;
     if (row) at = [...body.rows].indexOf(row);
-    if (event.key === "j") go(row ? at + 1 : at);
-    else if (event.key === "k") go(row ? at - 1 : at);
+    if (event.key === "j") go(row ? at + 1 : Math.min(at, rows.length - 1), 1);
+    else if (event.key === "k") go(row ? at - 1 : Math.min(at, rows.length - 1), -1);
     else if (event.key === "x" && row && !event.repeat) row.querySelector("input").click();
     else if (event.key === "Enter" && target.matches("[type=checkbox]") && row)
       row.querySelector("a").click();
@@ -118,16 +153,17 @@
           <th></th><th>What would happen</th><th>Messages</th><th>From</th><th>Why</th><th></th>
         </tr>
       </thead>
-      <tbody class="keyed" bind:this={body}>
+      <!-- svelte-ignore a11y_click_events_have_key_events, a11y_no_noninteractive_element_interactions -->
+      <tbody class="keyed" bind:this={body} onclick={leave}>
         {#each rows as bundle (bundle.bundle_id)}
-          <tr>
+          <tr class:stale={bundle.gone} title={bundle.gone ? "no longer waiting" : null}>
             <td>
               <input
                 type="checkbox"
                 aria-label="choose bundle {bundle.bundle_id}"
                 value={bundle.bundle_id}
                 bind:group={picked}
-                disabled={rejecting}
+                disabled={rejecting || bundle.gone}
               />
             </td>
             <td class="effect"><Effect {bundle} /></td>
@@ -145,8 +181,12 @@
     <form class="actions" onsubmit={reject}>
       <input bind:value={reason} placeholder="why not (optional)" size="30" />
       <button disabled={!chosen.length || rejecting}>Reject {several(chosen.length)}</button>
-      {#if held.length}
-        <button type="button" onclick={() => (held = [])}>Show {held.length} new</button>
+      {#if held || gone}
+        <button type="button" onclick={() => (rows = queue.bundles)}>
+          Update the list: {[held && `${held} new`, gone && `${gone} gone`]
+            .filter(Boolean)
+            .join(", ")}
+        </button>
       {/if}
       <span class="small muted">
         To accept one, review it. Keys: j and k move, x ticks, Enter reviews.
