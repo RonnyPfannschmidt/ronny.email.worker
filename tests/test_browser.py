@@ -642,11 +642,17 @@ async def test_rejecting_the_ticked_bundles_from_the_queue(page, bundle_at):
         await page.evaluate("document.body.dataset.mark = 1")
         assert await page.get_by_role("button", name="Accept").count() == 0
 
-        # What arrives is not ticked, and what is withdrawn takes its tick along.
+        # What arrives waits, and what is withdrawn takes its tick along.
         await tick(third.id).check()
+        was = await tick(second.id).bounding_box()
         fourth = await propose("fourth")
-        await tick(fourth.id).wait_for(timeout=10_000)
+        await page.get_by_role("button", name="Show 1 new").wait_for(timeout=10_000)
+        assert await tick(fourth.id).count() == 0
+        assert await tick(second.id).bounding_box() == was, "the rows moved"
+        await page.get_by_role("button", name="Show 1 new").click()
         assert not await tick(fourth.id).is_checked()
+        fifth = await propose("fifth")
+        await page.get_by_role("button", name="Show 1 new").wait_for(timeout=10_000)
         await page.get_by_role("button", name="Reject 2 bundles").wait_for()
         await suggest.withdraw(scope, third, producer, "mine")
         await scope.commit()
@@ -659,11 +665,83 @@ async def test_rejecting_the_ticked_bundles_from_the_queue(page, bundle_at):
     assert await page.get_by_text("Not rejected").count() == 0, "a withdrawn one was sent"
     none = page.get_by_role("button", name="Reject 0 bundles")
     assert await none.is_disabled()
+    # Nothing is ticked any more, so nothing is held back.
+    await tick(fifth.id).wait_for()
     assert await tick(fourth.id).count() == await tick(bundle_id).count() == 1
+    assert await page.get_by_role("button", name="Show").count() == 0
     assert await page.evaluate("document.body.dataset.mark") == "1", "the page was replaced"
     async with another_process(backend) as scope:
         gone = await scope.get(m.Bundle, second.id)
         assert (gone.status, gone.decision_reason) == (m.BundleStatus.rejected, "not now")
+    assert page.problems == []
+
+
+async def test_the_queue_is_walked_ticked_and_opened_from_the_keyboard(page, bundle_at):
+    base, _, _ = bundle_at
+    waiting = [{**BUNDLE, "bundle_id": n, "item_count": 3, "stale_count": 0} for n in (1, 2, 3)]
+    events = asyncio.Queue()
+    queue = {
+        "account": "test",
+        "elsewhere": [],
+        "bundles": waiting,
+        "applying": [],
+        "recent": [],
+    }
+
+    async def serve(route):  # noqa: ANN001, ANN202
+        await route.fulfill(json=queue)
+
+    async def stream(route):  # noqa: ANN001, ANN202
+        await events.get()
+        await route.fulfill(
+            body="retry: 100\nevent: ready\ndata: {}\n\n", content_type="text/event-stream"
+        )
+
+    await page.route("**/api/queue", serve)
+    await page.route("**/api/events", stream)
+    events.put_nowait(None)
+    await page.goto(f"{base}/")
+    box = lambda n: page.get_by_label(f"choose bundle {n}", exact=True)  # noqa: E731
+    await box(1).wait_for()
+    here = "Number(document.activeElement.value)"
+
+    async def press(*keys) -> int:  # noqa: ANN002
+        for each in keys:
+            await page.keyboard.press(each)
+        return await page.evaluate(here)
+
+    assert [await press(k) for k in "jjjjkx"] == [1, 2, 3, 3, 2, 2]
+    assert [await box(n).is_checked() for n in (1, 2, 3)] == [False, True, False]
+    assert await press("k", "k") == 1
+    assert await press("Control+j") == 1, "a browser shortcut is not ours"
+
+    # The row the keyboard is on leaves: the place is kept, and the next key lands there.
+    await press("j")
+    queue["bundles"] = [waiting[0], waiting[2]]
+    events.put_nowait(None)
+    await box(2).wait_for(state="detached")
+    assert await press("j") == 3
+
+    reason = page.get_by_placeholder("why not")
+    await reason.click()
+    await reason.press_sequentially("jxk")
+    assert await reason.input_value() == "jxk"
+    assert not await box(3).is_checked()
+
+    await box(3).focus()
+    await page.keyboard.press("Enter")
+    await page.wait_for_url("**/bundle/3")
+
+
+async def test_enter_on_a_button_is_the_buttons(page, bundle_at):
+    base, _, _ = bundle_at
+    await page.goto(f"{base}/")
+    await page.get_by_label("choose bundle 1").check()
+    async with page.expect_request("**/api/queue/reject"):
+        await page.get_by_role("button", name="Reject 1 bundle").press("Enter")
+    await page.get_by_text("Nothing to review").wait_for()
+    for each in ("j", "k", "x"):
+        await page.keyboard.press(each)
     assert page.problems == []
 
 
