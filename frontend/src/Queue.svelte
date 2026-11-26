@@ -39,13 +39,13 @@
 
   const PLACE = "mailmind-queue-place";
 
-  // A convenience: without storage, coming back starts at the top.
+  // A convenience: without storage, coming back starts at the top with nothing ticked.
   function leave(event) {
     const row = event.target.closest("a") && event.target.closest("tr");
     if (!row) return;
     const index = [...body.rows].indexOf(row);
     try {
-      sessionStorage.setItem(PLACE, JSON.stringify({ index, id: rows[index].bundle_id }));
+      sessionStorage.setItem(PLACE, JSON.stringify({ index, id: rows[index].bundle_id, picked: chosen }));
     } catch {}
   }
 
@@ -54,6 +54,8 @@
       const place = JSON.parse(sessionStorage.getItem(PLACE));
       sessionStorage.removeItem(PLACE);
       if (!place || !body) return;
+      // What was decided while away is not on the queue, so `chosen` drops its tick.
+      picked = place.picked ?? [];
       const index = ids(rows).indexOf(place.id);
       go(index < 0 ? Math.min(place.index, rows.length - 1) : index, 1);
     } catch {}
