@@ -1,0 +1,25 @@
+# The review UI and MCP endpoint as a user unit, run through the deploy repository.
+#
+#   ln -s $PWD/mailmind.service ~/.config/systemd/user/
+#   systemctl --user daemon-reload && systemctl --user enable --now mailmind
+#
+# No --watch: the code changes when `mailmindctl redeploy` says so, not when a file is
+# saved under a running service.
+
+[Unit]
+Description=mailmind: review UI and MCP endpoint
+
+[Service]
+Type=exec
+# Adjust both paths. The configuration is named because nothing here should depend on
+# where the process starts; give its database_url an absolute path for the same reason.
+Environment=MAILMIND_CONFIG=%h/.config/mailmind/mailmind.toml
+ExecStart=/usr/bin/env uv run --directory %h/src/my-mailmind mailmindctl serve
+# The key to the review UI goes to a file, never to the journal.
+StandardOutput=null
+StandardError=journal
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target

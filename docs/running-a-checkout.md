@@ -104,6 +104,33 @@ ask for another with `uv lock --upgrade-package mailmind`. `uvx --from
 git+https://github.com/RonnyPfannschmidt/ronny.email.worker mailmindctl …` is the same
 thing without a project around it.
 
+## Redeploying a unit
+
+A unit that serves from a checkout reads templates, the built interface and migrations from
+it while it runs, so a pull lands under a live service, possibly halfway through applying a
+bundle. `mailmindctl redeploy` does the steps in the order that avoids that. Run it from
+the directory the unit runs `uv run` in, with the configuration it uses:
+
+```
+uv run mailmindctl redeploy --unit mailmind-review \
+    --while-stopped 'git -C ../ronny.email.worker pull --ff-only'
+```
+
+1. **Wait for idle:** no task queued or running, and no audit event for `--quiet` seconds
+   (20). It gives up after `--wait` (400) with nothing stopped.
+2. **Stop** the unit, then run `--while-stopped`, if given.
+3. **Build** the interface with npm, when mailmind is an editable checkout. A wheel
+   already carries it.
+4. **`uv run mailmindctl migrate`**, which also re-syncs the environment.
+5. **Start** the unit, then check `/`, the login link, `/api/events` and the journal since
+   the stop.
+
+Anything that can be checked beforehand (the unit exists, `uv` and `npm` are on PATH) is
+checked before the stop. A failure after it leaves the unit stopped and names the step,
+because starting into a half-merged tree or a half-built interface is worse than a unit
+that says it is down. [`integrations/deploy-repo/`](https://github.com/RonnyPfannschmidt/ronny.email.worker/tree/main/integrations/deploy-repo)
+is a deploy repository to copy, with the pyproject and unit this expects.
+
 ## A checkout when there is one, the ref when there is not
 
 There is no source that resolves to a path if the directory exists and to a git ref
