@@ -794,7 +794,7 @@ async def test_coming_back_from_a_bundle_finds_the_place_again(page, bundle_at):
     assert await focused_on_return() is None, "the place is used once"
 
 
-async def test_ticks_survive_opening_a_bundle(page, bundle_at):
+async def test_ticks_and_reason_survive_opening_a_bundle(page, bundle_at):
     base, _, _ = bundle_at
     waiting = [{**BUNDLE, "bundle_id": n, "item_count": 3, "stale_count": 0} for n in (1, 2, 3)]
     queue = {
@@ -820,10 +820,12 @@ async def test_ticks_survive_opening_a_bundle(page, bundle_at):
     await page.goto(f"{base}/")
     await page.get_by_label("choose bundle 1", exact=True).check()
     await page.get_by_label("choose bundle 3", exact=True).check()
+    await page.get_by_placeholder("why not").fill("half a thought")
     await page.get_by_role("link", name="review", exact=True).nth(1).click()
     await page.wait_for_url("**/bundle/2")
     await page.goto(f"{base}/")
     assert await ticked() == ["1", "3"]
+    assert await page.get_by_placeholder("why not").input_value() == "half a thought"
     assert await page.get_by_role("button", name="Reject 2 bundles").is_enabled()
 
     # Decided while away: that tick goes with the bundle.
@@ -839,6 +841,7 @@ async def test_ticks_survive_opening_a_bundle(page, bundle_at):
     queue["bundles"] = waiting
     await page.goto(f"{base}/")
     assert await ticked() == [], "only on the way back from a bundle"
+    assert await page.get_by_placeholder("why not").input_value() == ""
 
 
 async def test_enter_on_a_button_is_the_buttons(page, bundle_at):
