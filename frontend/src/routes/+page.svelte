@@ -1,10 +1,10 @@
 <script>
   import { onMount, tick } from "svelte";
-  import { get, listen, oneAtATime, post, taskIsLive } from "./api.js";
-  import Effect from "./Effect.svelte";
-  import Task from "./Task.svelte";
+  import { cache, listen, oneAtATime, post, read, taskIsLive } from "#lib/api.js";
+  import Effect from "#lib/Effect.svelte";
+  import Task from "#lib/Task.svelte";
 
-  let { csrf } = $props();
+  const QUEUE = "/api/queue";
   let queue = $state(null);
   let error = $state("");
   let picked = $state([]);
@@ -62,19 +62,26 @@
     } catch {}
   }
 
+  // Once per visit, on the first rows drawn: the cached ones when there are any.
+  let placed = false;
+  async function place() {
+    if (placed) return;
+    placed = true;
+    await tick();
+    comeBack();
+  }
+
   const load = oneAtATime(async () => {
     try {
-      const first = !queue;
-      take(await get("/api/queue"));
-      if (first) {
-        await tick();
-        comeBack();
-      }
+      take(await read(QUEUE));
+      await place();
       error = "";
     } catch (problem) {
       error = problem.message;
     }
   });
+
+  if (cache.has(QUEUE)) take(cache.get(QUEUE));
 
   function taskChanged(task) {
     if (task.kind !== "apply_bundle") return;
@@ -85,7 +92,7 @@
 
   async function retry(task) {
     try {
-      await post(`/api/task/${task.id}/retry`, csrf);
+      await post(`/api/task/${task.id}/retry`);
       await load();
     } catch (problem) {
       error = problem.message;
@@ -98,7 +105,7 @@
     error = "";
     try {
       const fields = chosen.map((id) => ["bundle", id]);
-      ({ refused } = await post("/api/queue/reject", csrf, [...fields, ["reason", reason]]));
+      ({ refused } = await post("/api/queue/reject", [...fields, ["reason", reason]]));
       picked = [];
       reason = "";
       await load();
@@ -133,8 +140,13 @@
     event.preventDefault();
   }
 
-  onMount(() => listen(load, taskChanged, load));
+  onMount(() => {
+    if (queue) place();
+    return listen(load, taskChanged, load);
+  });
 </script>
+
+<svelte:head><title>review queue — mailmind</title></svelte:head>
 
 <svelte:window onkeydown={key} />
 

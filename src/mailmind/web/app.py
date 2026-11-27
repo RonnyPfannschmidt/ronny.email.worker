@@ -28,13 +28,12 @@ from mcp.server.auth.provider import construct_redirect_uri
 from mcp.server.transport_security import TransportSecuritySettings
 from starlette.middleware.base import BaseHTTPMiddleware
 
-from mailmind import tasks, views
+from mailmind import views
 from mailmind.config import check_exposure, is_wildcard, oauth_issuer
 from mailmind.db import models as m
 from mailmind.mcp import oauth
 from mailmind.mcp import server as mcp_server
 from mailmind.service import Service
-from mailmind.suggest import model as suggest
 from mailmind.web import interface
 from mailmind.worker import TaskRunner
 
@@ -59,21 +58,16 @@ def _local(value, fmt: str):  # noqa: ANN001
 TEMPLATES.env.filters["when"] = lambda value: _local(value, "%d %b %Y %H:%M")
 TEMPLATES.env.filters["day"] = lambda value: _local(value, "%d %b %Y")
 
-#: No inline script, no eval, no remote anything.  A remote image would tell a sender
-#: their mail was read, and this page renders mail written by strangers.  The scripts are
-#: the interface built from frontend/, served by this process from /static; connect-src
-#: covers their requests and event streams, all to ourselves.
+#: No eval, no remote anything, and no inline script but the one that boots the interface,
+#: named by its hash on the page that carries it.  A remote image would tell a sender their
+#: mail was read, and this page renders mail written by strangers.  The scripts are the
+#: interface built from frontend/, served by this process from /_app; connect-src covers
+#: their requests and event stream, all to ourselves.
 CSP = (
     "default-src 'none'; style-src 'self' 'unsafe-inline'; script-src 'self'; "
     "connect-src 'self'; form-action 'self'; "
     "base-uri 'none'; frame-ancestors 'none'; img-src 'none'"
 )
-
-
-#: How many messages one folder page shows.  Not the agent's bounded-observation limit
-#: (05): that one is about a model asking for more than it can read, and this is a person
-#: paging through their own mail, told the total either way.
-MAIL_PAGE = 100
 
 
 async def chosen_account(scope) -> m.Account | None:  # noqa: ANN001
@@ -297,10 +291,6 @@ def _mount_login(app: FastAPI, service: Service, public_url: str) -> None:
     app.router.routes.extend(routes)
 
 
-#: Holds only what the frontend build writes, so a fresh checkout has no such directory.
-STATIC = Path(__file__).parent / "static"
-
-
 class _BuiltFiles(StaticFiles):
     """Static files from a directory a fresh checkout does not have yet.
 
@@ -406,11 +396,11 @@ def create_app(
             status_code=403,
         )
 
-    # Behind the session key on purpose: the pages that use it are, so their script is.
+    # Behind the session key on purpose: the page that uses it is, so its script is.
     app.mount(
-        "/static",
-        _BuiltFiles(directory=str(STATIC), check_dir=False),
-        name="static",
+        "/_app",
+        _BuiltFiles(directory=str(interface.UI / "_app"), check_dir=False),
+        name="app",
     )
 
     @app.middleware("http")
@@ -489,7 +479,8 @@ def create_app(
             return unavailable_page(service.schema_problem)
         response = await call_next(request)
         if not is_machine_path(request.url.path):
-            response.headers["Content-Security-Policy"] = CSP
+            # The shell names its own boot script's hash on top of this, and nothing else.
+            response.headers.setdefault("Content-Security-Policy", CSP)
             # `no-referrer` is the tighter-looking choice and was the wrong one: browsers
             # derive a form POST's Origin from the referrer policy, so it arrived as
             # `Origin: null` and this service refused its own buttons.  `same-origin`
@@ -513,226 +504,7 @@ def create_app(
 
     # -------------------------------------------------------------- the queue
 
-    interface.mount(app, service, render, chrome, changes, reviewer)
-
-    @app.post("/bundle/{bundle_id}/accept", dependencies=changes)
-    async def accept_bundle(  # noqa: ANN202
-        bundle_id: int,
-        reviewed_through: int = Form(default=0),
-        acknowledge_stale: str = Form(default=""),
-    ):
-        async with service.scope() as scope:
-            bundle = await scope.get(m.Bundle, bundle_id)
-            if bundle is None:
-                return HTMLResponse("no such bundle", status_code=404)
-            try:
-                # What the page being accepted from actually showed.  Without it, accept
-                # would mean "this bundle as it stands now" rather than "the bundle I read".
-                await suggest.accept(
-                    scope,
-                    bundle,
-                    await reviewer(scope),
-                    reviewed_through=reviewed_through,
-                    acknowledge_stale=bool(acknowledge_stale),
-                )
-            except suggest.ProposalRefused as exc:
-                await scope.commit()
-                return _back(bundle_id, str(exc))
-
-            # The accept is recorded; the mailbox work is the runner's.  The page shows
-            # the apply as it runs, and a failure is a row with a retry — not a stuck
-            # invisible bundle.
-            await tasks.enqueue(
-                scope,
-                kind=m.TaskKind.apply_bundle,
-                account_id=bundle.account_id,
-                subject_id=bundle.id,
-                requested_by=(await reviewer(scope)).id,
-            )
-            await scope.commit()
-        service.notify_tasks()
-        return _back(bundle_id, None)
-
-    @app.post("/bundle/{bundle_id}/reject", dependencies=changes)
-    async def reject_bundle(bundle_id: int, reason: str = Form(default="")):  # noqa: ANN202
-        async with service.scope() as scope:
-            bundle = await scope.get(m.Bundle, bundle_id)
-            if bundle is None:
-                return HTMLResponse("no such bundle", status_code=404)
-            error = None
-            try:
-                await suggest.reject(scope, bundle, await reviewer(scope), reason or None)
-            except suggest.ProposalRefused as exc:
-                error = str(exc)
-            await scope.commit()
-        return _back(bundle_id, error)
-
-    # --------------------------------------------------- reading and filing by hand
-
-    async def _folder_options(scope, account_id: int) -> list[dict]:  # noqa: ANN001
-        """Somewhere to move mail to, in the order the folder list shows it."""
-        return views.flattened(
-            views.as_tree(
-                (await views.containers(scope, account_id))["containers"],
-                await views.container_delimiter(scope, account_id),
-            )
-        )
-
-    # A person browsing their own mail, and filing it the same way an agent proposes:
-    # selecting messages here builds a bundle whose producer is the reviewer, and the
-    # review page is where it is read and accepted.  Deliberately not a second way into
-    # the mailbox — 01 says this is not where mail is read, and this stays a triage view
-    # rather than a client: text only, no HTML, no attachments, nothing marked read.
-
-    @app.get("/mail", response_class=HTMLResponse)
-    async def mail_folders(request: Request):  # noqa: ANN202
-        async with service.scope(readonly=True) as scope:
-            header = await chrome(scope)
-            current = header["current_account"]
-            tree = []
-            if current:
-                tree = views.as_tree(
-                    (await views.containers(scope, current["id"]))["containers"],
-                    await views.container_delimiter(scope, current["id"]),
-                )
-            return render(request, "mail_folders.html", tree=tree, **header)
-
-    @app.get("/mail/message/{message_id}", response_class=HTMLResponse)
-    async def mail_message(request: Request, message_id: int):  # noqa: ANN202
-        async with service.scope(readonly=True) as scope:
-            try:
-                detail = await views.message_detail(scope, message_id)
-            except LookupError:
-                return HTMLResponse("no such message", status_code=404)
-            container = (
-                await scope.get(m.Container, detail["container_id"])
-                if detail["container_id"]
-                else None
-            )
-            folders = await _folder_options(scope, container.account_id) if container else []
-            return render(
-                request,
-                "message.html",
-                message=detail,
-                container={"id": container.id, "name": container.name} if container else None,
-                folders=folders,
-                script=interface.script_for("src/message.js"),
-                **await chrome(scope),
-            )
-
-    @app.get("/mail/{container_id}", response_class=HTMLResponse)
-    async def mail_container(  # noqa: ANN202
-        request: Request,
-        container_id: int,
-        offset: int = 0,
-        unread: str = "",
-        error: str | None = None,
-    ):
-        async with service.scope(readonly=True) as scope:
-            container = await scope.get(m.Container, container_id)
-            if container is None:
-                return HTMLResponse("no such folder", status_code=404)
-            listing = await views.messages(
-                scope,
-                container_id=container_id,
-                limit=MAIL_PAGE,
-                offset=max(offset, 0),
-                unread_only=bool(unread),
-            )
-            return render(
-                request,
-                "mail_container.html",
-                container={"id": container.id, "name": container.name},
-                listing=listing,
-                folders=await _folder_options(scope, container.account_id),
-                offset=max(offset, 0),
-                page=MAIL_PAGE,
-                unread=bool(unread),
-                error=error,
-                **await chrome(scope),
-            )
-
-    @app.post("/mail/{container_id}/file", dependencies=changes)
-    async def file_messages(  # noqa: ANN202
-        request: Request,
-        container_id: int,
-        operation: str = Form(default="move"),
-        target_container_id: str = Form(default=""),
-        target_container_name: str = Form(default=""),
-    ):
-        """What a person picked, proposed as a bundle of their own.
-
-        It goes to the review page rather than to the mailbox.  Nothing here is a shorter
-        path than the one an agent's proposal takes: the same enumerated effect is read,
-        and the same accept applies it.
-        """
-        back = f"/mail/{container_id}"
-        # The checkboxes come off the form rather than out of a signature: a repeated
-        # field is a list, and Starlette has already parsed this form for the CSRF check.
-        form = await request.form()
-        picked = [int(v) for v in form.getlist("message_id") if str(v).isdigit()]
-        async with service.scope() as scope:
-            container = await scope.get(m.Container, container_id)
-            if container is None:
-                return HTMLResponse("no such folder", status_code=404)
-            account = await scope.get(m.Account, container.account_id)
-            if not picked:
-                return _to(back, "nothing was selected, so there is nothing to propose")
-            try:
-                op = m.Operation(operation)
-                if op not in (m.Operation.move, m.Operation.delete):
-                    raise ValueError(operation)
-            except ValueError:
-                return _to(back, f"{operation!r} is not something this page proposes")
-
-            # The destination fields are on the form whichever button was pressed, and a
-            # delete that carried one would draw as "delete → Archive" on the review page.
-            # A delete goes to Trash and names nothing else.
-            named_id = target_container_id.strip() if op is m.Operation.move else ""
-            named_name = target_container_name.strip() if op is m.Operation.move else ""
-            if named_id and not named_id.isdigit():
-                return _to(back, "that is not a folder this page offered")
-            try:
-                bundle = await suggest.propose_bundle(
-                    scope,
-                    producer=await reviewer(scope),
-                    account=account,
-                    operation=op,
-                    message_ids=picked,
-                    summary=(
-                        f"{len(picked)} message{'s' if len(picked) > 1 else ''} "
-                        f"picked out of {container.name}"
-                    ),
-                    reason="Chosen by hand in the mail view.",
-                    target_container_id=int(named_id) if named_id else None,
-                    target_container_name=named_name or None,
-                    expiry_days=service.config.limits.bundle_expiry_days,
-                    max_size=service.config.limits.max_bundle_size,
-                )
-            except suggest.ProposalRefused as exc:
-                # A refusal can come after the bundle row was written, so the half of it
-                # that exists goes rather than being left in the queue for review.
-                await scope.rollback()
-                return _to(back, str(exc))
-            bundle_id = bundle.id
-            await scope.commit()
-        return RedirectResponse(f"/bundle/{bundle_id}", status_code=303)
-
-    # ------------------------------------------------------------- the mailbox
-
-    @app.post("/accounts/choose", dependencies=changes)
-    async def choose_account(account_id: int = Form()):  # noqa: ANN202
-        """Work in a different account.
-
-        The choice belongs to the person rather than to the tenant, which is the shape it
-        needs on a deployment where several authenticated people share one.
-        """
-        async with service.scope() as scope:
-            account = await scope.get(m.Account, account_id)
-            if account is not None:
-                (await reviewer(scope)).current_account_id = account.id
-                await scope.commit()
-        return RedirectResponse("/", status_code=303)
+    interface.mount(app, service, render, chrome, changes, reviewer, csrf=form_token, csp=CSP)
 
     # ------------------------------------------------------------- letting an agent in
 
@@ -941,15 +713,3 @@ async def _record_refusal(service: Service, request: Request, problem: str) -> N
                 },
             )
             await scope.commit()
-
-
-def _to(path: str, error: str | None = None) -> RedirectResponse:
-    """Back where the person was, carrying what refused them."""
-    return RedirectResponse(path + (f"?error={quote(error)}" if error else ""), status_code=303)
-
-
-def _back(bundle_id: int, error: str | None) -> RedirectResponse:
-    target = f"/bundle/{bundle_id}"
-    if error:
-        target += f"?error={quote(error)}"
-    return RedirectResponse(target, status_code=303)

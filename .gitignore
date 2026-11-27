@@ -219,7 +219,9 @@ __marimo__/
 
 # The built interface: from frontend/, by npm or by the wheel build.
 node_modules/
-/src/mailmind/web/static/app/
+/src/mailmind/web/static/ui/
+# SvelteKit's own source directory, not the Python `lib/` the template above ignores.
+!/frontend/src/lib/
 
 # mailmind local state — the config names a host and a username, and the database holds
 # cached mail. Neither belongs in a repository.

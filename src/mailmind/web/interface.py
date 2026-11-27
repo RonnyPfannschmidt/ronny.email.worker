@@ -1,19 +1,20 @@
 """The server half of the interface built from ``frontend/``.
 
-The server decides everything and the browser displays it: what the pages show is here as
-data, with the changes their scripts ask for and the stream that says what happened.
-Accepting stays an ordinary form on the page of the one bundle it is about.
+The browser holds one page for the whole review UI and routes between its views itself;
+the server hands every one of those addresses the same shell, and decides everything the
+views show, as data, with the changes they ask for and the stream that says what happened.
 """
 
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 from typing import Annotated
 
 import sqlalchemy as sa
 from fastapi import Form, HTTPException, Request
-from fastapi.responses import HTMLResponse, StreamingResponse
+from fastapi.responses import HTMLResponse, Response, StreamingResponse
 
 from mailmind import tasks, views
 from mailmind.db import models as m
@@ -21,17 +22,39 @@ from mailmind.suggest import model as suggest
 from mailmind.suggest import staleness
 from mailmind.worker import QueueChanged
 
-ASSETS = Path(__file__).parent / "static" / "app"
+#: What ``npm run build`` in frontend/ writes: index.html, and /_app beside it.
+UI = Path(__file__).parent / "static" / "ui"
+
+#: The addresses that are views of the one page.  A reload or a pasted link lands on any of
+#: them, so each answers with the shell and the browser draws the view.
+VIEWS = (
+    "/",
+    "/accounts",
+    "/bundle/{bundle_id:int}",
+    "/mail",
+    "/mail/{container_id:int}",
+    "/mail/message/{message_id:int}",
+)
+
+#: How many messages one folder page shows.  Not the agent's bounded-observation limit
+#: (05): that one is about a model asking for more than it can read, and this is a person
+#: paging through their own mail, told the total either way.
+MAIL_PAGE = 100
 
 
-#: Per entry point, the script Vite built for it.  Read per request: a checkout rebuilds
-#: under a running service.
-def script_for(entry: str) -> str | None:
+def shell() -> tuple[str, list[str]] | None:
+    """The built page, and the hashes of the inline script that boots it.
+
+    Read per request: a checkout rebuilds under a running service.  SvelteKit starts from
+    one inline script and writes its hash into a meta policy; the service's own header
+    forbids inline script, so the hash has to be named there too, and only that hash.
+    """
     try:
-        manifest = json.loads((ASSETS / "manifest.json").read_text())
+        page = (UI / "index.html").read_text()
     except FileNotFoundError:
         return None
-    return f"/static/app/{manifest[entry]['file']}"
+    policy = re.search(r'http-equiv="content-security-policy" content="([^"]*)"', page)
+    return page, re.findall(r"'sha256-[A-Za-z0-9+/=]+'", policy.group(1) if policy else "")
 
 
 def _body(body: m.MessageBody) -> dict:
@@ -44,33 +67,51 @@ def _body(body: m.MessageBody) -> dict:
     }
 
 
-def mount(app, service, render, chrome, changes, reviewer) -> None:  # noqa: ANN001
-    async def draw(request, scope, page: str, title: str, **data) -> HTMLResponse:  # noqa: ANN001
-        return render(
-            request,
-            "interface.html",
-            title=title,
-            script=script_for(f"src/{page}.js"),
-            data=data,
-            **await chrome(scope),
+def mount(app, service, render, chrome, changes, reviewer, *, csrf: str, csp: str) -> None:  # noqa: ANN001
+    async def view(request: Request) -> Response:
+        built = shell()
+        if built is None:
+            async with service.scope(readonly=True) as scope:
+                return render(
+                    request,
+                    "interface.html",
+                    title="mailmind",
+                    script=None,
+                    data={},
+                    **await chrome(scope),
+                )
+        page, hashes = built
+        # The token the view's changes carry, in the page rather than in a request of its own.
+        token = f'<meta name="mailmind-csrf" content="{csrf}">'
+        response = HTMLResponse(page.replace("</head>", token + "</head>", 1))
+        response.headers["Content-Security-Policy"] = csp.replace(
+            "script-src 'self'", " ".join(["script-src 'self'", *hashes]), 1
         )
+        return response
 
-    @app.get("/", response_class=HTMLResponse)
-    async def queue_page(request: Request) -> HTMLResponse:
-        async with service.scope(readonly=True) as scope:
-            return await draw(request, scope, "queue", "review queue")
+    for path in VIEWS:
+        app.add_api_route(path, view, methods=["GET"], response_class=HTMLResponse)
 
-    @app.get("/accounts", response_class=HTMLResponse)
-    async def accounts_page(request: Request) -> HTMLResponse:
+    @app.get("/api/session")
+    async def session() -> dict:
+        """What every view's header shows: the accounts, which one is chosen, what waits."""
         async with service.scope(readonly=True) as scope:
-            return await draw(request, scope, "accounts", "accounts")
+            return await chrome(scope)
 
-    @app.get("/bundle/{bundle_id}", response_class=HTMLResponse)
-    async def bundle_page(request: Request, bundle_id: int, error: str = "") -> HTMLResponse:
-        async with service.scope(readonly=True) as scope:
-            if await scope.get(m.Bundle, bundle_id) is None:
-                return HTMLResponse("no such bundle", status_code=404)
-            return await draw(request, scope, "bundle", "review", bundle=bundle_id, error=error)
+    @app.post("/api/account/choose", dependencies=changes)
+    async def choose_account(account_id: Annotated[int, Form()]) -> dict:
+        """Work in a different account.
+
+        The choice belongs to the person rather than to the tenant, which is the shape it
+        needs on a deployment where several authenticated people share one.
+        """
+        async with service.scope() as scope:
+            account = await scope.get(m.Account, account_id)
+            if account is None:
+                raise HTTPException(404)
+            (await reviewer(scope)).current_account_id = account.id
+            await scope.commit()
+            return await chrome(scope)
 
     @app.get("/api/queue")
     async def queue() -> dict:
@@ -314,6 +355,190 @@ def mount(app, service, render, chrome, changes, reviewer) -> None:  # noqa: ANN
                 problem = str(exc)
             await scope.commit()
             return {"status": suggestion.status.value, "problem": problem}
+
+    @app.post("/api/bundle/{bundle_id}/accept", dependencies=changes)
+    async def accept(
+        bundle_id: int,
+        reviewed_through: Annotated[int, Form()] = 0,
+        acknowledge_stale: Annotated[str, Form()] = "",
+    ) -> dict:
+        """Accept what the view showed, and hand the mailbox work to the runner.
+
+        ``reviewed_through`` is what makes this "the bundle I read" rather than "this bundle
+        as it stands now"; a refusal is an answer, not an error, because it is the view's
+        job to show it where the person decided.
+        """
+        async with service.scope() as scope:
+            bundle = await scope.get(m.Bundle, bundle_id)
+            if bundle is None:
+                raise HTTPException(404)
+            person = await reviewer(scope)
+            try:
+                await suggest.accept(
+                    scope,
+                    bundle,
+                    person,
+                    reviewed_through=reviewed_through,
+                    acknowledge_stale=bool(acknowledge_stale),
+                )
+            except suggest.ProposalRefused as exc:
+                await scope.commit()
+                return {"problem": str(exc)}
+            # A failure is a task with a retry, not a stuck invisible bundle.
+            await tasks.enqueue(
+                scope,
+                kind=m.TaskKind.apply_bundle,
+                account_id=bundle.account_id,
+                subject_id=bundle.id,
+                requested_by=person.id,
+            )
+            await scope.commit()
+        service.notify_tasks()
+        return {"problem": None}
+
+    @app.post("/api/bundle/{bundle_id}/reject", dependencies=changes)
+    async def reject_one(bundle_id: int, reason: Annotated[str, Form()] = "") -> dict:
+        async with service.scope() as scope:
+            bundle = await scope.get(m.Bundle, bundle_id)
+            if bundle is None:
+                raise HTTPException(404)
+            problem = None
+            person = await reviewer(scope)
+            try:
+                await suggest.reject(scope, bundle, person, reason.strip() or None)
+            except suggest.ProposalRefused as exc:
+                problem = str(exc)
+            await scope.commit()
+        return {"problem": problem}
+
+    # --------------------------------------------------- reading and filing by hand
+    #
+    # A person browsing their own mail, and filing it the same way an agent proposes:
+    # picking messages builds a bundle whose producer is the reviewer, and the bundle's
+    # view is where it is read and accepted.  Deliberately not a second way into the
+    # mailbox: 01 says this is not where mail is read, and this stays a triage view rather
+    # than a client: text only, no HTML, no attachments, nothing marked read.
+
+    async def folder_options(scope, account_id: int) -> list[dict]:  # noqa: ANN001
+        """Somewhere to move mail to, in the order the folder list shows it."""
+        return views.flattened(
+            views.as_tree(
+                (await views.containers(scope, account_id))["containers"],
+                await views.container_delimiter(scope, account_id),
+            )
+        )
+
+    @app.get("/api/mail")
+    async def mail() -> dict:
+        async with service.scope(readonly=True) as scope:
+            current = (await chrome(scope))["current_account"]
+            tree = []
+            if current:
+                tree = views.as_tree(
+                    (await views.containers(scope, current["id"]))["containers"],
+                    await views.container_delimiter(scope, current["id"]),
+                )
+            return {"account": current, "tree": tree}
+
+    @app.get("/api/mail/{container_id}")
+    async def mail_container(container_id: int, offset: int = 0, unread: bool = False) -> dict:
+        async with service.scope(readonly=True) as scope:
+            container = await scope.get(m.Container, container_id)
+            if container is None:
+                raise HTTPException(404)
+            offset = max(offset, 0)
+            return {
+                "container": {"id": container.id, "name": container.name},
+                "listing": await views.messages(
+                    scope,
+                    container_id=container_id,
+                    limit=MAIL_PAGE,
+                    offset=offset,
+                    unread_only=unread,
+                ),
+                "folders": await folder_options(scope, container.account_id),
+                "offset": offset,
+                "page": MAIL_PAGE,
+            }
+
+    @app.get("/api/mail/message/{message_id}")
+    async def mail_message(message_id: int) -> dict:
+        async with service.scope(readonly=True) as scope:
+            try:
+                detail = await views.message_detail(scope, message_id)
+            except LookupError:
+                raise HTTPException(404) from None
+            container = (
+                await scope.get(m.Container, detail["container_id"])
+                if detail["container_id"]
+                else None
+            )
+            if container is None:
+                return {"message": detail, "container": None, "folders": []}
+            return {
+                "message": detail,
+                "container": {"id": container.id, "name": container.name},
+                "folders": await folder_options(scope, container.account_id),
+            }
+
+    @app.post("/api/mail/{container_id}/file", dependencies=changes)
+    async def file_messages(
+        container_id: int,
+        message_id: Annotated[list[int], Form()] = (),
+        operation: Annotated[str, Form()] = "move",
+        target_container_id: Annotated[str, Form()] = "",
+        target_container_name: Annotated[str, Form()] = "",
+    ) -> dict:
+        """What a person picked, proposed as a bundle of their own.
+
+        Nothing here is a shorter path than the one an agent's proposal takes: the same
+        enumerated effect is read, and the same accept applies it.
+        """
+        picked = list(dict.fromkeys(message_id))
+        async with service.scope() as scope:
+            container = await scope.get(m.Container, container_id)
+            if container is None:
+                raise HTTPException(404)
+            account = await scope.get(m.Account, container.account_id)
+            if not picked:
+                return {"problem": "nothing was selected, so there is nothing to propose"}
+            try:
+                op = m.Operation(operation)
+                if op not in (m.Operation.move, m.Operation.delete):
+                    raise ValueError(operation)
+            except ValueError:
+                return {"problem": f"{operation!r} is not something this view proposes"}
+            # A delete goes to Trash and names nothing else: one that carried a destination
+            # would draw as "delete → Archive" on the bundle's view.
+            named_id = target_container_id.strip() if op is m.Operation.move else ""
+            named_name = target_container_name.strip() if op is m.Operation.move else ""
+            if named_id and not named_id.isdigit():
+                return {"problem": "that is not a folder this view offered"}
+            try:
+                bundle = await suggest.propose_bundle(
+                    scope,
+                    producer=await reviewer(scope),
+                    account=account,
+                    operation=op,
+                    message_ids=picked,
+                    summary=(
+                        f"{len(picked)} message{'s' if len(picked) > 1 else ''} "
+                        f"picked out of {container.name}"
+                    ),
+                    reason="Chosen by hand in the mail view.",
+                    target_container_id=int(named_id) if named_id else None,
+                    target_container_name=named_name or None,
+                    expiry_days=service.config.limits.bundle_expiry_days,
+                    max_size=service.config.limits.max_bundle_size,
+                )
+            except suggest.ProposalRefused as exc:
+                # A refusal can come after the bundle row was written, so the half of it
+                # that exists goes rather than being left in the queue for review.
+                await scope.rollback()
+                return {"problem": str(exc)}
+            bundle_id = bundle.id
+            await scope.commit()
+        return {"bundle_id": bundle_id}
 
     @app.get("/api/events")
     async def events(request: Request) -> StreamingResponse:

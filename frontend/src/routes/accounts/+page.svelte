@@ -1,16 +1,16 @@
 <script>
   import { onMount } from "svelte";
-  import { get, listen, oneAtATime, post, taskIsLive } from "./api.js";
-  import Task from "./Task.svelte";
-  import { when } from "./when.js";
+  import { cache, listen, oneAtATime, post, read, taskIsLive } from "#lib/api.js";
+  import Task from "#lib/Task.svelte";
+  import { when } from "#lib/when.js";
 
-  let { csrf } = $props();
-  let accounts = $state(null);
+  const ACCOUNTS = "/api/accounts";
+  let accounts = $state(cache.get(ACCOUNTS)?.accounts ?? null);
   let error = $state("");
 
   const load = oneAtATime(async () => {
     try {
-      accounts = (await get("/api/accounts")).accounts;
+      accounts = (await read(ACCOUNTS)).accounts;
       error = "";
     } catch (problem) {
       error = problem.message;
@@ -26,7 +26,7 @@
 
   async function ask(account, path) {
     try {
-      account.task = await post(path, csrf);
+      account.task = await post(path);
       error = "";
     } catch (problem) {
       error = problem.message;
@@ -35,6 +35,8 @@
 
   onMount(() => listen(load, taskChanged));
 </script>
+
+<svelte:head><title>accounts — mailmind</title></svelte:head>
 
 <h1>Accounts</h1>
 {#if error}<div class="banner error">{error}</div>{/if}

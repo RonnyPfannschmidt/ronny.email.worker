@@ -2,12 +2,20 @@
   "name": "mailmind-ui",
   "private": true,
   "type": "module",
-  "engines": { "node": ">=22.12" },
+  "engines": {
+    "node": ">=22.12"
+  },
+  "imports": {
+    "#lib": "./src/lib",
+    "#lib/*": "./src/lib/*"
+  },
   "scripts": {
     "build": "vite build",
     "watch": "vite build --watch"
   },
   "devDependencies": {
+    "@sveltejs/adapter-static": "^4.0.1",
+    "@sveltejs/kit": "^3.4.1",
     "@sveltejs/vite-plugin-svelte": "^7.0.0",
     "svelte": "^5.46.4",
     "vite": "^8.0.0"

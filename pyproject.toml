@@ -71,7 +71,7 @@ source = "vcs"
 
 [tool.hatch.build]
 # Built and git-ignored, so hatch has to be told it ships.
-artifacts = ["src/mailmind/web/static/app/**"]
+artifacts = ["src/mailmind/web/static/ui/**"]
 
 # Builds the interface for a wheel or an sdist.  Never for an editable install.
 [tool.hatch.build.hooks.custom]
