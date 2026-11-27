@@ -297,6 +297,23 @@ def _mount_login(app: FastAPI, service: Service, public_url: str) -> None:
     app.router.routes.extend(routes)
 
 
+#: Holds only what the frontend build writes, so a fresh checkout has no such directory.
+STATIC = Path(__file__).parent / "static"
+
+
+class _BuiltFiles(StaticFiles):
+    """Static files from a directory a fresh checkout does not have yet.
+
+    StaticFiles refuses a missing directory at startup and again at the first request,
+    so a checkout nobody had built crashed instead of showing pages that say to build it.
+    Missing, it is a 404 until the build creates it, with no restart needed.
+    """
+
+    async def check_config(self) -> None:
+        if Path(self.directory).is_dir():
+            await super().check_config()
+
+
 def create_app(
     service: Service, *, with_mcp: bool = True, session_key: str | None = None
 ) -> FastAPI:
@@ -392,7 +409,7 @@ def create_app(
     # Behind the session key on purpose: the pages that use it are, so their script is.
     app.mount(
         "/static",
-        StaticFiles(directory=str(Path(__file__).parent / "static")),
+        _BuiltFiles(directory=str(STATIC), check_dir=False),
         name="static",
     )
 

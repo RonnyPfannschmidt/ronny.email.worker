@@ -2147,6 +2147,20 @@ async def test_the_review_pages_forbid_remote_content(client):
     assert "unsafe-inline" not in csp.replace("style-src 'self' 'unsafe-inline'", "")
 
 
+async def test_a_checkout_never_built_serves_pages_that_say_so(service, tmp_path, monkeypatch):
+    """A fresh clone has no static directory at all, and `serve` crashed on it."""
+    import mailmind.web.app as web_app
+    import mailmind.web.interface as interface
+
+    monkeypatch.setattr(web_app, "STATIC", tmp_path / "static")
+    monkeypatch.setattr(interface, "ASSETS", tmp_path / "static" / "app")
+    async with opened(create_app(service, session_key=SESSION_KEY)) as client:
+        page = await client.get("/")
+        assert page.status_code == 200
+        assert "The interface is not built" in page.text
+        assert (await client.get("/static/app/manifest.json")).status_code == 404
+
+
 async def test_the_script_is_served_and_stays_behind_the_key(client):
     """/static is a page asset, not a machine path — no session, no script."""
     if not (ASSETS / "manifest.json").exists():
