@@ -850,6 +850,65 @@ def serve(
     raise SystemExit(0)
 
 
+@main.command()
+@click.option(
+    "--unit", required=True, help="the systemd user unit that runs `mailmindctl serve`"
+)
+@click.option(
+    "--while-stopped",
+    default=None,
+    metavar="COMMAND",
+    help="a shell command to run while the unit is down, such as the merge being deployed",
+)
+@click.option(
+    "--quiet",
+    default=20.0,
+    show_default=True,
+    help="seconds without activity that count as idle",
+)
+@click.option(
+    "--wait", default=400.0, show_default=True, help="seconds to wait for idle before giving up"
+)
+@click.pass_context
+def redeploy(
+    ctx: click.Context, unit: str, while_stopped: str | None, quiet: float, wait: float
+) -> None:
+    """Stop UNIT once it is idle, bring the code up to date, migrate, start and check it.
+
+    Run it from the repository the unit serves from — the checkout itself, or a deploy
+    repository that depends on one — with the configuration the unit uses. In order:
+    wait until no task is queued or running and nothing has happened for --quiet
+    seconds; stop; run --while-stopped; build the interface if mailmind is an editable
+    checkout; `uv run mailmindctl migrate`; start; check the page, the login, the event
+    stream and the journal. A failure after the stop leaves the unit stopped and says so.
+    """
+    import mailmind
+    from mailmind.redeploy import Redeploy, RedeployFailed, checkout_of
+    from mailmind.web.app import link_path
+
+    service = _service(ctx.obj["config_path"], needs_schema=False)
+    config = service.config
+    config_path = ctx.obj["config_path"]
+    job = Redeploy(
+        unit=unit,
+        database_url=config.database_url,
+        base_url=f"http://{config.bind}:{config.port}",
+        link_file=link_path(config.port),
+        project=Path.cwd(),
+        config_args=("--config", str(Path(config_path).resolve())) if config_path else (),
+        checkout=checkout_of(Path(mailmind.__file__).resolve().parent),
+        while_stopped=while_stopped,
+        quiet=quiet,
+        wait=wait,
+        say=lambda line: click.echo(line, err=True),
+    )
+    service.close()
+    try:
+        job()
+    except RedeployFailed as exc:
+        raise click.ClickException(str(exc)) from exc
+
+
 def _watched_paths(named: tuple[str, ...]) -> list[Path]:
     """What an edit to "the server" means: the package, and what pins its dependencies.
 

@@ -1,0 +1,22 @@
+# Not a package: a deploy repository holds what one machine runs mailmind with (the unit,
+# the agent's instructions, its client config), and builds nothing but an environment
+# with mailmind in it. Copy this directory to start one.
+[project]
+name = "my-mailmind"
+version = "0"
+requires-python = ">=3.13"
+dependencies = []
+
+[dependency-groups]
+# `secrets` for `secret-storage://` password URLs; drop it on a box with no session bus.
+dev = ["mailmind[secrets]"]
+
+[tool.uv]
+package = false
+
+# A checkout beside this repository, editable: a pull over there is the upgrade, and
+# `mailmindctl redeploy` builds its interface. For a pinned version instead, replace the
+# path with `git = "https://github.com/RonnyPfannschmidt/ronny.email.worker", branch = "main"`
+# and upgrade with `uv lock --upgrade-package mailmind` before redeploying.
+[tool.uv.sources]
+mailmind = { path = "../ronny.email.worker", editable = true }
