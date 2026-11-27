@@ -2,7 +2,7 @@
 # Spike: pin the three bases by digest before this publishes anything.
 ARG PYTHON=3.14
 
-FROM docker.io/library/node:22-slim AS interface
+FROM docker.io/library/node:26-slim AS interface
 WORKDIR /build/frontend
 COPY frontend/package.json frontend/package-lock.json ./
 RUN npm ci --ignore-scripts --no-fund --no-audit
