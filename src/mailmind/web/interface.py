@@ -72,14 +72,7 @@ def mount(app, service, render, chrome, changes, reviewer, *, csrf: str, csp: st
         built = shell()
         if built is None:
             async with service.scope(readonly=True) as scope:
-                return render(
-                    request,
-                    "interface.html",
-                    title="mailmind",
-                    script=None,
-                    data={},
-                    **await chrome(scope),
-                )
+                return render(request, "interface.html", **await chrome(scope))
         page, hashes = built
         # The token the view's changes carry, in the page rather than in a request of its own.
         token = f'<meta name="mailmind-csrf" content="{csrf}">'

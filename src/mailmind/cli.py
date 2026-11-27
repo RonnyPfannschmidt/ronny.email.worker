@@ -932,9 +932,9 @@ def _watched_paths(named: tuple[str, ...]) -> list[Path]:
 
 
 def _built_interface() -> Path:
-    from mailmind.web.interface import ASSETS
+    from mailmind.web.interface import UI
 
-    return ASSETS
+    return UI
 
 
 async def _watch_and_exit(server, watch_paths: tuple[str, ...]) -> None:  # noqa: ANN001
