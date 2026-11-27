@@ -18,6 +18,10 @@ follows it.
 
 A restart mints a new key, so an open tab stops working and you go back to the terminal.
 
+The review UI is one page. Moving between the queue, a bundle, the mail and the accounts
+never reloads it: a view you have seen is drawn at once from what it last read, and read again
+behind it. Each view has its own address, so a link or a reload lands where it points.
+
 ## The queue
 
 What is waiting, for the account you are working in. Each entry is a bundle: one operation
@@ -38,6 +42,8 @@ You can accept, reject with a reason, exclude a single item that does not belong
 the rest, or ask for a body to be fetched for a message whose subject is not enough to
 decide on. An agent can withdraw its own bundle until somebody decides.
 
+Accepting and rejecting happen where you read the bundle, which stays on screen and
+turns into its outcome; `n`, or the link at the top, moves on to the next waiting one.
 Accepting hands the work to a background runner: the queue gains a **Being applied**
 section, the bundle page shows progress as it runs, and a failure — an unreachable
 mailbox, most often — is shown where it happened with a retry button, instead of a

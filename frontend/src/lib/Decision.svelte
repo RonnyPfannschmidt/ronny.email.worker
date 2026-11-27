@@ -2,9 +2,43 @@
   import Task from "./Task.svelte";
   import { when } from "./when.js";
 
-  let { bundle, csrf, items, noun, grown, retry } = $props();
+  let { bundle, items, noun, grown, retry, decide, reread, next } = $props();
   const stale = $derived(items.filter((item) => item.status === "stale").length);
+
+  let acknowledged = $state(false);
+  let reason = $state("");
+  let deciding = $state(false);
+  let problem = $state("");
+
+  // A tick says what was read, so it does not outlive another item going stale.
+  let ticked = -1;
+  $effect(() => {
+    if (ticked >= 0 && stale !== ticked) acknowledged = false;
+    ticked = stale;
+  });
+
+  async function settle(event, how, fields) {
+    event.preventDefault();
+    deciding = true;
+    problem = "";
+    try {
+      problem = (await decide(how, fields)) ?? "";
+    } catch (failed) {
+      problem = failed.message;
+    } finally {
+      deciding = false;
+    }
+  }
+
+  const accept = (event) =>
+    settle(event, "accept", [
+      ["reviewed_through", bundle.reviewed_through],
+      ...(acknowledged ? [["acknowledge_stale", "1"]] : []),
+    ]);
+  const reject = (event) => settle(event, "reject", [["reason", reason]]);
 </script>
+
+{#if problem}<div class="banner error">Not done: {problem}</div>{/if}
 
 {#if bundle.attempts.length}
   <h2>What happened</h2>
@@ -34,32 +68,28 @@
 
 {#if bundle.status === "proposed"}
   <div class="actions">
-    <form method="post" action="/bundle/{bundle.bundle_id}/accept">
-      <input type="hidden" name="_csrf" value={csrf} />
-      <input type="hidden" name="reviewed_through" value={bundle.reviewed_through} />
-      <!-- Keyed: a tick says what was read, so it does not outlive another item going stale. -->
-      {#key stale}
-        {#if stale}
-          <p class="small">
-            <label>
-              <input type="checkbox" name="acknowledge_stale" value="1" required />
-              I have read what changed on the {stale} message(s) above. They will not be applied.
-            </label>
-          </p>
-        {/if}
-      {/key}
+    <form onsubmit={accept}>
+      {#if stale}
+        <p class="small">
+          <label>
+            <input type="checkbox" bind:checked={acknowledged} />
+            I have read what changed on the {stale} message(s) above. They will not be applied.
+          </label>
+        </p>
+      {/if}
       {#if grown}
         <p class="small warn">
-          More {noun} arrived. <a href="/bundle/{bundle.bundle_id}">Read it again</a> before
+          More {noun} arrived. <button type="button" onclick={reread}>Read it again</button> before
           accepting.
         </p>
       {/if}
-      <button disabled={grown}>Accept — do this to the mailbox</button>
+      <button disabled={grown || deciding || (stale && !acknowledged)}>
+        Accept — do this to the mailbox
+      </button>
     </form>
-    <form method="post" action="/bundle/{bundle.bundle_id}/reject">
-      <input type="hidden" name="_csrf" value={csrf} />
-      <input name="reason" placeholder="why not (optional)" size="30" />
-      <button>Reject</button>
+    <form onsubmit={reject}>
+      <input bind:value={reason} placeholder="why not (optional)" size="30" />
+      <button disabled={deciding}>Reject</button>
     </form>
   </div>
 {:else if bundle.status === "accepted"}
@@ -82,4 +112,8 @@
       ? ` at ${when(bundle.decided_at)}`
       : ""}{bundle.decision_reason ? ` — ${bundle.decision_reason}` : ""}
   </p>
+{/if}
+
+{#if bundle.status !== "proposed" && next}
+  <p><a href="/bundle/{next}">On to the next waiting bundle</a> <span class="small muted">(n)</span></p>
 {/if}

@@ -25,14 +25,12 @@ from mailmind.imap.capabilities import probe_account
 from mailmind.service import Service
 from mailmind.suggest import model as suggest
 from mailmind.web.app import SESSION_KEY_PARAM, create_app
-from mailmind.web.interface import script_for
+from mailmind.web.interface import shell
 from mailmind.web.serving import Server
 from tests.targets.fake import FakeBackend
 
 playwright = pytest.importorskip("playwright.async_api")
-pytestmark = pytest.mark.skipif(
-    script_for("src/bundle.js") is None, reason="the interface is not built"
-)
+pytestmark = pytest.mark.skipif(shell() is None, reason="the interface is not built")
 KEY = "browser-test-key"
 ITEMS = 81
 HOSTILE = "<img src=x onerror=document.title='owned'>"
@@ -195,7 +193,7 @@ async def test_a_bundle_that_grows_is_not_slipped_under_the_reader(page, bundle_
         timeout=15_000
     )
     assert await page.get_by_text("slipped in").count() == 0
-    assert await page.locator("[name=reviewed_through]").input_value() == str(read)
+    assert await page.get_by_role("button", name="Accept — do this").is_disabled()
 
 
 MESSAGE = {
@@ -891,3 +889,88 @@ async def test_the_queue_says_what_is_stuck_and_what_waits_elsewhere(page, bundl
     for words in ("2 in work", "1 moved", "went away mid-apply", "partially_applied"):
         assert words in text, text
     assert await page.get_by_role("button", name="retry").count() == 1
+
+
+# ---------------------------------------------------------- one page, not several
+#
+# The interface used to be four pages, each starting over: a form post and a redirect to
+# accept, a fresh "loading" on every move, a stream per page holding one of the browser's
+# six connections to the host. These are about it being one page instead.
+
+
+async def test_accepting_happens_in_place_and_the_apply_shows_there(page, bundle_at):
+    base, bundle_id, backend = bundle_at
+    await page.goto(f"{base}/bundle/{bundle_id}")
+    await page.get_by_text("Accept — do this").wait_for()
+    await page.evaluate("document.body.dataset.mark = 1")
+
+    await page.get_by_role("button", name="Accept — do this").click()
+    await page.get_by_text("being applied to the mailbox now").wait_for(timeout=5_000)
+    for _ in range(600):
+        if len(backend.folders["Archive"].messages) == ITEMS:
+            break
+        await asyncio.sleep(0.1)
+    await page.get_by_text("status applied").wait_for(timeout=10_000)
+
+    assert page.url == f"{base}/bundle/{bundle_id}", "it stays on the bundle"
+    assert await page.evaluate("document.body.dataset.mark") == "1", "the page was replaced"
+    assert page.problems == []
+
+
+async def test_moving_between_views_keeps_the_page_and_its_one_stream(page, bundle_at):
+    base, bundle_id, _ = bundle_at
+    streams = []
+    page.on(
+        "request", lambda r: streams.append(r.url) if r.url.endswith("/api/events") else None
+    )
+    await page.goto(f"{base}/")
+    await page.get_by_role("link", name="review", exact=True).wait_for()
+    await page.evaluate("document.body.dataset.mark = 1")
+
+    await page.get_by_role("link", name="review", exact=True).click()
+    await page.get_by_text("Accept — do this").wait_for()
+    await page.get_by_role("link", name="mail", exact=True).click()
+    await page.get_by_role("link", name="INBOX").click()
+    await page.get_by_text(f"showing {ITEMS} of {ITEMS}").wait_for()
+    await page.go_back()
+    await page.go_back()
+    await page.get_by_text("Accept — do this").wait_for()
+
+    assert page.url == f"{base}/bundle/{bundle_id}"
+    assert await page.evaluate("document.body.dataset.mark") == "1", "the page was replaced"
+    assert len(streams) == 1, "a view opened a stream of its own"
+    assert page.problems == []
+
+
+async def test_coming_back_to_a_view_draws_what_it_read_before_at_once(page, bundle_at):
+    base, _, _ = bundle_at
+    await page.goto(f"{base}/")
+    await page.get_by_role("link", name="review", exact=True).wait_for()
+    await page.get_by_role("link", name="accounts", exact=True).click()
+    await page.get_by_role("heading", name="Accounts").wait_for()
+
+    async def slow(route):  # noqa: ANN001, ANN202
+        await asyncio.sleep(2)
+        await route.continue_()
+
+    await page.route("**/api/queue", slow)
+    await page.get_by_role("link", name="review queue").click()
+    # Drawn from before while the read behind it takes its time.
+    await page.get_by_role("link", name="review", exact=True).wait_for(timeout=1_000)
+    assert await page.get_by_text("loading").count() == 0
+
+
+async def test_n_moves_on_to_the_next_waiting_bundle(page, bundle_at):
+    base, bundle_id, _ = bundle_at
+    queue = await (await page.request.get(f"{base}/api/queue")).json()
+    queue["bundles"] = [*queue["bundles"], {**queue["bundles"][0], "bundle_id": 9999}]
+
+    async def serve(route):  # noqa: ANN001, ANN202
+        await route.fulfill(json=queue)
+
+    await page.route("**/api/queue", serve)
+    await page.goto(f"{base}/bundle/{bundle_id}")
+    await page.get_by_role("link", name="next waiting bundle").wait_for()
+    await page.keyboard.press("n")
+    await page.wait_for_url("**/bundle/9999")
+    await page.get_by_text("There is no bundle 9999.").wait_for()

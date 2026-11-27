@@ -35,7 +35,7 @@ from mailmind.service import Service, hash_token
 from mailmind.suggest import model as suggest
 from mailmind.web import app as app_module
 from mailmind.web.app import SESSION_KEY_PARAM, create_app, csrf_token, is_machine_path
-from mailmind.web.interface import ASSETS
+from mailmind.web.interface import UI, shell
 from tests.corpus import CORPUS
 from tests.targets.fake import FakeBackend
 
@@ -326,7 +326,7 @@ async def as_a_person(client: Browser, path: str, **kwargs):  # noqa: ANN201
 
 
 async def shown(client: Browser, bundle_id: int) -> dict:
-    """What the bundle page shows: the page itself, and the data its script reads.
+    """What the bundle's view shows: the page itself, and the data it draws.
 
     What it says about it is drawn in a browser, and tested in one — see test_browser.
     """
@@ -343,17 +343,15 @@ async def waiting(client: Browser) -> dict:
 
 
 async def accepting(client: Browser, bundle_id: int, **kwargs):  # noqa: ANN201
-    """Accept the way a person does: from the page, carrying what the page showed.
+    """Accept the way a person does: from the bundle's view, carrying what it showed.
 
-    The accept form sends ``reviewed_through`` so that accepting means the list that was
-    read rather than whatever the bundle holds when the form arrives.  A test that posts
+    The view sends ``reviewed_through`` so that accepting means the list that was read
+    rather than whatever the bundle holds when the request arrives.  A test that posts
     without it is a test of the refusal, not of accepting.
     """
     data = {"reviewed_through": (await shown(client, bundle_id))["reviewed_through"]}
     data.update(kwargs.pop("data", {}))
-    response = await as_a_person(
-        client, f"/bundle/{bundle_id}/accept", data=data, follow_redirects=True, **kwargs
-    )
+    response = await as_a_person(client, f"/api/bundle/{bundle_id}/accept", data=data, **kwargs)
     await settle(client)
     return response
 
@@ -1000,12 +998,9 @@ async def test_a_bundle_that_grew_cannot_be_accepted_from_the_page_drawn_before_
     await agent.call("add_to_bundle", bundle_id=proposed["bundle_id"], query="Lunch")
 
     refused = await as_a_person(
-        client,
-        f"/bundle/{proposed['bundle_id']}/accept",
-        data={"reviewed_through": read},
-        follow_redirects=True,
+        client, f"/api/bundle/{proposed['bundle_id']}/accept", data={"reviewed_through": read}
     )
-    assert "2 more messages arrived" in str(refused.url.params["error"])
+    assert "2 more messages arrived" in refused.json()["problem"]
     assert len(backend.folders["Archive"].messages) == 0, "it applied anyway"
 
     # Reading it again is the whole resolution: the page now shows what arrived.
@@ -1410,11 +1405,10 @@ async def test_a_rejection_can_carry_a_reason_and_is_as_easy_as_accepting(client
     proposed = await _propose(agent)
     response = await as_a_person(
         client,
-        f"/bundle/{proposed['bundle_id']}/reject",
+        f"/api/bundle/{proposed['bundle_id']}/reject",
         data={"reason": "I want to keep reading these"},
-        follow_redirects=True,
     )
-    assert response.status_code == 200
+    assert response.json() == {"problem": None}
     page = await shown(client, proposed["bundle_id"])
     assert page["status"] == "rejected"
     assert page["decision_reason"] == "I want to keep reading these"
@@ -1443,7 +1437,7 @@ async def test_several_bundles_are_rejected_at_once_with_one_reason(client, serv
 async def test_what_cannot_be_rejected_is_named_and_the_rest_still_is(client):
     agent = await Agent.connect(client)
     decided = (await _propose(agent))["bundle_id"]
-    await as_a_person(client, f"/bundle/{decided}/reject", data={"reason": "first"})
+    await as_a_person(client, f"/api/bundle/{decided}/reject", data={"reason": "first"})
     still_open = (await _propose(agent))["bundle_id"]
     response = await as_a_person(
         client, "/api/queue/reject", data={"bundle": [decided, 999, still_open]}
@@ -1476,21 +1470,31 @@ async def test_the_queue_lists_what_is_waiting(client):
 # ------------------------------------------------------- reading and filing by hand
 
 
+async def _tree(client) -> list[dict]:  # noqa: ANN001
+    """The folder tree, as the mail view draws it."""
+    return (await client.get("/api/mail")).json()["tree"]
+
+
 async def _inbox(client) -> int:  # noqa: ANN001
-    """The folder id, found the way the page offers it rather than by asking an agent."""
-    match = re.search(r'href="/mail/(\d+)">INBOX<', (await client.get("/mail")).text)
-    assert match
-    return int(match.group(1))
+    """The folder id, found the way the view offers it rather than by asking an agent."""
+    (inbox,) = [
+        node["folder"]["id"] for node in await _tree(client) if node["label"] == "INBOX"
+    ]
+    return inbox
 
 
-async def _picked(client, container_id: int) -> list[str]:  # noqa: ANN001
-    """The message ids a person would be ticking, read off the folder page."""
-    page = (await client.get(f"/mail/{container_id}")).text
-    return re.findall(r'name="message_id" value="(\d+)"', page)
+async def _listed(client, container_id: int) -> list[dict]:  # noqa: ANN001
+    return (await client.get(f"/api/mail/{container_id}")).json()["listing"]["messages"]
+
+
+async def _picked(client, container_id: int) -> list[int]:  # noqa: ANN001
+    """The message ids a person would be ticking in the folder's view."""
+    return [message["message_id"] for message in await _listed(client, container_id)]
 
 
 def _landed_on(response) -> int:  # noqa: ANN001
-    return int(re.search(r"/bundle/(\d+)", str(response.url)).group(1))
+    """Filing answers with the bundle it proposed, which is where the view goes next."""
+    return response.json()["bundle_id"]
 
 
 async def _container(service, name: str) -> int:  # noqa: ANN001
@@ -1500,8 +1504,8 @@ async def _container(service, name: str) -> int:  # noqa: ANN001
 
 async def test_the_mail_page_puts_inbox_first(client):
     """Sorted by name, INBOX sits under I among however many folders there are."""
-    page = (await client.get("/mail")).text
-    assert page.index(">INBOX<") < page.index(">Archive<") < page.index(">Trash<")
+    labels = [node["label"] for node in await _tree(client)]
+    assert labels.index("INBOX") < labels.index("Archive") < labels.index("Trash")
 
 
 async def test_a_person_can_read_a_folder_without_an_agent_proposing_anything(client):
@@ -1510,12 +1514,11 @@ async def test_a_person_can_read_a_folder_without_an_agent_proposing_anything(cl
     It exists so that filing by hand is possible at all; that it is not a second way into
     the mailbox is what the tests below are about.
     """
-    page = await client.get(f"/mail/{await _inbox(client)}")
-    assert page.status_code == 200
+    answer = (await client.get(f"/api/mail/{await _inbox(client)}")).json()
     # The address rather than the name attached to it, per 08.
-    assert "news@list.example" in page.text
+    assert "news@list.example" in [m["from_address"] for m in answer["listing"]["messages"]]
     # Bounded like every other read: it says how much of the folder it drew.
-    assert "showing" in page.text
+    assert answer["listing"]["returned"] <= answer["listing"]["total_matching"]
 
 
 async def test_reading_a_message_by_hand_marks_nothing_and_fetches_nothing_on_its_own(
@@ -1527,11 +1530,9 @@ async def test_reading_a_message_by_hand_marks_nothing_and_fetches_nothing_on_it
     the body is fetched only when it is asked for, because fetching is a connection to
     somebody's server.
     """
-    listed = re.findall(
-        r'href="/mail/message/(\d+)"', (await client.get(f"/mail/{await _inbox(client)}")).text
-    )
+    listed = await _picked(client, await _inbox(client))
     assert listed
-    page = await client.get(f"/mail/message/{listed[0]}")
+    page = await client.get(f"/api/mail/message/{listed[0]}")
     assert page.status_code == 200
     answer = (await client.get(f"/api/message/{listed[0]}")).json()
     assert answer == {"task": None, "body": None}, "nothing was fetched by looking"
@@ -1555,16 +1556,14 @@ async def test_filing_by_hand_proposes_rather_than_moving(client, service, backe
 
     landed = await as_a_person(
         client,
-        f"/mail/{inbox}/file",
+        f"/api/mail/{inbox}/file",
         data={
             "message_id": picked[:2],
             "operation": "move",
             "target_container_id": str(await _container(service, "Archive")),
         },
-        follow_redirects=True,
     )
-    assert landed.status_code == 200
-    # The review page, with the effect enumerated, and a mailbox nobody has touched.
+    # The bundle's view, with the effect enumerated, and a mailbox nobody has touched.
     page = await shown(client, _landed_on(landed))
     assert len(page["items"]) == 2
     assert "picked out of INBOX" in page["summary"] + page["reason"]
@@ -1579,13 +1578,12 @@ async def test_a_bundle_filed_by_hand_is_accepted_the_same_way_and_then_moves(
     inbox = await _inbox(client)
     landed = await as_a_person(
         client,
-        f"/mail/{inbox}/file",
+        f"/api/mail/{inbox}/file",
         data={
             "message_id": (await _picked(client, inbox))[:1],
             "operation": "move",
             "target_container_id": str(await _container(service, "Archive")),
         },
-        follow_redirects=True,
     )
     bundle_id = _landed_on(landed)
 
@@ -1595,10 +1593,8 @@ async def test_a_bundle_filed_by_hand_is_accepted_the_same_way_and_then_moves(
 
 async def test_filing_nothing_says_so_rather_than_proposing_an_empty_bundle(client):
     inbox = await _inbox(client)
-    refused = await as_a_person(
-        client, f"/mail/{inbox}/file", data={"operation": "move"}, follow_redirects=True
-    )
-    assert "nothing was selected" in refused.text
+    refused = await as_a_person(client, f"/api/mail/{inbox}/file", data={"operation": "move"})
+    assert "nothing was selected" in refused.json()["problem"]
 
 
 async def test_a_refused_hand_filing_leaves_no_half_written_bundle_behind(client, service):
@@ -1612,13 +1608,12 @@ async def test_a_refused_hand_filing_leaves_no_half_written_bundle_behind(client
     # message and that one does not hold.
     await as_a_person(
         client,
-        f"/mail/{inbox}/file",
+        f"/api/mail/{inbox}/file",
         data={
             "message_id": (await _picked(client, inbox))[:1],
             "operation": "move",
             "target_container_id": str(inbox),
         },
-        follow_redirects=True,
     )
 
     async with service.scope() as scope:
@@ -1634,13 +1629,12 @@ async def test_a_hand_filed_delete_names_trash_and_nothing_else(client, service,
     inbox = await _inbox(client)
     landed = await as_a_person(
         client,
-        f"/mail/{inbox}/file",
+        f"/api/mail/{inbox}/file",
         data={
             "message_id": (await _picked(client, inbox))[:1],
             "operation": "delete",
             "target_container_id": str(await _container(service, "Archive")),
         },
-        follow_redirects=True,
     )
     assert (await shown(client, _landed_on(landed)))["target_container"] is None
 
@@ -1686,19 +1680,16 @@ async def test_the_queue_shows_the_account_being_worked_in_and_no_other(client, 
     theirs = other_account["bundle_id"]
 
     # Nothing chosen yet, so the first account by name — "other" sorts before "test".
-    assert "working in" in (await client.get("/")).text
+    assert (await client.get("/api/session")).json()["current_account"]["name"] == "other"
     queue = await waiting(client)
     assert queue["account"] == "other"
     assert [b["bundle_id"] for b in queue["bundles"]] == [theirs]
     assert queue["elsewhere"] == [{"name": "test", "waiting": 1}]
 
     switched = await as_a_person(
-        client,
-        "/accounts/choose",
-        data={"account_id": other_account["test_account_id"]},
-        follow_redirects=True,
+        client, "/api/account/choose", data={"account_id": other_account["test_account_id"]}
     )
-    assert switched.status_code == 200
+    assert switched.json()["current_account"]["name"] == "test"
     assert [b["bundle_id"] for b in (await waiting(client))["bundles"]] == [mine]
 
     # The choice is the person's and outlives the request that made it.
@@ -2058,7 +2049,7 @@ async def test_the_review_ui_refuses_a_change_without_the_form_token(client, bac
     """Same-origin is necessary and not sufficient: the form token is the other half."""
     proposed = await _propose(await Agent.connect(client))
     refused = await client.post(
-        f"/bundle/{proposed['bundle_id']}/accept",
+        f"/api/bundle/{proposed['bundle_id']}/accept",
         headers={
             "Sec-Fetch-Site": "same-origin",
             "Origin": str(client.base_url).rstrip("/"),
@@ -2079,7 +2070,7 @@ async def test_a_framework_fetch_from_our_own_page_gets_through(client, backend)
     proposed = await _propose(await Agent.connect(client))
     read = (await shown(client, proposed["bundle_id"]))["reviewed_through"]
     response = await client.post(
-        f"/bundle/{proposed['bundle_id']}/accept",
+        f"/api/bundle/{proposed['bundle_id']}/accept",
         headers={"Sec-Fetch-Site": "same-origin", "Sec-Fetch-Mode": "cors"},
         data={"_csrf": CSRF, "reviewed_through": read},
     )
@@ -2141,36 +2132,58 @@ async def test_the_review_pages_forbid_remote_content(client):
     csp = response.headers["content-security-policy"]
     assert "img-src 'none'" in csp
     assert "default-src 'none'" in csp
-    # The one script is our own vendored file; nothing inline, nothing remote.
     assert "script-src 'self'" in csp
     assert "connect-src 'self'" in csp
     assert "unsafe-inline" not in csp.replace("style-src 'self' 'unsafe-inline'", "")
 
 
+async def test_the_only_inline_script_allowed_is_the_one_that_boots_the_page(client):
+    """SvelteKit starts from an inline script; the header names its hash and nothing more."""
+    if shell() is None:
+        pytest.skip("the interface is not built")
+    response = await client.get("/bundle/1")
+    scripts = re.findall(r"<script>(.*?)</script>", response.text, re.S)
+    assert len(scripts) == 1
+    digest = base64.b64encode(hashlib.sha256(scripts[0].encode()).digest()).decode()
+    allowed = re.search(r"script-src ([^;]*)", response.headers["content-security-policy"])
+    assert allowed.group(1).split() == ["'self'", f"'sha256-{digest}'"]
+    # Every other page keeps the policy that allows no inline script at all.
+    other = await client.get("/agents")
+    assert "sha256" not in other.headers["content-security-policy"]
+
+
+async def test_every_view_is_the_same_page(client):
+    """A reload or a pasted link lands on any view; the browser draws it from the address."""
+    if shell() is None:
+        pytest.skip("the interface is not built")
+    views = ["/", "/accounts", "/bundle/7", "/mail", "/mail/3", "/mail/message/5"]
+    pages = {(await client.get(path)).text for path in views}
+    assert len(pages) == 1
+    assert f'<meta name="mailmind-csrf" content="{csrf_token(SESSION_KEY)}">' in pages.pop()
+
+
 async def test_a_checkout_never_built_serves_pages_that_say_so(service, tmp_path, monkeypatch):
     """A fresh clone has no static directory at all, and `serve` crashed on it."""
-    import mailmind.web.app as web_app
     import mailmind.web.interface as interface
 
-    monkeypatch.setattr(web_app, "STATIC", tmp_path / "static")
-    monkeypatch.setattr(interface, "ASSETS", tmp_path / "static" / "app")
+    monkeypatch.setattr(interface, "UI", tmp_path / "static" / "ui")
     async with opened(create_app(service, session_key=SESSION_KEY)) as client:
         page = await client.get("/")
         assert page.status_code == 200
         assert "The interface is not built" in page.text
-        assert (await client.get("/static/app/manifest.json")).status_code == 404
+        assert (await client.get("/_app/version.json")).status_code == 404
 
 
 async def test_the_script_is_served_and_stays_behind_the_key(client):
-    """/static is a page asset, not a machine path — no session, no script."""
-    if not (ASSETS / "manifest.json").exists():
+    """/_app is a page asset, not a machine path — no session, no script."""
+    if not (UI / "_app" / "version.json").exists():
         pytest.skip("the interface is not built")
-    served = await client.get("/static/app/manifest.json")
+    served = await client.get("/_app/version.json")
     assert served.status_code == 200
     assert served.json()
 
     async with Browser(client.app) as stranger:
-        assert (await stranger.get("/static/app/manifest.json")).status_code == 401
+        assert (await stranger.get("/_app/version.json")).status_code == 401
 
 
 # =====================================================================================
@@ -2379,9 +2392,7 @@ async def test_the_page_data_is_behind_the_key(client):
 
 
 async def test_a_message_text_asked_for_by_hand_arrives_as_text(client):
-    message = re.search(
-        r'href="/mail/message/(\d+)"', (await client.get(f"/mail/{await _inbox(client)}")).text
-    ).group(1)
+    message = (await _picked(client, await _inbox(client)))[0]
     asked = await as_a_person(client, f"/api/message/{message}/body")
     assert asked.json()["status"] in ("queued", "running")
     await settle(client)
@@ -2392,8 +2403,8 @@ async def test_a_message_text_asked_for_by_hand_arrives_as_text(client):
     assert (await client.get("/api/message/99999")).status_code == 404
 
 
-async def test_a_bundle_that_is_not_there_is_a_404_not_a_page(client):
-    assert (await client.get("/bundle/999")).status_code == 404
+async def test_a_bundle_that_is_not_there_is_a_404_from_its_data(client):
+    """The address is a view like any other; the view says so from the answer it gets."""
     assert (await client.get("/api/bundle/999")).status_code == 404
 
 

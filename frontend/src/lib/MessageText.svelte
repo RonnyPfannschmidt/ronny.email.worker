@@ -1,9 +1,12 @@
 <script>
   import { onMount } from "svelte";
-  import { get, listen, oneAtATime, post, taskIsLive } from "./api.js";
+  import { cache, listen, oneAtATime, post, read, taskIsLive } from "./api.js";
 
-  let { messageId, csrf } = $props();
-  let message = $state(null);
+  let { messageId } = $props();
+  // Fixed for the life of the view: another message is another view.
+  // svelte-ignore state_referenced_locally
+  const TEXT = `/api/message/${messageId}`;
+  let message = $state(cache.get(TEXT) ?? null);
   let error = $state("");
 
   const body = $derived(message?.body);
@@ -11,7 +14,7 @@
 
   const load = oneAtATime(async () => {
     try {
-      message = await get(`/api/message/${messageId}`);
+      message = await read(TEXT);
       error = "";
     } catch (problem) {
       error = problem.message;
@@ -20,7 +23,7 @@
 
   async function fetchText() {
     try {
-      message.task = await post(`/api/message/${messageId}/body`, csrf);
+      message.task = await post(`/api/message/${messageId}/body`);
       error = "";
     } catch (problem) {
       error = problem.message;

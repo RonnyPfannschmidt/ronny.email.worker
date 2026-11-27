@@ -16,7 +16,7 @@ ENV UV_PROJECT_ENVIRONMENT=/opt/mailmind UV_PYTHON_DOWNLOADS=never UV_LINK_MODE=
     UV_COMPILE_BYTECODE=1 MAILMIND_UI_PREBUILT=1 SETUPTOOLS_SCM_PRETEND_VERSION=${VERSION}
 WORKDIR /build
 COPY . .
-COPY --from=interface /build/src/mailmind/web/static/app src/mailmind/web/static/app
+COPY --from=interface /build/src/mailmind/web/static/ui src/mailmind/web/static/ui
 RUN uv sync --frozen --no-default-groups --no-editable
 
 FROM docker.io/library/python:${PYTHON}-slim

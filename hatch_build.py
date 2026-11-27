@@ -14,7 +14,7 @@ from pathlib import Path
 
 from hatchling.builders.hooks.plugin.interface import BuildHookInterface
 
-BUILT = Path("src/mailmind/web/static/app/manifest.json")
+BUILT = Path("src/mailmind/web/static/ui/index.html")
 
 #: The image builds the interface in a stage of its own and copies the result in.
 PREBUILT = "MAILMIND_UI_PREBUILT"

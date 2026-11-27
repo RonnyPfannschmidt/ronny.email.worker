@@ -1,7 +1,7 @@
 <script>
   import { day } from "./when.js";
 
-  let { bundle, folders, noun, grown, closed } = $props();
+  let { bundle, folders, noun, grown, closed, reread } = $props();
   const named = $derived(bundle.queries.find((query) => !query.grew));
   const later = $derived(bundle.queries.filter((query) => query.grew));
   const stale = $derived(bundle.items.filter((item) => item.status === "stale").length);
@@ -17,7 +17,7 @@
 {#if grown}
   <div class="banner error">
     More {noun} arrived in this bundle after this page was drawn. Accepting it from here will be
-    refused. <a href="/bundle/{bundle.bundle_id}">Read it again</a> to see them.
+    refused. <button onclick={reread}>Read it again</button> to see them.
   </div>
 {/if}
 {#if bundle.target_is_new}

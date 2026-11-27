@@ -10,7 +10,6 @@
 body { font: 15px/1.5 system-ui, sans-serif; margin: 0 auto; max-width: 62rem; padding: 1.5rem; }
 nav { display: flex; gap: 1rem; align-items: baseline; flex-wrap: wrap; }
 nav a { margin-right: 0; }
-nav form { margin-left: auto; }
 nav select, nav button { font: inherit; font-size: .85rem; padding: .15rem .4rem; }
 .here { font-weight: 600; }
 h1 { font-size: 1.3rem; } h2 { font-size: 1.05rem; margin-top: 2rem; }
@@ -44,23 +43,8 @@ ul.tree > li { border-left: none; padding-left: 0; }
 <nav class="small">
   <a href="/">review queue</a><a href="/mail">mail</a><a href="/accounts">accounts</a><a href="/agents">agents</a>
   {% if current_account %}
-    {% if accounts|length > 1 %}
-      {# No script anywhere: the CSP forbids it, so switching is a submit rather than an
-         onchange. #}
-      <form method="post" action="/accounts/choose">
-  <input type="hidden" name="_csrf" value="{{ csrf }}">
-        <label>working in
-          <select name="account_id">
-            {% for a in accounts %}
-            <option value="{{ a.id }}"{% if a.id == current_account.id %} selected{% endif %}>{{ a.name }}{% if waiting.get(a.id) and a.id != current_account.id %} ({{ waiting[a.id] }} waiting){% endif %}</option>
-            {% endfor %}
-          </select>
-        </label>
-        <button>switch</button>
-      </form>
-    {% else %}
-      <span class="muted" style="margin-left:auto">working in <span class="here">{{ current_account.name }}</span></span>
-    {% endif %}
+    {# Switching is done in the interface; the pages left here only say where you are. #}
+    <span class="muted" style="margin-left:auto">working in <span class="here">{{ current_account.name }}</span></span>
   {% endif %}
 </nav>
 {% block content %}{% endblock %}
